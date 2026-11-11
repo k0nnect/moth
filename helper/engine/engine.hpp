@@ -95,6 +95,9 @@ class Engine {
 
   std::vector<GroupInfo> groups() const;
   uint64_t storage_bytes() const;  // heap bytes held by every group's positions and values
+  // Changes the candidate storage budget for later scans and narrows.
+  void set_budget_bytes(uint64_t b) { cfg_.budget_bytes = b; }
+  uint64_t budget_bytes() const { return cfg_.budget_bytes; }
   unsigned workers_used() const { return workers_; }  // EngineConfig::workers, resolved
   // The most raw 32-bit offsets (matches not yet compacted into positions) that the last scan's
   // workers had room for at once. A worker compacts each 256 KiB slice of a block before the
