@@ -1,6 +1,6 @@
 (* The stand-in game (tests/target/target.cpp), launched in the test bottle with CrossOver's wine.
    It connects back to a port we listen on, sends one manifest line with its variables, then
-   answers "set <name> <value>" with "ok" and "get <name>" with the value, until "quit" or until
+   answers "set <name> <value>" and "free <page>" with "ok" and "get <name>" with the value, until "quit" or until
    the connection closes: losing the connection, or never making it, makes the target exit by
    itself. Its stdout and stderr (CrossOver writes there too) go to a log and are never read. *)
 
@@ -132,6 +132,10 @@ let set t name value =
   match ask t (Printf.sprintf "set %s %s" name value) with "ok" -> () | r -> failwith (Printf.sprintf "the target refused set %s %s: %s" name value r)
 
 let get t name = ask t ("get " ^ name)
+
+(* decommits one page of the target's small filler (its large one when it has no small one) *)
+let free t page =
+  match ask t (Printf.sprintf "free %d" page) with "ok" -> () | r -> failwith (Printf.sprintf "the target refused free %d: %s" page r)
 
 (* Lets the target go: closing the connection makes it exit. Waits for wine to end, and kills
    the launcher when it does not. Safe to call more than once. *)

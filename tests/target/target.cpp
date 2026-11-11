@@ -1,6 +1,9 @@
 // Stand-in "game" for automated tests: holds known values in memory and lets the test harness
 // read or change them over a TCP control port, so scans can be checked against ground truth.
 //   moth-target.exe <port> [--filler-mb N] [--filler-small-mb N]
+// Control lines: "get <name>", "set <name> <value>", "free <page>" (decommits that page of the
+// small filler, or of the large one when there is no small one, as a game freeing memory would),
+// "quit". Replies: the value, "ok" or "error".
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -110,6 +113,19 @@ void* make_filler(size_t mb, bool small) {
 }
 
 void* volatile g_fillers[2] = {nullptr, nullptr};  // keeps the filler blocks referenced
+size_t g_filler_bytes[2] = {0, 0};
+
+// Decommits page number `text` of the small filler (the large one when there is no small one).
+bool free_page(const std::string& text) {
+  const int which = g_fillers[1] ? 1 : 0;
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  const size_t page = si.dwPageSize;
+  char* end = nullptr;
+  const unsigned long long n = std::strtoull(text.c_str(), &end, 10);
+  if (!g_fillers[which] || text.empty() || *end != '\0' || n >= g_filler_bytes[which] / page) return false;
+  return VirtualFree(static_cast<char*>(g_fillers[which]) + n * page, page, MEM_DECOMMIT) != 0;
+}
 
 bool send_all(SOCKET s, const std::string& data) {
   size_t off = 0;
@@ -140,6 +156,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     g_fillers[small ? 1 : 0] = p;
+    g_filler_bytes[small ? 1 : 0] = mb << 20;
   }
 
   Vars* vars = new Vars();
@@ -219,7 +236,9 @@ int main(int argc, char** argv) {
       const Var* found = nullptr;
       for (auto& v : table)
         if (name == v.name) found = &v;
-      if (!found || (cmd != "set" && cmd != "get"))
+      if (cmd == "free")
+        reply = free_page(name) ? "ok" : "error";
+      else if (!found || (cmd != "set" && cmd != "get"))
         reply = "error";
       else if (cmd == "get")
         reply = format(*found);

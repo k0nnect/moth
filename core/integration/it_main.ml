@@ -108,10 +108,6 @@ let expect t name want =
   let got = Target_ctl.get t name in
   check (got = want) "the target has %s = %s, expected %s" name got want
 
-let expect_near t name want =
-  let got = Target_ctl.get t name in
-  check (match float_of_string_opt got with Some f -> Float.abs (f -. want) < 1e-4 | None -> false) "the target has %s = %s, expected %g" name got want
-
 (* ---- one target per scenario ---- *)
 
 let target_log () = Filename.concat !home "target.log"
@@ -129,20 +125,51 @@ let with_target ?(name = "moth-target.exe") ?(filler_mb = 0) ?(filler_small_mb =
 
 let set_row (r : row) v = ignore (moth [ "set"; string_of_int r.n; v ])
 
+(* The modules of the running target [exe_name], asked of a helper of our own in the bottle (the
+   daemon's helper is its own). attach checks them for anti-cheat and refuses when they can't be
+   read; this shows the list is really there under CrossOver: the program itself and [also].
+   (For a 32-bit program CrossOver lists only the 64-bit WoW64 modules, not kernel32.dll.) *)
+let check_modules ?(also = []) exe_name =
+  let open Moth_core in
+  let log = Filename.concat !home "helper.log" in
+  let launch = Helper_conn.wine_launcher ~bottle:(bottle ()) ~helper_exe:(exe "moth-helper.exe") in
+  match Helper_conn.start ~launch ~label:"the test bottle" ~log () with
+  | Error m -> failf "couldn't start a helper to list modules: %s" m
+  | Ok h ->
+      Fun.protect ~finally:h.close (fun () ->
+          let fail_with what (e : Helper_api.err) = failf "%s: %s %s" what e.code e.message in
+          let procs = match h.ps () with Ok p -> p | Error e -> fail_with "ps" e in
+          let pid =
+            match List.find_opt (fun (_, n) -> String.lowercase_ascii n = exe_name) procs with
+            | Some (p, _) -> p
+            | None -> failf "%s isn't running in the bottle" exe_name
+          in
+          match h.modules pid with
+          | Error e -> fail_with ("the modules of " ^ exe_name) e
+          | Ok mods ->
+              let lower = List.map String.lowercase_ascii mods in
+              check (List.for_all (fun m -> List.mem m lower) (exe_name :: also)) "the modules of %s are: %s" exe_name (String.concat ", " mods))
+
 (* ---- the scenarios ---- *)
 
-(* 1: health is a float holding 100.0; the user only ever types whole numbers *)
+(* 1: health is a float holding 100.0; the user only ever types whole numbers. Gives what the
+   game showed for health just before moth wrote it. *)
 let decimal_steps t =
   ignore (find "100");
   Target_ctl.set t "health" "85.3";
   ignore (next "85");
   Target_ctl.set t "health" "61.9";
   ignore (next "61");
+  let before = Target_ctl.get t "health" in
   let r = need_row (results ()) (Target_ctl.var t "health") "decimal" in
   set_row r "999";
-  expect t "health" "999"
+  expect t "health" "999";
+  before
 
-let decimal_from_whole () = with_target decimal_steps
+let decimal_from_whole () =
+  with_target (fun t ->
+      check_modules ~also:[ "kernel32.dll" ] "moth-target.exe";
+      ignore (decimal_steps t))
 
 let money () =
   with_target (fun t ->
@@ -191,17 +218,22 @@ let dead_end () =
       let o = next "12345" in
       check (to_bool (member "dead_end" o)) "next 12345 was not a dead end: %s" (show o);
       let hunt = member "hunt" (moth [ "status" ]) in
-      check (counts hunt = counts f) "status after the dead end differs from the find. find: %s. status: %s" (show f) (show hunt))
+      check (counts hunt = counts f) "status after the dead end differs from the find. find: %s. status: %s" (show f) (show hunt);
+      (* the helper did not narrow either: the number that is still true keeps every match *)
+      let again = next "100" in
+      check (counts again = counts f) "next 100 after the dead end differs from the find. find: %s. next: %s" (show f) (show again))
 
+(* the bytes undo puts back are exactly the ones the game had *)
 let undo () =
   with_target (fun t ->
-      decimal_steps t;
+      let before = decimal_steps t in
       ignore (moth [ "undo" ]);
-      expect_near t "health" 61.9)
+      expect t "health" before)
 
 let bits32 () =
   with_target ~name:"moth-target32.exe" (fun t ->
       check (contains !attach_said "32-bit") "attach said \"%s\", not 32-bit" !attach_said;
+      check_modules "moth-target32.exe";
       let attached = member "attached" (moth [ "status" ]) in
       check (attached <> `Null && to_int (member "bits" attached) = 32) "status does not show a 32-bit target: %s" (show attached);
       ignore (find "100");
@@ -249,6 +281,53 @@ exception Skipped of string
 
 let anticheat () = raise (Skipped "not run in a bottle; the daemon's unit tests cover it with a fake helper")
 
+(* 13 to 15: the other widths, found by the number the game shows, then written through moth *)
+let two_byte () =
+  with_target (fun t ->
+      ignore (find "7");
+      Target_ctl.set t "level" "9";
+      ignore (next "9");
+      let r = need_row (results ()) (Target_ctl.var t "level") "whole number (2-byte)" in
+      set_row r "12";
+      expect t "level" "12")
+
+let eight_byte () =
+  with_target (fun t ->
+      ignore (find "100000");
+      Target_ctl.set t "xp" "100250";
+      ignore (next "100250");
+      let r = need_row (results ()) (Target_ctl.var t "xp") "whole number (8-byte)" in
+      set_row r "5000000000";
+      expect t "xp" "5000000000")
+
+let eight_byte_decimal () =
+  with_target (fun t ->
+      ignore (find "85");
+      Target_ctl.set t "morale" "70.6";
+      ignore (next "70");
+      let r = need_row (results ()) (Target_ctl.var t "morale") "decimal (8-byte)" in
+      set_row r "99.5";
+      expect t "morale" "99.5")
+
+(* 16: the game frees one page in the middle of a dense hunt. Only the matches in that page are
+   lost. A new search no longer walks that page at all (it is not committed memory any more, so
+   the region list leaves it out), so it reads everything else and counts nothing unreadable. *)
+let freed_page () =
+  with_target ~filler_small_mb:64 (fun t ->
+      let f = find "3" in
+      let groups = List.length (to_list (member "groups" f)) in
+      Target_ctl.free t (64 * 256 / 2);
+      Target_ctl.set t "lives" "2";
+      let n = next "2" in
+      let lost = to_int (member "lost" n) in
+      ignore (need_row (results ()) (Target_ctl.var t "lives") "whole number");
+      check (lost > 0) "next 2 lost no matches, so it never met the freed page: %s" (show n);
+      check (lost <= 1024 * groups) "next 2 lost %d matches, more than one page's worth (1024) for each of %d groups" lost groups;
+      let again = find "3" in
+      let unreadable = to_int (member "unreadable" again) and bytes = to_int (member "bytes" again) in
+      check (unreadable = 0) "find 3 after the free couldn't read %d bytes, expected none: %s" unreadable (show again);
+      check (bytes >= (64 lsl 20) - 4096) "find 3 after the free read only %d bytes, less than the filler around the page" bytes)
+
 let scenarios =
   [
     (1, "decimal found from a whole number", decimal_from_whole);
@@ -263,6 +342,10 @@ let scenarios =
     (10, "speed", speed);
     (11, "the game closing", game_closing);
     (12, "anti-cheat names", anticheat);
+    (13, "two-byte value", two_byte);
+    (14, "eight-byte value", eight_byte);
+    (15, "eight-byte decimal typed whole", eight_byte_decimal);
+    (16, "a freed page", freed_page);
   ]
 
 (* ---- the daemon's lifetime ---- *)
