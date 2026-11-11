@@ -1,0 +1,4 @@
+; the end-to-end scenarios: run by make test-integration and make bench, never by dune test
+(executable
+ (name it_main)
+ (libraries yojson unix))

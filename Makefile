@@ -1,4 +1,4 @@
-# moth build entry points. later tasks add: smoke, test-integration, bench.
+# moth build entry points.
 WINE ?= $(HOME)/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
 MOTH_TEST_BOTTLE ?= uhmm
 export WINE MOTH_TEST_BOTTLE
@@ -7,7 +7,7 @@ DUNE := opam exec -- dune
 CMAKE := cmake -G "Unix Makefiles"
 JOBS ?= $(shell sysctl -n hw.ncpu)
 
-.PHONY: setup build test test-native test-core bench-native helper smoke clean
+.PHONY: setup build test test-native test-core bench-native helper smoke test-integration bench clean
 
 setup:
 	opam init --bare --no-setup -y
@@ -47,6 +47,14 @@ smoke: helper
 	@(printf '{"id":1,"op":"ps"}\n{"id":2,"op":"bye"}\n' | nc -l 127.0.0.1 47113 > build/smoke.out) & \
 	 sleep 1; "$(WINE)" --bottle "$(MOTH_TEST_BOTTLE)" --workdir "$(CURDIR)/bin" "$(CURDIR)/bin/moth-helper.exe" 47113 smoketoken >/dev/null 2>&1; wait
 	@grep -q '"hello"' build/smoke.out && grep -q 'smoketoken' build/smoke.out && grep -q 'moth-helper.exe' build/smoke.out && echo "smoke ok"
+
+# end to end in the test bottle (MOTH_TEST_BOTTLE): every scenario, one line each. a few minutes.
+test-integration: build helper
+	_build/default/core/integration/it_main.exe --bin "$(CURDIR)/bin"
+
+# scenario 10 alone: the real helper's scan speed under wine, on a 1 GB target
+bench: build helper
+	_build/default/core/integration/it_main.exe --bin "$(CURDIR)/bin" 10
 
 clean:
 	rm -rf build bin _build
