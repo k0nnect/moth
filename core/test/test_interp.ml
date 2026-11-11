@@ -58,4 +58,26 @@ let cases () =
   check_str "describe unaligned" "whole number (unaligned)" (Interp.describe (i "i32u" (Int 100L)));
   check_str "decode negative cents" "-0.05" (Interp.decode (i "i32x100" (dec "132.50")) (Vint (-5L)))
 
-let () = Alcotest.run "interp" [ ("plan", [ Alcotest.test_case "cases" `Quick cases ]) ]
+let fixes () =
+  let open Value in
+  let no_scaled v = List.for_all (fun x -> match (x : Interp.t).encoding with Scaled _ -> false | _ -> true) (Interp.plan v) in
+  Alcotest.(check bool) "min_int has no scaled" true (no_scaled (Int Int64.min_int));
+  let d19 = dec "0.0000000000000000001" in
+  check_ids "19 places" (ids d19) [ "f32"; "f64"; "f32u" ];
+  let i id v = List.find (fun (x : Interp.t) -> x.id = id) (Interp.plan v) in
+  let c = i "i32x100" (dec "1.00") in
+  check_pred "0.005" (Some (Eq 1L)) (Interp.pred_for c (dec "0.005"));
+  check_pred "132.505" (Some (Eq 13251L)) (Interp.pred_for c (dec "132.505"));
+  check_pred "-132.505" (Some (Eq (-13251L))) (Interp.pred_for c (dec "-132.505"));
+  check_pred "-0.004" (Some (Eq 0L)) (Interp.pred_for c (dec "-0.004"));
+  let f = i "f32" (Int 100L) in
+  let show = Interp.decode f in
+  check_str "1250000" "1250000" (show (Vfloat 1250000.));
+  check_str "1234567.5" "1234567.5" (show (Vfloat 1234567.5));
+  check_str "small" "0.00001" (show (Vfloat 0.00001));
+  check_str "zero" "0" (show (Vfloat 0.));
+  check_str "85.3" "85.3" (show (Vfloat 85.3));
+  check_str "neg big" "-2500000.25" (show (Vfloat (-2500000.25)));
+  check_str "min_int scaled" "-92233720368547758.08" (Interp.decode c (Vint Int64.min_int))
+
+let () = Alcotest.run "interp" [ ("plan", [ Alcotest.test_case "cases" `Quick cases; Alcotest.test_case "fixes" `Quick fixes ]) ]

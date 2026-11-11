@@ -16,7 +16,10 @@ let fits vtype n =
   | "u64" -> n >= 0L
   | _ -> false
 
-let pow10 p = int_of_float (10. ** float_of_int p)
+let pow10 p =
+  let r = ref 1 in
+  for _ = 1 to p do r := !r * 10 done;
+  !r
 let digits_of_scale k = String.length (string_of_int k) - 1
 
 (* value * 10^p rounded to nearest (halves away from zero), None if it overflows int64 *)
@@ -25,7 +28,7 @@ let scale_value (v : Value.t) k =
   match v with
   | Value.Int n ->
       let kk = Int64.of_int k in
-      if Int64.abs n > Int64.div Int64.max_int kk && n <> 0L then None else Some (Int64.mul n kk)
+      if n > Int64.div Int64.max_int kk || n < Int64.div Int64.min_int kk then None else Some (Int64.mul n kk)
   | Value.Dec { text; _ } -> (
       let neg = text.[0] = '-' in
       let body = if neg then String.sub text 1 (String.length text - 1) else text in
@@ -77,6 +80,7 @@ let plan (v : Value.t) =
         @ [ mk "f32u" "f32" 1 4 Wide Plain ]
       in
       main @ wide
+  | Value.Dec d when d.decimals > 18 -> [ mk "f32" "f32" 4 0 Main Plain; mk "f64" "f64" 8 0 Main Plain; mk "f32u" "f32" 1 4 Wide Plain ]
   | Value.Dec d ->
       let k = pow10 d.decimals in
       let scaled vt =
@@ -134,9 +138,27 @@ let encode t (v : Value.t) : (Helper_api.value, string) result =
       | _ -> no_fit ())
   | Fraction -> Ok (Vfloat (Value.to_float v /. 100.))
 
+let trim_zeros s =
+  if String.contains s '.' then (
+    let n = ref (String.length s) in
+    while !n > 0 && s.[!n - 1] = '0' do decr n done;
+    if !n > 0 && s.[!n - 1] = '.' then decr n;
+    String.sub s 0 !n)
+  else s
+
 let float_str f =
-  let s = Printf.sprintf "%.6g" f in
-  if s = "-0" then "0" else s
+  if Float.is_nan f || Float.abs f = Float.infinity then string_of_float f
+  else if f = 0. then "0"
+  else
+    let a = Float.abs f in
+    let plain () =
+      let s = trim_zeros (if a >= 1e6 then Printf.sprintf "%.2f" f else Printf.sprintf "%.10f" f) in
+      if s = "-0" || s = "" then "0" else s
+    in
+    if a >= 1e-4 && a < 1e6 then (
+      let s = Printf.sprintf "%.6g" f in
+      if String.contains s 'e' then plain () else s)
+    else plain ()
 
 let decode t (x : Helper_api.value) =
   match (t.encoding, x) with
@@ -145,7 +167,7 @@ let decode t (x : Helper_api.value) =
       let neg = n < 0L in
       let a = if neg then Int64.neg n else n in
       let kk = Int64.of_int k in
-      let ip = Int64.div a kk and fp = Int64.rem a kk in
+      let ip = Int64.unsigned_div a kk and fp = Int64.unsigned_rem a kk in
       Printf.sprintf "%s%Lu.%0*Ld" (if neg then "-" else "") ip p fp
   | Scaled k, Vfloat f -> float_str (f /. float_of_int k)
   | Fraction, Vfloat f -> float_str (f *. 100.)
