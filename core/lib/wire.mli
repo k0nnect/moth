@@ -32,3 +32,7 @@ val bits_to_json : vtype:string -> int64 -> Yojson.Safe.t
 
 (** [0x] and up to two hex digits per byte of the type *)
 val bits_of_json : vtype:string -> Yojson.Safe.t -> int64
+
+(** the raw bytes the helper writes for a value of the type: a whole number's low bytes, a float's
+    IEEE bits (an [f32] rounded to single precision first) *)
+val bits_of_value : vtype:string -> Helper_api.value -> int64

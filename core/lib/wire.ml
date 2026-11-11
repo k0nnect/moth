@@ -78,6 +78,11 @@ let bits_to_json ~vtype bits =
   let bits = if w = 8 then bits else Int64.logand bits (Int64.pred (Int64.shift_left 1L (8 * w))) in
   `String (Printf.sprintf "0x%0*Lx" (2 * w) bits)
 
+let bits_of_value ~vtype v =
+  let w = width vtype in
+  let raw = match (v, vtype) with Vfloat f, "f32" -> Int64.of_int32 (Int32.bits_of_float f) | Vfloat f, _ -> Int64.bits_of_float f | Vint n, _ -> n in
+  if w = 8 then raw else Int64.logand raw (Int64.pred (Int64.shift_left 1L (8 * w)))
+
 let bits_of_json ~vtype (j : Yojson.Safe.t) =
   let digits = 2 * width vtype in
   let bad () = fail "a %s value's bytes must be a 0x hex string of up to %d digits" vtype digits in

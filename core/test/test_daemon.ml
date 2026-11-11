@@ -36,12 +36,16 @@ type fake = {
   mutable closed : int;
   mutable modules_asked : int; (* modules calls *)
   mutable attaches : int; (* attach calls *)
+  mutable attached_to : int option; (* the pid the helper last attached to *)
+  mutable alive : bool; (* whether that process is still running *)
   script : Fake_helper.script;
 }
 
 let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
   let h, script = Fake_helper.create () in
-  let fk = { procs; modules = Ok [ "UnityPlayer.dll" ]; started = []; closed = 0; modules_asked = 0; attaches = 0; script } in
+  let fk =
+    { procs; modules = Ok [ "UnityPlayer.dll" ]; started = []; closed = 0; modules_asked = 0; attaches = 0; attached_to = None; alive = true; script }
+  in
   let helper =
     {
       h with
@@ -53,7 +57,14 @@ let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
       attach =
         (fun pid ->
           fk.attaches <- fk.attaches + 1;
+          fk.attached_to <- Some pid;
+          fk.alive <- true;
           Ok { pid; name = List.assoc pid fk.procs; bits = 64 });
+      status =
+        (fun () ->
+          match fk.attached_to with
+          | Some pid when fk.alive -> Ok (Some { pid; name = List.assoc pid fk.procs; bits = 64 })
+          | _ -> Ok None);
       close = (fun () -> fk.closed <- fk.closed + 1);
     }
   in
@@ -166,7 +177,7 @@ let anticheat () =
       check_int "still not attached" 0 fk.attaches;
       check_str "status" "not attached" (text (call d "status" [])))
 
-let outcome_json ?(notes = []) ?(lost = 0) ?(ms = 0.) ?(bytes = 0) ?(wide = 0) ~main by_tag groups =
+let outcome_json ?(notes = []) ?(lost = 0) ?(ms = 0.) ?(bytes = 0) ?(unreadable = 0) ?(wide = 0) ~main by_tag groups =
   `Assoc
     [
       ("main", `Int main);
@@ -177,6 +188,7 @@ let outcome_json ?(notes = []) ?(lost = 0) ?(ms = 0.) ?(bytes = 0) ?(wide = 0) ~
       ("dead_end", `Bool false);
       ("ms", `Float ms);
       ("bytes", `Int bytes);
+      ("unreadable", `Int unreadable);
       ("groups", `List groups);
     ]
 
@@ -190,12 +202,15 @@ let hunt () =
       ignore (text (attach d));
       Fake_helper.queue_scan f [ gi "i32" 3 ];
       check_str "find" "3 matches (3 whole number)" (text (call d "find" [ "100" ]));
-      Fake_helper.queue_scan f ~stats:{ Fake_helper.zero_stats with bytes = 4096; ms = 2.5 } [ gi "i32" 3; gi "u8" 7 ];
+      Fake_helper.queue_scan f ~stats:{ Fake_helper.zero_stats with bytes = 4096; unreadable_bytes = 8192; ms = 2.5 } [ gi "i32" 3; gi "u8" 7 ];
       let j = json (call d "find" [ "100" ]) in
       check_bool "json" true (Yojson.Safe.Util.(member "main" j |> to_int) = 3);
       check_json "find json"
-        (outcome_json ~main:3 ~wide:7 ~ms:2.5 ~bytes:4096 [ ("whole number", 3) ] [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ])
+        (outcome_json ~main:3 ~wide:7 ~ms:2.5 ~bytes:4096 ~unreadable:8192 [ ("whole number", 3) ] [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ])
         j;
+      Fake_helper.queue_scan f ~stats:{ Fake_helper.zero_stats with unreadable_bytes = 8192 } [ gi "i32" 3; gi "u8" 7 ];
+      check_str "find text" "3 matches (3 whole number)\ncouldn't read 8 kb of the game's memory, so matches there are missing."
+        (text (call d "find" [ "100" ]));
       check_str "status with a hunt" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
       check_json "status json hunt"
         (`Assoc [ ("main", `Int 3); ("wide", `Int 7); ("groups", `List [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ]) ])
@@ -336,6 +351,67 @@ let events () =
       close_in ic;
       check_int "one line per request" 9 n;
       check_int "events file mode" 0o600 (Unix.stat file).st_perm)
+
+let write_record () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 1; gi "f32" 1 ];
+      ignore (text (call d "find" [ "60" ]));
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
+      Fake_helper.queue_peek f "f32" [ { addr = 0x2000L; v = Vfloat 60. } ];
+      ignore (text (call d "results" []));
+      Fake_helper.queue_write f ~prev:(Vint 60L) ~prev_bits:0x3cL;
+      ignore (text (call d "set" [ "1"; "999" ]));
+      Fake_helper.queue_write f ~prev:(Vfloat 60.) ~prev_bits:0x42700000L;
+      ignore (text (call d "set" [ "2"; "-1.5" ]));
+      Fake_helper.queue_write f ~prev:(Vfloat (-1.5)) ~prev_bits:0xbfc00000L;
+      ignore (text (call d "undo" []));
+      check_err "a refused set" "this value is a whole number, and 1.5 has a decimal part" (call d "set" [ "1"; "1.5" ]);
+      let open Yojson.Safe.Util in
+      (* newest first: the refused set, undo, set, set, results *)
+      let ev = json (call d "log" [] ~opts:[ ("n", "5") ]) in
+      let write i = member "write" (index i ev) in
+      let wrote addr vtype prev_bits new_bits =
+        `Assoc [ ("addr", `String addr); ("type", `String vtype); ("prev_bits", `String prev_bits); ("new_bits", `String new_bits) ]
+      in
+      check_json "set, whole number" (wrote "0x10008" "i32" "0x0000003c" "0x000003e7") (write 3);
+      check_json "set, decimal" (wrote "0x2000" "f32" "0x42700000" "0xbfc00000") (write 2);
+      check_json "undo" (wrote "0x2000" "f32" "0xbfc00000" "0x42700000") (write 1);
+      check_strs "fields" [ "seq"; "ts"; "actor"; "cmd"; "args"; "ok"; "summary"; "write" ] (keys (index 1 ev));
+      check_bool "nothing written, no record" true (write 0 = `Null);
+      check_bool "other commands, no record" true (write 4 = `Null))
+
+(* attaching again to the same pid keeps the hunt only while the helper still has that game *)
+let reattach () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "100" ]));
+      check_str "again" attached (text (attach d));
+      check_int "not attached twice" 1 fk.attaches;
+      check_str "the hunt goes on" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
+      (* the game closed, and the one running now has the same pid *)
+      fk.alive <- false;
+      check_str "attached afresh" attached (text (attach d));
+      check_int "attached again" 2 fk.attaches;
+      check_str "a new hunt" attached (text (call d "status" [])))
+
+let crossover_missing () =
+  let bottles = fresh_home () in
+  Unix.mkdir bottles 0o700;
+  let home = fresh_home () in
+  let missing = "crossover not found. set MOTH_CROSSOVER to the path of CrossOver.app." in
+  Fun.protect
+    ~finally:(fun () -> rm bottles)
+    (fun () ->
+      with_env "MOTH_CROSSOVER" "/nonexistent/CrossOver.app" (fun () ->
+          with_env "MOTH_BOTTLES" bottles (fun () ->
+              with_daemon ~home (Daemon.default_start_helper ~home) (fun d ->
+                  check_err "attach" missing (attach d);
+                  check_err "ps" missing (call d "ps" [] ~opts:[ ("bottle", "uhmm") ])))))
 
 let stop_and_restart () =
   let fk, sh = fake () in
@@ -481,6 +557,9 @@ let () =
           t "ps" ps;
           t "bottles" bottles;
           t "events" events;
+          t "write record" write_record;
+          t "attach again" reattach;
+          t "crossover missing" crossover_missing;
           t "usage" usage;
           t "unexpected error" unexpected;
         ] );

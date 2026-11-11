@@ -11,6 +11,7 @@ type outcome = {
   dead_end : bool;
   ms : float;
   bytes : int;
+  unreadable : int;
   groups : (group_info * Interp.tier) list;
 }
 
@@ -19,13 +20,16 @@ type row = { n : int; addr : int64; interp_id : string; tag : string; shown : st
 (* one helper group and the interpretation it searches for *)
 type group = { interp : Interp.t; info : group_info }
 
-(* current: the hunt's groups in plan order. last: the last number typed that applied. *)
-type hunt = { current : group list; last : Value.t }
+(* current: the hunt's groups in plan order. last: the last number typed that applied, which the
+   helper's stored values hold; None after a relation step moved them on. *)
+type hunt = { current : group list; last : Value.t option }
 
 type listed = { at : int; li : Interp.t; laddr : int64 }
 
 (* prev_bits: the bytes the write replaced, which undo puts back exactly *)
 type write = { wn : int; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
+
+type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
 
 type t = {
   h : helper;
@@ -39,6 +43,7 @@ let no_hunt = "no hunt in progress. start one with: moth find <number>"
 let too_many = "too many matches to compare by change yet. type the new number instead."
 let game_closed = "the game closed. attach again once it's running."
 let helper_lost = "lost contact with moth's helper. attach again."
+let hunt_lost = "the hunt was lost. start again with: moth find <number>"
 let page = 10
 let listable = 1000
 
@@ -47,11 +52,15 @@ exception Helper_failed of err
 let call = function Ok x -> x | Error e -> raise (Helper_failed e)
 
 (* Runs one step. A helper error ends it; losing the game or the helper also ends the hunt, and
-   the writes, whose addresses mean nothing once attached again. *)
+   the writes, whose addresses mean nothing once attached again. A group the helper no longer
+   has ends the hunt, which can't go on without it; the writes stay. *)
 let guard t f =
-  let clear () =
+  let drop_hunt () =
     t.hunt <- None;
-    t.listing <- [];
+    t.listing <- []
+  in
+  let clear () =
+    drop_hunt ();
     t.undo <- []
   in
   try f () with
@@ -61,16 +70,20 @@ let guard t f =
   | Helper_failed { code = "helper_lost"; _ } ->
       clear ();
       Error helper_lost
+  | Helper_failed { code = "no_such_group"; _ } ->
+      drop_hunt ();
+      Error hunt_lost
   | Helper_failed e -> Error (if e.message = "" then e.code else e.message)
 
-(* the helper's time, bytes read and lost candidates over one step *)
-type tally = { mutable spent_ms : float; mutable read_bytes : int; mutable lost_count : int }
+(* the helper's time, bytes read, bytes it could not read and lost candidates over one step *)
+type tally = { mutable spent_ms : float; mutable read_bytes : int; mutable unread_bytes : int; mutable lost_count : int }
 
-let tally () = { spent_ms = 0.; read_bytes = 0; lost_count = 0 }
+let tally () = { spent_ms = 0.; read_bytes = 0; unread_bytes = 0; lost_count = 0 }
 
 let add tl (s : stats) =
   tl.spent_ms <- tl.spent_ms +. s.ms;
   tl.read_bytes <- tl.read_bytes + s.bytes;
+  tl.unread_bytes <- tl.unread_bytes + s.unreadable_bytes;
   tl.lost_count <- tl.lost_count + s.lost
 
 let total tier gs = List.fold_left (fun a g -> if g.info.tracked && g.interp.tier = tier then a + g.info.count else a) 0 gs
@@ -104,6 +117,7 @@ let outcome_of ?fell_back ?(dead_end = false) tl gs =
     dead_end;
     ms = tl.spent_ms;
     bytes = tl.read_bytes;
+    unreadable = tl.unread_bytes;
     groups = List.map (fun g -> (g.info, g.interp.tier)) gs;
   }
 
@@ -136,14 +150,22 @@ let find t text =
       guard t (fun () ->
           let plan = List.filter_map (fun i -> Option.map (fun p -> (i, p)) (Interp.pred_for i v)) (Interp.plan v) in
           let tl = tally () in
-          let infos, st = call (t.h.scan ~keep:false (List.map (fun (i, p) -> spec_of i p) plan)) in
+          let infos, st =
+            match t.h.scan ~keep:false (List.map (fun (i, p) -> spec_of i p) plan) with
+            | Ok r -> r
+            | Error e ->
+                (* the helper may have dropped the old groups already, so the old hunt is over *)
+                t.hunt <- None;
+                t.listing <- [];
+                raise (Helper_failed e)
+          in
           add tl st;
           let current =
             List.filter_map
               (fun ((interp : Interp.t), _) -> Option.map (fun info -> { interp; info }) (List.find_opt (fun (i : group_info) -> i.id = interp.id) infos))
               plan
           in
-          commit t current v;
+          commit t current (Some v);
           Ok (outcome_of tl current))
 
 let next_number t text =
@@ -174,7 +196,7 @@ let next_number t text =
               (* keep the groups [keep] picks, with their new counts; the rest leave the helper *)
               let finish ?fell_back keep infos =
                 let current = List.map (updated infos) (List.filter keep hunt.current) in
-                commit t current m;
+                commit t current (Some m);
                 let gone = List.filter_map (fun g -> if keep g then None else Some g.info.id) hunt.current in
                 if gone <> [] then call (t.h.drop gone);
                 Ok (outcome_of ?fell_back tl current)
@@ -185,11 +207,16 @@ let next_number t text =
                    untracked again holds only a count of how common the number is, not a match. *)
                 finish (fun g -> fits g && not g.info.tracked) rescanned
               else
-                let r = relation_between m hunt.last in
-                let applied, narrowed =
-                  narrow t tl (List.filter_map (fun g -> if fits g && comparable g then Some (g.info.id, pred_of_relation r) else None) hunt.current)
-                in
-                if applied then finish ~fell_back:r fits (narrowed @ rescanned) else Ok (outcome_of ~dead_end:true tl hunt.current)))
+                match hunt.last with
+                | None ->
+                    (* no number the stored values hold, so no direction to fall back on *)
+                    Ok (outcome_of ~dead_end:true tl hunt.current)
+                | Some last ->
+                    let r = relation_between m last in
+                    let applied, narrowed =
+                      narrow t tl (List.filter_map (fun g -> if fits g && comparable g then Some (g.info.id, pred_of_relation r) else None) hunt.current)
+                    in
+                    if applied then finish ~fell_back:r fits (narrowed @ rescanned) else Ok (outcome_of ~dead_end:true tl hunt.current)))
 
 let next_relation t r =
   match t.hunt with
@@ -204,7 +231,8 @@ let next_relation t r =
               let applied, narrowed = narrow t tl (List.map (fun g -> (g.info.id, pred_of_relation r)) gs) in
               if applied then (
                 let current = List.map (updated narrowed) hunt.current in
-                commit t current hunt.last;
+                (* the stored values now hold what this step read, not the last number typed *)
+                commit t current None;
                 Ok (outcome_of tl current))
               else Ok (outcome_of ~dead_end:true tl hunt.current)))
 
@@ -238,18 +266,22 @@ let set t ~row text =
           | Error e -> Error e
           | Ok next ->
               guard t (fun () ->
-                  let r = call (t.h.write ~addr:l.laddr ~vtype:l.li.vtype (Put_value next)) in
+                  let vtype = l.li.vtype in
+                  let r = call (t.h.write ~addr:l.laddr ~vtype (Put_value next)) in
                   t.undo <- { wn = row; wi = l.li; waddr = l.laddr; prev = r.prev; prev_bits = r.prev_bits; next } :: t.undo;
-                  Ok (Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li r.prev)))))
+                  let w = { where = l.laddr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
+                  Ok (Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li r.prev), w))))
 
 let undo t =
   match t.undo with
   | [] -> Error "nothing to undo"
   | w :: rest ->
       guard t (fun () ->
-          ignore (call (t.h.write ~addr:w.waddr ~vtype:w.wi.vtype (Put_bits w.prev_bits)));
+          let vtype = w.wi.vtype in
+          let r = call (t.h.write ~addr:w.waddr ~vtype (Put_bits w.prev_bits)) in
           t.undo <- rest;
-          Ok (Printf.sprintf "restored #%d to %s" w.wn (Interp.decode w.wi w.prev)))
+          let done_ = { where = w.waddr; wtype = vtype; bits_before = r.prev_bits; bits_after = w.prev_bits } in
+          Ok (Printf.sprintf "restored #%d to %s" w.wn (Interp.decode w.wi w.prev), done_))
 
 let writes t = List.map (fun w -> (w.waddr, w.wi.vtype, w.prev, w.next)) t.undo
 

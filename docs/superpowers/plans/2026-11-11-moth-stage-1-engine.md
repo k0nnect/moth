@@ -98,7 +98,7 @@ bin/                             build output, gitignored
 | `peek` | `group, offset, limit` | `items:[{addr,v}]` |
 | `read` | `addr, type` | `v` |
 | `write` | `addr, type`, and `v` or `bits` | `prev, prev_bits` |
-| `status` | | `attached:{pid,name,bits}\|null, groups:[I]` |
+| `status` | | `attached:{pid,name,bits}\|null, groups:[I]` (null, and no groups, once the attached process has exited) |
 | `detach`, `bye` | | |
 
 - `G` = `{"id":"i32","type":"i32","align":4,"exclude_align":0,"pred":P}`. `type` is one of `i8 u8 i16 u16 i32 u32 i64 u64 f32 f64`.

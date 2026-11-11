@@ -22,30 +22,25 @@ let pow10 p =
   !r
 let digits_of_scale k = String.length (string_of_int k) - 1
 
-(* value * 10^p rounded to nearest (halves away from zero), None if it overflows int64 *)
+(* value * 10^p exactly: `Inexact when it has more decimal places than p that are not zeros,
+   `Too_big when the product overflows int64 *)
 let scale_value (v : Value.t) k =
   let p = digits_of_scale k in
   match v with
   | Value.Int n ->
       let kk = Int64.of_int k in
-      if n > Int64.div Int64.max_int kk || n < Int64.div Int64.min_int kk then None else Some (Int64.mul n kk)
+      if n > Int64.div Int64.max_int kk || n < Int64.div Int64.min_int kk then Error `Too_big else Ok (Int64.mul n kk)
   | Value.Dec { text; _ } -> (
       let neg = text.[0] = '-' in
       let body = if neg then String.sub text 1 (String.length text - 1) else text in
       match String.split_on_char '.' body with
       | [ ip; fp ] -> (
           let lf = String.length fp in
-          let digits, up =
-            if lf <= p then (ip ^ fp ^ String.make (p - lf) '0', false)
-            else (ip ^ String.sub fp 0 p, fp.[p] >= '5')
-          in
-          match Int64.of_string_opt digits with
-          | None -> None
-          | Some n when up && n = Int64.max_int -> None
-          | Some n ->
-              let n = if up then Int64.succ n else n in
-              Some (if neg then Int64.neg n else n))
-      | _ -> None)
+          if lf > p && String.exists (fun c -> c <> '0') (String.sub fp p (lf - p)) then Error `Inexact
+          else
+            let kept = if lf <= p then fp ^ String.make (p - lf) '0' else String.sub fp 0 p in
+            match Int64.of_string_opt (ip ^ kept) with None -> Error `Too_big | Some n -> Ok (if neg then Int64.neg n else n))
+      | _ -> Error `Too_big)
 
 let text_of = function Value.Int n -> Int64.to_string n | Value.Dec d -> d.text
 
@@ -68,7 +63,7 @@ let plan (v : Value.t) =
       in
       let scaled k =
         match scale_value v k with
-        | Some p when fits "i32" p -> [ mk (Printf.sprintf "i32x%d" k) "i32" 4 0 Wide (Scaled k) ]
+        | Ok p when fits "i32" p -> [ mk (Printf.sprintf "i32x%d" k) "i32" 4 0 Wide (Scaled k) ]
         | _ -> []
       in
       let wide =
@@ -85,7 +80,7 @@ let plan (v : Value.t) =
       let k = pow10 d.decimals in
       let scaled vt =
         match scale_value v k with
-        | Some p when fits vt p -> [ mk (Printf.sprintf "%sx%d" vt k) vt (if vt = "i32" then 4 else 8) 0 Main (Scaled k) ]
+        | Ok p when fits vt p -> [ mk (Printf.sprintf "%sx%d" vt k) vt (if vt = "i32" then 4 else 8) 0 Main (Scaled k) ]
         | _ -> []
       in
       [ mk "f32" "f32" 4 0 Main Plain; mk "f64" "f64" 8 0 Main Plain ]
@@ -103,7 +98,7 @@ let pred_for t (v : Value.t) : Helper_api.pred option =
       | _ -> None)
   | Scaled k -> (
       match scale_value v k with
-      | Some p when fits t.vtype p -> Some (Eq p)
+      | Ok p when fits t.vtype p -> Some (Eq p)
       | _ -> None)
   | Fraction ->
       let c = Value.to_float v and e = eps_of v in
@@ -111,7 +106,7 @@ let pred_for t (v : Value.t) : Helper_api.pred option =
 
 let describe t =
   match t.encoding with
-  | Scaled k -> Printf.sprintf "whole number ×%d" k
+  | Scaled k -> if t.vtype = "i64" then Printf.sprintf "whole number ×%d (8-byte)" k else Printf.sprintf "whole number ×%d" k
   | Fraction -> "decimal ÷100"
   | Plain ->
       if t.exclude_align > 0 then if is_float_type t.vtype then "decimal (unaligned)" else "whole number (unaligned)"
@@ -134,7 +129,8 @@ let encode t (v : Value.t) : (Helper_api.value, string) result =
       | Value.Int n -> if fits t.vtype n then Ok (Vint n) else no_fit ())
   | Scaled k -> (
       match scale_value v k with
-      | Some p when fits t.vtype p -> Ok (Vint p)
+      | Ok p when fits t.vtype p -> Ok (Vint p)
+      | Error `Inexact -> Error (Printf.sprintf "%s has more decimal places than this value keeps" (text_of v))
       | _ -> no_fit ())
   | Fraction -> Ok (Vfloat (Value.to_float v /. 100.))
 

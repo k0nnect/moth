@@ -23,6 +23,7 @@ type helper = {
   peek : id:string -> vtype:string -> offset:int -> limit:int -> (item list, err) result;
   read : addr:int64 -> vtype:string -> (value, err) result;
   write : addr:int64 -> vtype:string -> put -> (replaced, err) result;
+  status : unit -> (attached option, err) result; (* None: not attached, or the process has exited *)
   detach : unit -> (unit, err) result;
   close : unit -> unit;
 }

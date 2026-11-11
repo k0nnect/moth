@@ -41,6 +41,7 @@ let serve ?(on_ps = `Answer) (ic, oc) =
             send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"nan"},{"addr":"0x14","v":85},{"addr":"0x18","v":"-inf"}]}|} id)
         | "peek" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"7"}]}|} id)
         | "write" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"prev":"inf","prev_bits":"0x7f800000"}|} id)
+        | "status" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"attached":{"pid":208,"name":"disco.exe","bits":64},"groups":[]}|} id)
         | "bye" -> raise Exit
         | _ -> send oc (Printf.sprintf {|{"id":%d,"ok":true}|} id));
         loop ()
@@ -69,6 +70,7 @@ let basics () =
   check_bool "ps" true (h.ps () = Ok [ (208, "disco.exe") ]);
   check_bool "peek" true (h.peek ~id:"i32" ~vtype:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
   check_bool "error mapped" true (match h.scan ~keep:false [] with Error { code = "not_attached"; _ } -> true | _ -> false);
+  check_bool "status" true (h.status () = Ok (Some { pid = 208; name = "disco.exe"; bits = 64 }));
   check_bool "detach" true (h.detach () = Ok ());
   h.close ()
 

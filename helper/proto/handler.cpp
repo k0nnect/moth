@@ -290,8 +290,9 @@ struct Handler::Impl {
     } else if (op == "bye") {
       exit = true;
     } else if (op == "status") {
-      r["attached"] = attached ? json{{"pid", proc.pid}, {"name", proc.name}, {"bits", proc.bits}} : json(nullptr);
-      r["groups"] = attached ? infos_json(eng->groups()) : json::array();
+      const bool live = attached && mem->alive();  // a process that has exited is not shown as attached
+      r["attached"] = live ? json{{"pid", proc.pid}, {"name", proc.name}, {"bits", proc.bits}} : json(nullptr);
+      r["groups"] = live ? infos_json(eng->groups()) : json::array();
     } else if (op == "scan") {
       scan(req, r);
     } else if (op == "narrow") {

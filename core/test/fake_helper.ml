@@ -66,6 +66,7 @@ let create () =
         (fun ~addr ~vtype v ->
           record (Write { addr; vtype; v });
           next "write" f.writes);
+      status = (fun () -> unscripted "status");
       detach = (fun () -> unscripted "detach");
       close = (fun () -> ());
     }

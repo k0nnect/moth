@@ -3,6 +3,7 @@ open Helper_api
 open Fake_helper
 
 let ok = function Ok x -> x | Error e -> Alcotest.failf "unexpected error: %s" e
+let said r = fst (ok r)
 let check_int n w g = Alcotest.(check int) n w g
 let check_bool n w g = Alcotest.(check bool) n w g
 let check_str n w g = Alcotest.(check string) n w g
@@ -25,7 +26,7 @@ let fresh () =
   let h, f = Fake_helper.create () in
   (Session.create h, f)
 
-let stats ?(bytes = 0) ?(lost = 0) ms = { zero_stats with bytes; lost; ms }
+let stats ?(bytes = 0) ?(lost = 0) ?(unreadable = 0) ms = { zero_stats with bytes; lost; unreadable_bytes = unreadable; ms }
 let ids_of (o : Session.outcome) = List.map (fun ((g : group_info), _) -> g.id) o.groups
 let fell_back (o : Session.outcome) = List.exists (function Session.Fell_back _ -> true | _ -> false) o.notes
 let closed = "the game closed. attach again once it's running."
@@ -234,11 +235,11 @@ let results_set_undo () =
   check_bool "row" true (rows = [ { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85" } ]);
   check_bool "one page of 10" true (peeks f = [ ("i32", 0, 10) ]);
   queue_write f ~prev:(Vint 85L) ~prev_bits:0x55L;
-  check_str "set" "set #1 to 999 (was 85)" (ok (Session.set s ~row:1 "999"));
+  check_str "set" "set #1 to 999 (was 85)" (said (Session.set s ~row:1 "999"));
   check_bool "wrote" true (last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
   check_bool "recorded" true (Session.writes s = [ (0x10008L, "i32", Vint 85L, Vint 999L) ]);
   queue_write f ~prev:(Vint 999L);
-  check_str "undo" "restored #1 to 85" (ok (Session.undo s));
+  check_str "undo" "restored #1 to 85" (said (Session.undo s));
   check_bool "wrote back the bytes" true (last_write f = (0x10008L, "i32", Put_bits 0x55L));
   check_bool "undone" true (Session.writes s = []);
   check_err "undo twice" "nothing to undo" (Session.undo s);
@@ -259,14 +260,14 @@ let undo_order () =
   queue_peek f "i32x100" [ it 0x5000L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
-  check_str "first" "set #1 to 2.50 (was 1.00)" (ok (Session.set s ~row:1 "2.5"));
+  check_str "first" "set #1 to 2.50 (was 1.00)" (said (Session.set s ~row:1 "2.5"));
   queue_write f ~prev:(Vint 250L) ~prev_bits:250L;
-  check_str "second" "set #1 to 9.00 (was 2.50)" (ok (Session.set s ~row:1 "9"));
+  check_str "second" "set #1 to 9.00 (was 2.50)" (said (Session.set s ~row:1 "9"));
   check_bool "newest first" true (Session.writes s = [ (0x5000L, "i32", Vint 250L, Vint 900L); (0x5000L, "i32", Vint 100L, Vint 250L) ]);
   queue_write f ~prev:(Vint 900L);
-  check_str "undo newest" "restored #1 to 2.50" (ok (Session.undo s));
+  check_str "undo newest" "restored #1 to 2.50" (said (Session.undo s));
   queue_write f ~prev:(Vint 250L);
-  check_str "undo oldest" "restored #1 to 1.00" (ok (Session.undo s));
+  check_str "undo oldest" "restored #1 to 1.00" (said (Session.undo s));
   check_bool "wrote the first value back" true (last_write f = (0x5000L, "i32", Put_bits 100L))
 
 let undo_puts_bytes_back () =
@@ -277,10 +278,14 @@ let undo_puts_bytes_back () =
   check_str "a nan is shown" "nan" (List.hd (ok (Session.results s ~all:false))).shown;
   check_bool "peeked as its type" true (peek_vtypes f = [ ("f32", "f32") ]);
   queue_write f ~prev:(Vfloat Float.nan) ~prev_bits:0x7fc00001L;
-  check_str "set" "set #1 to 5 (was nan)" (ok (Session.set s ~row:1 "5"));
+  let text, w = ok (Session.set s ~row:1 "5") in
+  check_str "set" "set #1 to 5 (was nan)" text;
+  check_bool "the write" true (w = { where = 0x7000L; wtype = "f32"; bits_before = 0x7fc00001L; bits_after = 0x40a00000L });
   check_bool "wrote the value" true (last_write f = (0x7000L, "f32", Put_value (Vfloat 5.)));
   queue_write f ~prev:(Vfloat 5.) ~prev_bits:0x40a00000L;
-  check_str "undo" "restored #1 to nan" (ok (Session.undo s));
+  let text, w = ok (Session.undo s) in
+  check_str "undo" "restored #1 to nan" text;
+  check_bool "the undo's write" true (w = { where = 0x7000L; wtype = "f32"; bits_before = 0x40a00000L; bits_after = 0x7fc00001L });
   check_bool "wrote the bytes back" true (last_write f = (0x7000L, "f32", Put_bits 0x7fc00001L))
 
 let listing_follows_hunt () =
@@ -293,7 +298,7 @@ let listing_follows_hunt () =
   queue_narrow f ~applied:false [];
   check_bool "dead end" true (ok (Session.next_number s "5")).dead_end;
   queue_write f ~prev:(Vint 100L);
-  check_str "a dead end keeps the listing" "set #2 to 7 (was 100)" (ok (Session.set s ~row:2 "7"));
+  check_str "a dead end keeps the listing" "set #2 to 7 (was 100)" (said (Session.set s ~row:2 "7"));
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   ignore (ok (Session.next_number s "100"));
   check_err "a step replaces the listing" "no result #2. run: moth results" (Session.set s ~row:2 "7")
@@ -320,16 +325,89 @@ let results_selection () =
 
 let stats_and_lost () =
   let s, f = fresh () in
-  queue_scan ~stats:(stats ~bytes:4096 2.5) f [ gi "i32" 50; gi ~tracked:false "u8" 4_000_000 ];
+  queue_scan ~stats:(stats ~bytes:4096 ~unreadable:8192 2.5) f [ gi "i32" 50; gi ~tracked:false "u8" 4_000_000 ];
   let o = ok (Session.find s "30") in
   check_int "bytes" 4096 o.bytes;
+  check_int "unreadable" 8192 o.unreadable;
   check_bool "ms" true (o.ms = 2.5);
   queue_narrow ~stats:(stats ~bytes:12 ~lost:2 1.) f ~applied:true [ gi "i32" 3 ];
-  queue_scan ~stats:(stats ~bytes:1000 3.) f [ gi "u8" 0 ];
+  queue_scan ~stats:(stats ~bytes:1000 ~unreadable:4096 3.) f [ gi "u8" 0 ];
   let o = ok (Session.next_number s "29") in
   check_bool "lost" true (List.mem (Session.Lost 2) o.notes);
   check_int "bytes summed" 1012 o.bytes;
-  check_bool "ms summed" true (o.ms = 4.)
+  check_int "unreadable of the rescan" 4096 o.unreadable;
+  check_bool "ms summed" true (o.ms = 4.);
+  queue_narrow f ~applied:true [ gi "i32" 1 ];
+  queue_scan f [ gi "u8" 0 ];
+  check_int "none this step" 0 (ok (Session.next_number s "28")).unreadable;
+  check_int "nothing read for the hunt as it stands" 0 (Option.get (Session.current s)).unreadable
+
+(* a relation step moves the helper's stored values on, so the last number typed no longer says
+   which way a later number went *)
+let relation_clears_the_baseline () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 500 ];
+  ignore (ok (Session.find s "100"));
+  queue_narrow f ~applied:true [ gi "i32" 40 ];
+  ignore (ok (Session.next_relation s Down));
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "91") in
+  check_bool "dead end" true o.dead_end;
+  check_int "no fallback sent" 2 (narrow_calls f);
+  check_pred "only the exact number" (Eq 91L) (last_narrow_pred f "i32");
+  check_int "unchanged" 40 o.main;
+  (* a number that applies is the baseline again *)
+  queue_narrow f ~applied:true [ gi "i32" 5 ];
+  ignore (ok (Session.next_number s "90"));
+  queue_narrow f ~applied:false [];
+  queue_narrow f ~applied:true [ gi "i32" 2 ];
+  let o = ok (Session.next_number s "85") in
+  check_bool "fell back" true (List.mem (Session.Fell_back Down) o.notes);
+  check_pred "compared with 90" Lt_prev (last_narrow_pred f "i32");
+  (* a relation step that is a dead end changes nothing, so the baseline stays *)
+  queue_narrow f ~applied:false [];
+  check_bool "relation dead end" true (ok (Session.next_relation s Up)).dead_end;
+  queue_narrow f ~applied:false [];
+  queue_narrow f ~applied:true [ gi "i32" 1 ];
+  let o = ok (Session.next_number s "99") in
+  check_bool "fell back up from 85" true (List.mem (Session.Fell_back Up) o.notes)
+
+let hunt_lost = "the hunt was lost. start again with: moth find <number>"
+
+let failed_find_and_lost_groups () =
+  (* a find whose scan fails leaves no hunt behind *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 500 ];
+  ignore (ok (Session.find s "100"));
+  queue_error f "scan" { code = "bad_request"; message = "out of memory" };
+  check_err "scan failed" "out of memory" (Session.find s "85");
+  check_err "no hunt left" no_hunt (Session.next_number s "5");
+  check_bool "nothing to show" true (Session.current s = None);
+  (* the helper no longer has a group the hunt relies on: the hunt is lost, the writes are not *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "100"));
+  queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
+  ignore (ok (Session.results s ~all:false));
+  queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
+  ignore (said (Session.set s ~row:1 "5"));
+  queue_error f "narrow" { code = "no_such_group"; message = "no group \"i32\"" };
+  check_err "lost in a step" hunt_lost (Session.next_number s "5");
+  check_err "cleared" no_hunt (Session.next_number s "5");
+  check_err "listing cleared" no_hunt (Session.set s ~row:1 "7");
+  queue_write f ~prev:(Vint 5L) ~prev_bits:5L;
+  check_str "the write can still be undone" "restored #1 to 100" (said (Session.undo s));
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "100"));
+  queue_error f "peek" { code = "no_such_group"; message = "no group \"i32\"" };
+  check_err "lost listing results" hunt_lost (Session.results s ~all:false);
+  check_err "cleared too" no_hunt (Session.results s ~all:false);
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 9 ];
+  ignore (ok (Session.find s "100"));
+  queue_error f "narrow" { code = "no_such_group"; message = "no group \"i32\"" };
+  check_err "lost in a relation step" hunt_lost (Session.next_relation s Down)
 
 let out_of_order () =
   let fresh_s, _ = fresh () in
@@ -354,7 +432,7 @@ let game_closes () =
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L);
-  ignore (ok (Session.set s ~row:1 "5"));
+  ignore (said (Session.set s ~row:1 "5"));
   queue_error f "peek" gone;
   check_err "closed during results" closed (Session.results s ~all:false);
   check_err "undo cleared" "nothing to undo" (Session.undo s);
@@ -366,7 +444,7 @@ let game_closes () =
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L);
-  ignore (ok (Session.set s ~row:1 "5"));
+  ignore (said (Session.set s ~row:1 "5"));
   queue_error f "narrow" { code = "helper_lost"; message = "" };
   check_err "helper lost" "lost contact with moth's helper. attach again." (Session.next_number s "5");
   check_err "hunt cleared" no_hunt (Session.next_number s "5");
@@ -375,8 +453,8 @@ let game_closes () =
   let s, f = fresh () in
   queue_scan f [ gi "i32" 500 ];
   ignore (ok (Session.find s "100"));
-  queue_error f "narrow" { code = "no_such_group"; message = "no group i32" };
-  check_err "passed through" "no group i32" (Session.next_number s "5");
+  queue_error f "narrow" { code = "bad_request"; message = "group listed twice: i32" };
+  check_err "passed through" "group listed twice: i32" (Session.next_number s "5");
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   check_int "hunt kept" 1 (ok (Session.next_number s "5")).main
 
@@ -417,6 +495,7 @@ let () =
           t "unfit groups" unfit_groups;
           t "relations" relations;
           t "stats and lost" stats_and_lost;
+          t "a relation step clears the baseline" relation_clears_the_baseline;
           t "current" current;
         ] );
       ( "results",
@@ -427,5 +506,5 @@ let () =
           t "listing follows the hunt" listing_follows_hunt;
           t "results selection" results_selection;
         ] );
-      ("errors", [ t "out of order" out_of_order; t "game closes" game_closes ]);
+      ("errors", [ t "out of order" out_of_order; t "game closes" game_closes; t "failed find, lost groups" failed_find_and_lost_groups ]);
     ]

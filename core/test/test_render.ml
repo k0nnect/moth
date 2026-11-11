@@ -4,12 +4,12 @@ let check_str n w g = Alcotest.(check string) n w g
 
 let outcome () =
   check_str "counts" "259,560 matches (241,178 whole number, 18,382 decimal)"
-    (Render.outcome { main = 259560; wide = 0; by_tag = [ ("whole number", 241178); ("decimal", 18382) ]; notes = []; dead_end = false; ms = 0.; bytes = 0; groups = [] });
+    (Render.outcome { main = 259560; wide = 0; by_tag = [ ("whole number", 241178); ("decimal", 18382) ]; notes = []; dead_end = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
   check_str "dead end" "nothing left that fits. that step was not applied, so you can try a different number."
-    (Render.outcome { main = 4; wide = 0; by_tag = []; notes = []; dead_end = true; ms = 0.; bytes = 0; groups = [] });
+    (Render.outcome { main = 4; wide = 0; by_tag = []; notes = []; dead_end = true; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
   check_str "fallback" "4 matches (4 whole number)\nno exact match for that number. kept the ones that went down instead."
-    (Render.outcome { main = 4; wide = 0; by_tag = [ ("whole number", 4) ]; notes = [ Fell_back Down ]; dead_end = false; ms = 0.; bytes = 0; groups = [] });
-  let plain ?(main = 0) ?(wide = 0) ?(dead_end = false) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end; ms = 0.; bytes = 0; groups = [] } in
+    (Render.outcome { main = 4; wide = 0; by_tag = [ ("whole number", 4) ]; notes = [ Fell_back Down ]; dead_end = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
+  let plain ?(main = 0) ?(wide = 0) ?(dead_end = false) ?(unreadable = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end; ms = 0.; bytes = 0; unreadable; groups = [] } in
   check_str "one match" "1 match (1 whole number)" (Render.outcome (plain ~main:1 [ ("whole number", 1) ] []));
   check_str "went up" "2 matches (2 decimal)\nno exact match for that number. kept the ones that went up instead."
     (Render.outcome (plain ~main:2 [ ("decimal", 2) ] [ Fell_back Up ]));
@@ -33,10 +33,35 @@ let outcome () =
   check_str "zero tags left out" "4 matches (4 whole number)" (Render.outcome (plain ~main:4 [ ("whole number", 4); ("decimal", 0) ] []));
   check_str "no matches" "0 matches" (Render.outcome (plain [] []));
   check_str "dead end alone" "nothing left that fits. that step was not applied, so you can try a different number."
-    (Render.outcome (plain ~main:4 ~dead_end:true [ ("whole number", 4) ] [ Untracked; Lost 3 ]))
+    (Render.outcome (plain ~main:4 ~dead_end:true [ ("whole number", 4) ] [ Untracked; Lost 3 ]));
+  check_str "unreadable"
+    "3 matches (3 whole number)\ncouldn't read 4 kb of the game's memory, so matches there are missing."
+    (Render.outcome (plain ~main:3 ~unreadable:4096 [ ("whole number", 3) ] []));
+  check_str "unreadable before the notes"
+    "2 matches (2 decimal)\n\
+     couldn't read 12 mb of the game's memory, so matches there are missing.\n\
+     no exact match for that number. kept the ones that went down instead.\n\
+     5 matches disappeared because the game freed that memory."
+    (Render.outcome (plain ~main:2 ~unreadable:(12 * 1048576) [ ("decimal", 2) ] [ Lost 5; Fell_back Down ]))
+
+let sizes () =
+  List.iter
+    (fun (n, s) -> check_str s s (Render.size n))
+    [
+      (4096, "4 kb");
+      (100, "1 kb");
+      (1536, "2 kb");
+      (1047552, "1023 kb");
+      (1048064, "1 mb");
+      (12 * 1048576, "12 mb");
+      (1073741824 - 1048576, "1023 mb");
+      (1073741824, "1.0 gb");
+      (1288490189, "1.2 gb");
+      (5 * 1073741824, "5.0 gb");
+    ]
 
 let counts () =
-  let o ?(main = 0) ?(wide = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end = false; ms = 0.; bytes = 0; groups = [] } in
+  let o ?(main = 0) ?(wide = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] } in
   check_str "counts line" "4 matches (4 whole number)" (Render.counts (o ~main:4 [ ("whole number", 4) ] [ Fell_back Down; Untracked ]));
   check_str "wide when showing wide" "3 matches (3 whole number (1-byte))" (Render.counts (o ~wide:3 [ ("whole number (1-byte)", 3) ] [ Showing_wide ]));
   check_str "none" "0 matches" (Render.counts (o [] []))
@@ -63,4 +88,13 @@ let rows () =
 
 let () =
   Alcotest.run "render"
-    [ ("render", [ Alcotest.test_case "outcome" `Quick outcome; Alcotest.test_case "counts" `Quick counts;Alcotest.test_case "commas" `Quick commas; Alcotest.test_case "rows" `Quick rows ]) ]
+    [
+      ( "render",
+        [
+          Alcotest.test_case "outcome" `Quick outcome;
+          Alcotest.test_case "counts" `Quick counts;
+          Alcotest.test_case "commas" `Quick commas;
+          Alcotest.test_case "rows" `Quick rows;
+          Alcotest.test_case "sizes" `Quick sizes;
+        ] );
+    ]

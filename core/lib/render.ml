@@ -30,11 +30,20 @@ let note_line = function
   | Untracked -> "some rarer forms are too common to track yet. they'll be rechecked on your next number."
   | Lost n -> Printf.sprintf "%s %s disappeared because the game freed that memory." (commas n) (if n = 1 then "match" else "matches")
 
+let size n =
+  let f = float_of_int n in
+  let kb = max 1 (int_of_float (Float.round (f /. 1024.))) in
+  let mb = int_of_float (Float.round (f /. 1048576.)) in
+  if kb < 1024 then Printf.sprintf "%d kb" kb else if mb < 1024 then Printf.sprintf "%d mb" mb else Printf.sprintf "%.1f gb" (f /. 1073741824.)
+
+let unreadable_line n = Printf.sprintf "couldn't read %s of the game's memory, so matches there are missing." (size n)
+
 let outcome (o : Session.outcome) =
   if o.dead_end then dead_end
   else
     let notes = List.stable_sort (fun a b -> compare (rank a) (rank b)) o.notes in
-    String.concat "\n" (counts o :: List.map note_line notes)
+    let unread = if o.unreadable > 0 then [ unreadable_line o.unreadable ] else [] in
+    String.concat "\n" ((counts o :: unread) @ List.map note_line notes)
 
 let rows = function
   | [] -> "nothing to list yet. narrow it down with your next number."

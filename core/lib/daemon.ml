@@ -71,6 +71,7 @@ type state = {
   mutable lost : bool; (* the helper said helper_lost during this request *)
   mutable gone : bool; (* the helper said target_gone during this request *)
   mutable seq : int; (* the newest event's number *)
+  mutable wrote : Yojson.Safe.t option; (* the write this request made, for its event *)
   mutable owned : (Unix.file_descr * Unix.file_descr) option; (* listener and lock, while serving *)
 }
 
@@ -105,6 +106,7 @@ let watch st (h : Helper_api.helper) : Helper_api.helper =
     peek = (fun ~id ~vtype ~offset ~limit -> see (h.peek ~id ~vtype ~offset ~limit));
     read = (fun ~addr ~vtype -> see (h.read ~addr ~vtype));
     write = (fun ~addr ~vtype v -> see (h.write ~addr ~vtype v));
+    status = (fun () -> see (h.status ()));
     detach = (fun () -> see (h.detach ()));
     close = h.close;
   }
@@ -189,19 +191,21 @@ let attach st ~bottle what =
     | Error { code = "modules_failed"; _ } -> Error (sprintf "couldn't check what's loaded in %s, so moth won't attach. try again." (List.assoc pid procs))
     | Error e -> Error (message e)
   in
-  match refuse_anticheat st (Anticheat.check ~processes ~modules) with
-  | Error m -> Error m
-  | Ok () -> (
-      match st.target with
-      | Some t when t.proc.pid = pid -> Ok t
-      | _ ->
-          (* the helper lets go of the old target when it attaches to the new one *)
-          st.target <- None;
-          let* proc = lift (h.attach pid) in
-          let t = { proc; bottle; session = Session.create h } in
-          st.gone <- false;
-          st.target <- Some t;
-          Ok t)
+  let* () = refuse_anticheat st (Anticheat.check ~processes ~modules) in
+  (* attaching again to the game already attached keeps its hunt, once the helper confirms it
+     is still attached to that pid and the process is running; a game that has closed (whose pid
+     a new one may have) is attached afresh *)
+  let same t = t.proc.pid = pid && match h.status () with Ok (Some a) -> a.pid = pid | _ -> false in
+  match st.target with
+  | Some t when same t -> Ok t
+  | _ ->
+      (* the helper lets go of the old target when it attaches to the new one *)
+      st.target <- None;
+      let* proc = lift (h.attach pid) in
+      let t = { proc; bottle; session = Session.create h } in
+      st.gone <- false;
+      st.target <- Some t;
+      Ok t
 
 let attached_line t = sprintf "attached to %s (pid %d, %d-bit) in %s" t.proc.name t.proc.pid t.proc.bits t.bottle
 
@@ -240,6 +244,7 @@ let outcome (o : Session.outcome) =
         ("dead_end", `Bool o.dead_end);
         ("ms", `Float o.ms);
         ("bytes", `Int o.bytes);
+        ("unreadable", `Int o.unreadable);
         ("groups", `List (List.map group_json o.groups));
       ],
     Render.outcome o )
@@ -254,6 +259,16 @@ let rows (rs : Session.row list) =
     Render.rows rs )
 
 let said m = (`Assoc [ ("message", `String m) ], m)
+
+(* a write for the event log: where, as which type, the bytes it replaced and the ones it put there *)
+let written_json (w : Session.written) =
+  `Assoc
+    [
+      ("addr", `String (sprintf "0x%Lx" w.where));
+      ("type", `String w.wtype);
+      ("prev_bits", Wire.bits_to_json ~vtype:w.wtype w.bits_before);
+      ("new_bits", Wire.bits_to_json ~vtype:w.wtype w.bits_after);
+    ]
 
 let status st =
   match st.target with
@@ -316,7 +331,7 @@ let record st ~actor ~cmd ~args result =
   let ok, summary = match result with Ok (_, text) -> (true, first_line text) | Error e -> (false, first_line e) in
   let ev =
     `Assoc
-      [
+      ([
         ("seq", `Int st.seq);
         ("ts", `Float (Float.round (Unix.gettimeofday () *. 1000.) /. 1000.));
         ("actor", `String actor);
@@ -325,6 +340,7 @@ let record st ~actor ~cmd ~args result =
         ("ok", `Bool ok);
         ("summary", `String summary);
       ]
+      @ match st.wrote with Some w -> [ ("write", w) ] | None -> [])
   in
   try
     let oc = open_out_gen [ Open_wronly; Open_creat; Open_append; Open_binary ] 0o600 (in_home st.home "events.jsonl") in
@@ -386,10 +402,14 @@ let handle st ~cmd ~args ~opts =
       Result.map rows (Session.results s ~all:(List.assoc_opt "all" opts = Some "true"))
   | "set", [ row; v ] ->
       let* s = session () in
-      Result.map said (Session.set s ~row:(Option.get (row_number row)) v)
+      let* text, w = Session.set s ~row:(Option.get (row_number row)) v in
+      st.wrote <- Some (written_json w);
+      Ok (said text)
   | "undo", _ ->
       let* s = session () in
-      Result.map said (Session.undo s)
+      let* text, w = Session.undo s in
+      st.wrote <- Some (written_json w);
+      Ok (said text)
   | "detach", _ -> Ok (said (detach st))
   | "log", _ -> Ok (log st opts)
   | "stop", _ ->
@@ -433,6 +453,7 @@ let answer st line =
       in
       settle st;
       record st ~actor:r.actor ~cmd:r.cmd ~args:r.args result;
+      st.wrote <- None;
       reply r.rid result
 
 let max_request = 1 lsl 20
@@ -492,7 +513,18 @@ let run ~home ~start_helper =
   (try Unix.unlink sock with Unix.Unix_error _ -> ());
   let listener = Unix.socket ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   let st =
-    { home; sock; start_helper; conn = None; target = None; lost = false; gone = false; seq = last_seq home; owned = Some (listener, lock) }
+    {
+      home;
+      sock;
+      start_helper;
+      conn = None;
+      target = None;
+      lost = false;
+      gone = false;
+      seq = last_seq home;
+      wrote = None;
+      owned = Some (listener, lock);
+    }
   in
   (* a signal wakes the loop through a pipe, so a request being served finishes first *)
   let wake_r, wake_w = Unix.pipe ~cloexec:true () in
@@ -515,6 +547,8 @@ let run ~home ~start_helper =
       loop st listener wake_r)
 
 let default_start_helper ~home ~bottle =
+  (* without crossover there are no bottles to name *)
+  let* _app = Crossover.find_app () in
   let* () = Crossover.check_bottle bottle in
   let* helper_exe = Helper_conn.helper_exe () in
   Helper_conn.start

@@ -66,10 +66,11 @@ let fixes () =
   check_ids "19 places" (ids d19) [ "f32"; "f64"; "f32u" ];
   let i id v = List.find (fun (x : Interp.t) -> x.id = id) (Interp.plan v) in
   let c = i "i32x100" (dec "1.00") in
-  check_pred "0.005" (Some (Eq 1L)) (Interp.pred_for c (dec "0.005"));
-  check_pred "132.505" (Some (Eq 13251L)) (Interp.pred_for c (dec "132.505"));
-  check_pred "-132.505" (Some (Eq (-13251L))) (Interp.pred_for c (dec "-132.505"));
-  check_pred "-0.004" (Some (Eq 0L)) (Interp.pred_for c (dec "-0.004"));
+  check_pred "0.005" None (Interp.pred_for c (dec "0.005"));
+  check_pred "132.505" None (Interp.pred_for c (dec "132.505"));
+  check_pred "-132.505" None (Interp.pred_for c (dec "-132.505"));
+  check_pred "-0.004" None (Interp.pred_for c (dec "-0.004"));
+  check_pred "trailing zeros are exact" (Some (Eq 13250L)) (Interp.pred_for c (dec "132.5000"));
   let f = i "f32" (Int 100L) in
   let show = Interp.decode f in
   check_str "1250000" "1250000" (show (Vfloat 1250000.));
@@ -84,4 +85,38 @@ let fixes () =
   check_str "inf" "inf" (show (Vfloat Float.infinity));
   check_str "-inf" "-inf" (show (Vfloat Float.neg_infinity))
 
-let () = Alcotest.run "interp" [ ("plan", [ Alcotest.test_case "cases" `Quick cases; Alcotest.test_case "fixes" `Quick fixes ]) ]
+(* a scaled form holds a number only when its decimals fit the scale exactly *)
+let scaled_exactly () =
+  let open Value in
+  let i id v = List.find (fun (x : Interp.t) -> x.id = id) (Interp.plan v) in
+  let tens = i "i32x10" (Int 100L) and cents = i "i32x100" (Int 100L) in
+  check_pred "99.25 in tenths" None (Interp.pred_for tens (dec "99.25"));
+  check_pred "99.25 in hundredths" (Some (Eq 9925L)) (Interp.pred_for cents (dec "99.25"));
+  check_pred "99.30 in tenths" (Some (Eq 993L)) (Interp.pred_for tens (dec "99.30"));
+  check_pred "99.3 in tenths" (Some (Eq 993L)) (Interp.pred_for tens (dec "99.3"));
+  check_err "set 99.25 in tenths" "99.25 has more decimal places than this value keeps" (Interp.encode tens (dec "99.25"));
+  check_err "negative" "-0.005 has more decimal places than this value keeps" (Interp.encode cents (dec "-0.005"));
+  check_enc "set 99.3 in tenths" (Ok (Vint 993L)) (Interp.encode tens (dec "99.3"));
+  check_enc "set a whole number" (Ok (Vint 990L)) (Interp.encode tens (Int 99L));
+  check_err "too big still says so" "300000000 doesn't fit in a whole number ×10" (Interp.encode tens (Int 300_000_000L));
+  (* the first number picks its scale from its own decimals *)
+  check_ids "132.505" (ids (dec "132.505")) [ "f32"; "f64"; "i32x1000"; "i64x1000"; "f32u" ];
+  check_pred "planned exactly" (Some (Eq 132505L)) (Interp.pred_for (i "i32x1000" (dec "132.505")) (dec "132.505"))
+
+let eight_byte_scaled () =
+  let i id v = List.find (fun (x : Interp.t) -> x.id = id) (Interp.plan v) in
+  check_str "i64" "whole number ×100 (8-byte)" (Interp.describe (i "i64x100" (dec "132.50")));
+  check_str "i32" "whole number ×100" (Interp.describe (i "i32x100" (dec "132.50")));
+  check_str "i64, three places" "whole number ×1000 (8-byte)" (Interp.describe (i "i64x1000" (dec "1.505")))
+
+let () =
+  Alcotest.run "interp"
+    [
+      ( "plan",
+        [
+          Alcotest.test_case "cases" `Quick cases;
+          Alcotest.test_case "fixes" `Quick fixes;
+          Alcotest.test_case "scaled exactly" `Quick scaled_exactly;
+          Alcotest.test_case "eight-byte scaled" `Quick eight_byte_scaled;
+        ] );
+    ]

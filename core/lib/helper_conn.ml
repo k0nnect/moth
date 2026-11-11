@@ -104,12 +104,12 @@ let make c =
   let int = function `Int n -> n | _ -> failwith "expected an integer" in
   let str = function `String s -> s | _ -> failwith "expected a string" in
   let list = function `List l -> l | _ -> failwith "expected a list" in
+  let attached r = { pid = int (field "pid" r); name = str (field "name" r); bits = int (field "bits" r) } in
   {
     ps = (fun () -> req "ps" [] (fun r -> List.map (fun p -> (int (field "pid" p), str (field "name" p))) (list (field "processes" r))));
     modules = (fun pid -> req "modules" [ ("pid", `Int pid) ] (fun r -> List.map str (list (field "modules" r))));
-    attach =
-      (fun pid ->
-        req "attach" [ ("pid", `Int pid) ] (fun r -> { pid = int (field "pid" r); name = str (field "name" r); bits = int (field "bits" r) }));
+    attach = (fun pid -> req "attach" [ ("pid", `Int pid) ] attached);
+    status = (fun () -> req "status" [] (fun r -> match field "attached" r with `Null -> None | a -> Some (attached a)));
     scan =
       (fun ~keep specs ->
         req ~timeout:long "scan"

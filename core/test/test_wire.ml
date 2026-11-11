@@ -89,6 +89,13 @@ let bits () =
   check_bool "not hex" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`String "0xzz")));
   check_bool "no 0x" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`String "64")));
   check_bool "a number" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`Int 64)));
+  let b vtype v = Wire.bits_of_value ~vtype v in
+  check_bool "whole number" true (b "i32" (Vint 999L) = 0x3e7L);
+  check_bool "negative, its type's bytes" true (b "i16" (Vint (-2L)) = 0xfffeL);
+  check_bool "u64" true (b "u64" (Vint (-1L)) = -1L);
+  check_bool "f32" true (b "f32" (Vfloat (-1.5)) = 0xbfc00000L);
+  check_bool "f32 rounds to single" true (b "f32" (Vfloat 0.1) = 0x3dcccccdL);
+  check_bool "f64" true (b "f64" (Vfloat 0.1) = 0x3fb999999999999aL);
   Alcotest.(check (list int)) "widths" [ 1; 1; 2; 2; 4; 4; 4; 8; 8; 8 ] (List.map Wire.width [ "i8"; "u8"; "i16"; "u16"; "i32"; "u32"; "f32"; "i64"; "u64"; "f64" ])
 
 let () =
