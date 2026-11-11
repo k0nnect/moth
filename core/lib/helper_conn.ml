@@ -37,18 +37,19 @@ let rec readable fd ~deadline =
 
 let chunk = Bytes.create 4096
 
-let rec read_line c ~deadline =
+let rec read_line ?(max = max_int) c ~deadline =
   match take_line c with
   | Some l -> `Line l
   | None ->
-      if not (readable c.fd ~deadline) then `Timeout
+      if Buffer.length c.buf > max then `Eof
+      else if not (readable c.fd ~deadline) then `Timeout
       else (
         match Unix.read c.fd chunk 0 (Bytes.length chunk) with
         | 0 -> `Eof
         | n ->
             Buffer.add_subbytes c.buf chunk 0 n;
-            read_line c ~deadline
-        | exception Unix.Unix_error (Unix.EINTR, _, _) -> read_line c ~deadline
+            read_line ~max c ~deadline
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> read_line ~max c ~deadline
         | exception Unix.Unix_error _ -> `Eof)
 
 let write_all c s =
@@ -78,11 +79,16 @@ let call c ~timeout ~op fields =
       | `Eof -> fail "the helper closed the connection"
       | `Timeout -> fail (Printf.sprintf "the helper did not answer %s within %.0fs" op timeout)
       | `Line l -> (
-          match Wire.parse_reply l with
-          | Error { code = "bad_reply"; message } -> fail ("the helper sent something that is not a reply: " ^ message)
-          | Error e -> Error e
-          | Ok (rid, _) when rid <> id -> fail (Printf.sprintf "the helper answered request %d to request %d" rid id)
-          | Ok (_, reply) -> Ok reply)
+          let mismatch =
+            match Yojson.Safe.from_string l with
+            | `Assoc f -> ( match List.assoc_opt "id" f with Some (`Int rid) when rid <> id -> Some rid | _ -> None)
+            | _ | (exception Yojson.Json_error _) -> None
+          in
+          match (mismatch, Wire.parse_reply l) with
+          | Some rid, _ -> fail (Printf.sprintf "the helper answered request %d to request %d" rid id)
+          | None, Error { code = "bad_reply"; message } -> fail ("the helper sent something that is not a reply: " ^ message)
+          | None, Error e -> Error e
+          | None, Ok (_, reply) -> Ok reply)
   end
 
 let decode f reply = try Ok (f reply) with Failure m -> Error { code = "bad_reply"; message = m }
@@ -167,20 +173,20 @@ let hello_ok ~token line =
   | _ -> false
   | exception Yojson.Json_error _ -> false
 
-let rec accept_hello listener ~token ~deadline =
+let rec accept_hello listener ~token ~deadline ~hello_timeout =
   if not (readable listener ~deadline) then None
   else
     match Unix.accept ~cloexec:true listener with
-    | exception Unix.Unix_error _ -> accept_hello listener ~token ~deadline
+    | exception Unix.Unix_error _ -> accept_hello listener ~token ~deadline ~hello_timeout
     | fd, _ -> (
         let c = new_conn fd in
-        match read_line c ~deadline with
+        match read_line ~max:4096 c ~deadline:(Float.min deadline (now () +. hello_timeout)) with
         | `Line l when hello_ok ~token l -> Some c
         | _ ->
             close_conn c;
-            accept_hello listener ~token ~deadline)
+            accept_hello listener ~token ~deadline ~hello_timeout)
 
-let start ~launch ~label ~log ?(timeout = 60.) () =
+let start ~launch ~label ~log ?(timeout = 60.) ?(hello_timeout = 5.) () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let listener = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
   Fun.protect
@@ -194,7 +200,7 @@ let start ~launch ~label ~log ?(timeout = 60.) () =
       match launch ~port ~token ~log with
       | Error m -> Error m
       | Ok () -> (
-          match accept_hello listener ~token ~deadline with
+          match accept_hello listener ~token ~deadline ~hello_timeout with
           | Some c -> Ok (make c)
           | None -> Error (Printf.sprintf "the helper didn't start in %s (waited %.0fs). see %s" label timeout log)))
 
@@ -215,7 +221,7 @@ let wine_launcher ~bottle ~helper_exe ~port ~token ~log =
 let helper_exe () =
   let path =
     match Sys.getenv_opt "MOTH_HELPER" with
-    | Some p when p <> "" -> p
+    | Some p when p <> "" -> if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p
     | _ ->
         let exe = try Unix.realpath Sys.executable_name with Unix.Unix_error _ -> Sys.executable_name in
         Filename.concat (Filename.dirname exe) "moth-helper.exe"

@@ -30,7 +30,8 @@ let serve ?(on_ps = `Answer) (ic, oc) =
             match on_ps with
             | `Answer -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"processes":[{"pid":208,"name":"disco.exe"}]}|} id)
             | `Wrong_id -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"processes":[]}|} (id + 5))
-            | `Lose -> raise Exit)
+            | `Lose -> raise Exit
+            | `Error_wrong_id -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"x"}}|} (id + 5)))
         | "scan" -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"attach first"}}|} id)
         | "peek" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"7"}]}|} id ^ "")
         | "bye" -> raise Exit
@@ -88,6 +89,42 @@ let wrong_id () =
   check_bool "mismatch is lost" true (is_code "helper_lost" (h.ps ()));
   check_bool "closed after" true (is_code "helper_lost" (h.ps ()))
 
+let error_wrong_id () =
+  let h = ok (start ~on_ps:`Error_wrong_id ()) in
+  check_bool "error with wrong id is lost" true (is_code "helper_lost" (h.ps ()));
+  check_bool "closed after" true (is_code "helper_lost" (h.ps ()))
+
+let silent_connection () =
+  let silent = ref None in
+  let launch ~port ~token ~log =
+    let s, _, _ = connect port in
+    silent := Some s;
+    fake_helper ~tokens:[ `Right ] () ~port ~token ~log
+  in
+  let h = ok (Helper_conn.start ~launch ~label:"test" ~log ~hello_timeout:0.3 ()) in
+  check_bool "ps after silent peer" true (Result.is_ok (h.ps ()));
+  h.close ();
+  Option.iter Unix.close !silent
+
+let oversized_hello () =
+  let launch ~port ~token ~log =
+    let s, _, oc = connect port in
+    output_string oc (String.make 10000 'x');
+    flush oc;
+    ignore s;
+    fake_helper ~tokens:[ `Right ] () ~port ~token ~log
+  in
+  let h = ok (Helper_conn.start ~launch ~label:"test" ~log ()) in
+  check_bool "ps" true (Result.is_ok (h.ps ()));
+  h.close ()
+
+let relative_helper () =
+  let old = Sys.getenv_opt "MOTH_HELPER" in
+  Unix.putenv "MOTH_HELPER" "test_helper_conn.exe";
+  let r = Helper_conn.helper_exe () in
+  Unix.putenv "MOTH_HELPER" (Option.value old ~default:"");
+  Alcotest.(check (result string string)) "absolute" (Ok (Filename.concat (Sys.getcwd ()) "test_helper_conn.exe")) r
+
 let () =
   Alcotest.run "helper_conn"
     [
@@ -99,5 +136,9 @@ let () =
           Alcotest.test_case "launch fails" `Quick launch_fails;
           Alcotest.test_case "connection lost" `Quick lost;
           Alcotest.test_case "wrong id" `Quick wrong_id;
+          Alcotest.test_case "error with wrong id" `Quick error_wrong_id;
+          Alcotest.test_case "silent connection" `Quick silent_connection;
+          Alcotest.test_case "oversized hello" `Quick oversized_hello;
+          Alcotest.test_case "relative MOTH_HELPER" `Quick relative_helper;
         ] );
     ]
