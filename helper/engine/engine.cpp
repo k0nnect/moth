@@ -33,6 +33,47 @@ constexpr size_t kSlice = size_t{256} << 10;
 // At most this many blocks that have been read wait for a worker.
 constexpr size_t kQueue = 4;
 
+// Memory becomes unreadable a page at a time.
+constexpr uint64_t kPage = 4096;
+
+// The bytes of a buffer that were read, as [first, second) offsets: ascending, apart.
+using Spans = std::vector<std::pair<size_t, size_t>>;
+
+void add_span(Spans& spans, size_t from, size_t to) {
+  if (from == to) return;
+  if (!spans.empty() && spans.back().second == from)
+    spans.back().second = to;
+  else
+    spans.push_back({from, to});
+}
+
+// Reads n bytes at addr into buf + at and appends the offsets that arrived to spans. Everything
+// readable costs one read. A read that comes back short is continued from where it stopped; one
+// that gets nothing and covers more than one page is split in two at a page boundary near its
+// middle, and each half read the same way. So with a read that gets all or nothing (as
+// ReadProcessMemory does), an unreadable page loses only its own bytes, at about two reads per
+// halving. Splitting stops once the process has closed. Returns the bytes read.
+size_t read_spans(ProcessMemory& mem, uint64_t addr, uint8_t* buf, size_t at, size_t n, Spans& spans) {
+  size_t total = 0;
+  while (n > 0) {
+    const size_t got = std::min(mem.read(addr, buf + at, n), n);
+    add_span(spans, at, at + got);
+    if (got == 0) break;
+    total += got;
+    addr += got;
+    at += got;
+    n -= got;
+  }
+  if (n == 0) return total;
+  const uint64_t first = addr - addr % kPage + kPage;  // the first page boundary after addr
+  const uint64_t last = (addr + n - 1) - (addr + n - 1) % kPage;  // the last one before the end
+  if (first > last || !mem.alive()) return total;      // one page, or the game is gone
+  const uint64_t mid = std::clamp<uint64_t>((addr + n / 2) - (addr + n / 2) % kPage, first, last);
+  const size_t left = static_cast<size_t>(mid - addr);
+  total += read_spans(mem, addr, buf, at, left, spans);
+  return total + read_spans(mem, mid, buf, at + left, n - left, spans);
+}
+
 bool compares_with_last(const Pred& p) {
   return p.op == Pred::LtPrev || p.op == Pred::GtPrev || p.op == Pred::EqPrev || p.op == Pred::NePrev;
 }
@@ -81,25 +122,35 @@ class Bytes {
 struct Job {
   uint64_t base = 0;
   uint32_t span = 0;       // the block's own bytes; data holds up to kOverlap more
-  size_t got = 0;          // bytes read
-  size_t limit = 0;        // bytes searched: positions start below this
+  Spans parts;             // the bytes of data that were read
   Bytes data;
   std::vector<PositionSet::Block> found;  // per group, set by the worker
   bool searched = false;
 };
 
-// Searches a job's block kSlice bytes at a time, compacting each slice's matches before the next.
-// hits is the worker's own scratch for one slice's raw offsets.
+// The bytes of a job's block, not its overlap, that were read.
+uint64_t block_bytes(const Job& j) {
+  uint64_t n = 0;
+  for (const auto& [from, to] : j.parts) n += from < j.span ? std::min<size_t>(to, j.span) - from : 0;
+  return n;
+}
+
+// Searches the parts of a job's block that were read, kSlice bytes at a time, compacting each
+// slice's matches before the next. A value is found only when all its bytes were read. hits is
+// the worker's own scratch for one slice's raw offsets.
 void search(Job& j, std::span<const GroupSpec> groups, std::vector<std::vector<uint32_t>>& hits) {
   std::vector<PositionSet::Builder> found;
   found.reserve(groups.size());
   for (const GroupSpec& g : groups) found.emplace_back(g.align, j.base, j.span);
-  for (size_t s = 0; s < j.limit; s += kSlice) {
-    // the slice's values may run on into the bytes after it, which are in the buffer
-    scan_block(j.data.data() + s, j.got - s, std::min(kSlice, j.limit - s), j.base + s, groups, hits);
-    for (size_t i = 0; i < groups.size(); i++) {
-      found[i].add(hits[i], static_cast<uint32_t>(s));
-      hits[i].clear();
+  for (const auto& [from, to] : j.parts) {
+    const size_t limit = std::min<size_t>(to, j.span);  // positions start in the block's own bytes
+    for (size_t s = from; s < limit; s += kSlice) {
+      // the slice's values may run on into the bytes after it, up to the end of the part
+      scan_block(j.data.data() + s, to - s, std::min(kSlice, limit - s), j.base + s, groups, hits);
+      for (size_t i = 0; i < groups.size(); i++) {
+        found[i].add(hits[i], static_cast<uint32_t>(s));
+        hits[i].clear();
+      }
     }
   }
   j.found.clear();
@@ -282,11 +333,12 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
       j->base = r.base + off;
       j->span = static_cast<uint32_t>(std::min<uint64_t>(cfg_.block_size, left));
       const size_t want = static_cast<size_t>(std::min<uint64_t>(j->span + kOverlap, left));
-      j->got = std::min(mem_.read(j->base, j->data.data(), want), want);
-      j->limit = std::min<size_t>(j->span, j->got);  // a short read searches what arrived
-      stats.bytes += j->limit;
-      stats.unreadable_bytes += j->span - j->limit;
-      if (j->limit == 0) {
+      j->parts.clear();
+      read_spans(mem_, j->base, j->data.data(), 0, want, j->parts);  // only what arrived is searched
+      const uint64_t got = block_bytes(*j);
+      stats.bytes += got;
+      stats.unreadable_bytes += j->span - got;
+      if (got == 0) {
         searchers.release(j);
         continue;
       }
@@ -400,8 +452,9 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
 // its predicate, with values captured while its count is within value_cap.
 // Groups from one scan share their blocks, so a block is narrowed together with every listed
 // group's block at the same base and span: their positions are merged into runs, each run is read
-// with one call, and every group is tested on the same bytes. Blocks that differ (groups from scans
-// of a changed memory map) are read on their own. A position its run's read did not reach is lost.
+// with one call while all of it is readable, and every group is tested on the same bytes. Blocks
+// that differ (groups from scans of a changed memory map) are read on their own. A position whose
+// bytes could not be read is lost.
 std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items,
                                             ScanStats& stats) {
   struct Lane {
@@ -414,13 +467,15 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
   // Positions first..last of a block (offsets), whose values take bytes [first, end).
   struct Run {
     uint32_t first, last, end;
-    size_t at = 0, got = 0;  // where its bytes are in the buffer, and how many were read
+    size_t at = 0;       // where its bytes are in the buffer
+    bool whole = false;  // all of them were read
   };
   std::vector<Lane> lanes;
   lanes.reserve(at.size());
   for (size_t i = 0; i < at.size(); i++) lanes.push_back({&groups_[at[i]], &items[i].pred, Group(groups_[at[i]].spec)});
   std::vector<size_t> set;  // the lanes narrowing the current block
   std::vector<Run> spans, runs;
+  Spans arrived;            // the buffer bytes that were read, run after run
   Bytes buf;
   for (;;) {
     // the lowest next block among the lanes, and every lane whose next block is the same
@@ -467,17 +522,19 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
       }
     }
 
-    // each run read once, packed one after another into the buffer
+    // each run read (with one call unless part of it is unreadable), packed one after another
+    // into the buffer
     size_t need = 0;
     for (Run& r : runs) {
       r.at = need;
       need += r.end - r.first;
     }
     uint8_t* data = buf.reserve(need);
+    arrived.clear();
     for (Run& r : runs) {
-      const size_t want = r.end - r.first;
-      r.got = std::min(mem_.read(base + r.first, data + r.at, want), want);
-      stats.bytes += r.got;
+      const size_t got = read_spans(mem_, base + r.first, data, r.at, r.end - r.first, arrived);
+      r.whole = got == r.end - r.first;
+      stats.bytes += got;
     }
 
     for (size_t i : set) {
@@ -488,18 +545,23 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
       const size_t w = width_of(t);
       Group& out = lane.out;
       PositionSet::Builder keep(g.spec.align, b.base, b.span);
-      size_t r = 0;
+      // the run holding the position, and the first span of arrived that ends at or past its
+      // value's bytes: both only move forward, since the value's place in the buffer does
+      size_t r = 0, k = 0;
       g.positions.for_each_in(b, [&](uint32_t o) {
         while (runs[r].last < o) r++;  // every position is in a run; other lanes' runs are skipped
         const uint64_t prev = g.has_values ? g.values[static_cast<size_t>(lane.index)] : 0;
         lane.index++;
-        const size_t off = o - runs[r].first;
-        if (off + w > runs[r].got) {
-          stats.lost++;
-          return;
+        const size_t x = runs[r].at + (o - runs[r].first);  // the value's bytes in the buffer
+        if (!runs[r].whole) {
+          while (k < arrived.size() && arrived[k].second < x + w) k++;
+          if (k == arrived.size() || arrived[k].first > x) {  // not all of them were read
+            stats.lost++;
+            return;
+          }
         }
         uint64_t cur = 0;
-        std::memcpy(&cur, data + runs[r].at + off, w);  // little-endian host
+        std::memcpy(&cur, data + x, w);  // little-endian host
         if (!matches(*lane.pred, t, cur, prev)) return;
         keep.add(o);
         out.count++;

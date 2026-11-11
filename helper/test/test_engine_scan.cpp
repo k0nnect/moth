@@ -42,6 +42,31 @@ TEST_CASE("unreadable region is counted, not fatal") {
   Engine e(m); ScanStats s; CHECK(e.scan({G("a", I32, 4, 0, eq(100))}, false, s)[0].count == 0);
   CHECK(s.unreadable_bytes == 4096);
 }
+TEST_CASE("a freed page in a block hides only its own bytes") {
+  // reads get all or nothing; the hole is in the middle of one 4 MiB block, or starts a 1 MiB
+  // block whose neighbour's read runs 7 bytes into it
+  for (size_t block : {size_t{16} << 20, size_t{1} << 20}) {
+    CAPTURE(block);
+    FakeMemory m; m.set_all_or_nothing(true); const uint64_t base = 0x10000000; m.add_region(base, 4u << 20);
+    const uint64_t hole = base + (2u << 20);
+    for (uint64_t a : {base + 8, hole - 8, hole + 64, hole + 4096, base + (4u << 20) - 4}) m.poke<int32_t>(a, 100);
+    m.poke<int32_t>(base + 0x101, 100);                                 // unaligned, readable
+    m.poke<uint16_t>(hole - 2, 100);                                    // an unaligned 100 only with the hole's zeros
+    m.free_page(hole);
+    Engine e(m, {.block_size = block}); ScanStats s;
+    auto g = e.scan({G("a", I32, 4, 0, eq(100)), G("u", I32, 1, 4, eq(100))}, false, s);
+    CHECK(g[0].count == 4); CHECK(g[1].count == 1);
+    CHECK(s.unreadable_bytes == 4096); CHECK(s.bytes == (4u << 20) - 4096);
+    auto p = e.peek("a", 0, 9);
+    REQUIRE(p.size() == 4); CHECK(p[1].addr == hole - 8); CHECK(p[2].addr == hole + 4096);
+    CHECK(e.peek("u", 0, 9)[0].addr == base + 0x101);
+  }
+}
+TEST_CASE("a readable block is read with one call") {
+  FakeMemory m; m.set_all_or_nothing(true); m.add_region(0x10000000, 4u << 20);
+  Engine e(m); ScanStats s; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  CHECK(m.read_calls == 1); CHECK(s.unreadable_bytes == 0);
+}
 TEST_CASE("values are kept only up to value_cap") {
   FakeMemory m; m.add_region(0x10000, 4096); for (int i = 0; i < 5; i++) m.poke<int32_t>(0x10000 + i * 4, 100);
   Engine e(m, {.value_cap = 4}); ScanStats s; auto g = e.scan({G("a", I32, 4, 0, eq(100))}, false, s);

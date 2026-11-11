@@ -134,6 +134,34 @@ TEST_CASE("a short read keeps what arrived and loses the rest") {
   m.poke<int32_t>(0x10000, 100); m.poke<int32_t>(0x10010, 100);
   CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(g[0].count == 2); CHECK(s.lost == 1); CHECK(s.bytes == 0x18);
 }
+TEST_CASE("a freed page in a dense run loses only the candidates in it") {
+  // 256 candidates 16 KiB apart make one run over the whole 4 MiB; reads get all or nothing
+  FakeMemory m; m.set_all_or_nothing(true); const uint64_t base = 0x10000000; m.add_region(base, 4u << 20);
+  for (uint64_t i = 0; i < 256; i++) m.poke<int32_t>(base + i * 16384 + 64, 100);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  REQUIRE(e.groups()[0].count == 256);
+  const uint64_t run = 255 * 16384 + 4;
+  m.read_calls = 0;
+  CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(m.read_calls == 1); CHECK(s.bytes == run);
+  m.free_page(base + 5 * 16384 + 4096);                                 // holds no candidate
+  uint8_t probe[8]; CHECK(m.read(base + 5 * 16384 + 4096 - 4, probe, 8) == 0);
+  m.read_calls = 0;
+  CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(s.lost == 0); CHECK(g[0].count == 256);
+  CHECK(s.bytes == run - 4096); CHECK(m.read_calls < 64);               // split, not page by page
+  m.free_page(base + 9 * 16384);                                        // holds the tenth candidate
+  CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(s.lost == 1); CHECK(g[0].count == 255);
+  CHECK(s.bytes == run - 8192);
+  auto p = e.peek("a", 9, 1); REQUIRE(p.size() == 1); CHECK(p[0].addr == base + 10 * 16384 + 64);
+}
+TEST_CASE("a candidate whose bytes run into a freed page is lost") {
+  FakeMemory m; m.set_all_or_nothing(true); m.add_region(0x10000, 3 * 4096);
+  m.poke<int32_t>(0x10ffe, 100); m.poke<int32_t>(0x10100, 100); m.poke<int32_t>(0x12000, 100);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("u", I32, 1, 0, eq(100))}, false, s);
+  REQUIRE(e.groups()[0].count == 3);
+  m.free_page(0x11000);
+  CHECK(e.narrow({{"u", eq(100)}}, true, g, s)); CHECK(s.lost == 1); CHECK(g[0].count == 2);
+  CHECK(e.peek("u", 0, 9)[1].addr == 0x12000);
+}
 TEST_CASE("the game closing in the middle of a narrow changes nothing") {
   DyingMemory m; three(m); m.add_region(0x50000, 4096); m.poke<int32_t>(0x50000, 100);
   Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -14,11 +15,20 @@ namespace moth::test {
 
 class FakeMemory : public ProcessMemory {
  public:
+  static constexpr uint64_t kPage = 4096;
+
   void add_region(uint64_t base, size_t size) { regions_[base] = Reg{base, std::vector<uint8_t>(size, 0)}; }
   void remove_region(uint64_t base) { regions_.erase(base); }
   void set_unreadable(uint64_t base, bool v) { regions_.at(base).unreadable = v; }
   void set_readonly(uint64_t base, bool v) { regions_.at(base).readonly = v; }
   void set_alive(bool v) { alive_ = v; }
+  // The page holding addr can no longer be read or written, while its region stays listed, as
+  // when a game decommits one page of a larger allocation after the regions were walked.
+  void free_page(uint64_t addr) { freed_.insert(addr - addr % kPage); }
+  // On: a read that cannot get every byte it asks for gets none, as ReadProcessMemory does, and
+  // a read runs on into a region that starts where the last one ends. Off (the default): a read
+  // stops at the end of the region holding addr, or at a freed page, and returns what it got.
+  void set_all_or_nothing(bool v) { all_or_nothing_ = v; }
 
   // Direct access for setting up and checking a test; ignores every switch.
   template <class T> void poke(uint64_t addr, T v) { std::memcpy(at(addr, sizeof(T)), &v, sizeof(T)); }
@@ -40,14 +50,18 @@ class FakeMemory : public ProcessMemory {
     return out;
   }
 
-  // Reads stop at the end of the region holding addr, like a partial ReadProcessMemory.
   size_t read(uint64_t addr, void* out, size_t len) override {
     read_calls++;
-    Reg* r = holding(addr);
-    if (!alive_ || r == nullptr || r->unreadable) return 0;
-    const size_t off = static_cast<size_t>(addr - r->base);
-    const size_t n = len < r->bytes.size() - off ? len : r->bytes.size() - off;
-    std::memcpy(out, r->bytes.data() + off, n);
+    if (!alive_) return 0;
+    size_t n = readable(addr, len, all_or_nothing_);
+    if (all_or_nothing_ && n < len) n = 0;
+    for (size_t done = 0; done < n;) {  // region by region
+      Reg* r = holding(addr + done);
+      const size_t off = static_cast<size_t>(addr + done - r->base);
+      const size_t k = n - done < r->bytes.size() - off ? n - done : r->bytes.size() - off;
+      std::memcpy(static_cast<uint8_t*>(out) + done, r->bytes.data() + off, k);
+      done += k;
+    }
     bytes_read += n;
     return n;
   }
@@ -56,7 +70,7 @@ class FakeMemory : public ProcessMemory {
     Reg* r = holding(addr);
     if (!alive_ || r == nullptr || r->unreadable || r->readonly) return false;
     const size_t off = static_cast<size_t>(addr - r->base);
-    if (len > r->bytes.size() - off) return false;
+    if (len > r->bytes.size() - off || readable(addr, len, false) < len) return false;
     std::memcpy(r->bytes.data() + off, data, len);
     return true;
   }
@@ -78,6 +92,24 @@ class FakeMemory : public ProcessMemory {
     return addr - it->first < it->second.bytes.size() ? &it->second : nullptr;
   }
 
+  // How many bytes from addr, up to len, can be read in a row: to the end of the region holding
+  // addr (on through adjacent regions when across), stopping at an unreadable region or a freed page.
+  size_t readable(uint64_t addr, size_t len, bool across) {
+    size_t n = 0;
+    while (n < len) {
+      const uint64_t a = addr + n;
+      Reg* r = holding(a);
+      if (r == nullptr || r->unreadable) break;
+      const uint64_t left = r->base + r->bytes.size() - a;
+      size_t here = len - n < left ? len - n : static_cast<size_t>(left);
+      auto f = freed_.lower_bound(a - a % kPage);  // the first freed page that ends after a
+      if (f != freed_.end() && *f < a + here) return n + static_cast<size_t>(*f > a ? *f - a : 0);
+      n += here;
+      if (!across) break;
+    }
+    return n;
+  }
+
   uint8_t* at(uint64_t addr, size_t len) {
     Reg* r = holding(addr);
     if (r == nullptr || len > r->bytes.size() - (addr - r->base)) throw std::out_of_range("fake memory: no region there");
@@ -85,7 +117,9 @@ class FakeMemory : public ProcessMemory {
   }
 
   std::map<uint64_t, Reg> regions_;
+  std::set<uint64_t> freed_;  // page bases
   bool alive_ = true;
+  bool all_or_nothing_ = false;
 };
 
 // Fills [base, base + size) with xorshift64 output from seed, the same bytes for the same seed.
