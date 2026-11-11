@@ -154,3 +154,33 @@ TEST_CASE("drop and reply shape") {
   CHECK(code(h, "[1]") == "bad_request");
   CHECK(code(h, R"({"id":1})") == "bad_request");
 }
+
+TEST_CASE("a failed keep:false scan leaves the old groups usable") {
+  FakePlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x10000, 4096); p.mem(1).poke<int32_t>(0x10008, 7);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  h.handle_line(R"({"op":"scan","keep":false,"groups":[{"id":"a","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"7"}}]})");
+  const char* g = R"({"id":"d","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"7"}})";
+  CHECK(code(h, std::string(R"({"op":"scan","keep":false,"groups":[)") + g + "," + g + "]}") == "bad_request");  // duplicate id
+  auto pk = J(h.handle_line(R"({"op":"peek","group":"a","offset":0,"limit":5})"));
+  CHECK(pk["ok"] == true); CHECK(pk["items"][0]["v"] == "7");
+  CHECK(code(h, R"({"op":"narrow","atomic":false,"groups":[{"id":"a","pred":{"op":"eq","v":"7"}}]})") == "ok");
+  p.mem(1).set_alive(false);  // target_gone before the engine clears anything
+  CHECK(code(h, std::string(R"({"op":"scan","keep":false,"groups":[)") + g + "]}") == "target_gone");
+  p.mem(1).set_alive(true);
+  CHECK(code(h, R"({"op":"peek","group":"a","offset":0,"limit":5})") == "ok");
+}
+
+TEST_CASE("budget_mb lasts for the hunt and resets on the next keep:false scan") {
+  FakePlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x100000, size_t{64} << 20);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  auto grp = [](const char* id) {
+    return std::string(R"({"id":")") + id + R"(","type":"u8","align":1,"exclude_align":0,"pred":{"op":"eq","v":"0"}})";
+  };
+  auto tracked = [&](const std::string& body, size_t i) {
+    return J(h.handle_line(body))["groups"][i]["tracked"].get<bool>();
+  };
+  CHECK_FALSE(tracked(R"({"op":"scan","keep":false,"budget_mb":1,"groups":[)" + grp("a") + "]}", 0));
+  CHECK_FALSE(tracked(R"({"op":"scan","keep":true,"groups":[)" + grp("b") + "]}", 0));      // carried
+  CHECK(tracked(R"({"op":"scan","keep":false,"groups":[)" + grp("c") + "]}", 0));            // reset
+  CHECK(tracked(R"({"op":"scan","keep":true,"groups":[)" + grp("d") + "]}", 0));
+}

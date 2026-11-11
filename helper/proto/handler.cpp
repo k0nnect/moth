@@ -322,12 +322,16 @@ struct Handler::Impl {
       if (align > std::numeric_limits<uint32_t>::max() || excl > std::numeric_limits<uint32_t>::max()) bad("align out of range");
       specs.push_back(GroupSpec{get_str(g, "id"), t, static_cast<uint32_t>(align), static_cast<uint32_t>(excl), parse_pred(get_obj(g, "pred"), t, false)});
     }
+    // A hunt starts with a keep=false scan: its budget_mb (or the configured budget) holds for
+    // the hunt, and keep=true scans without budget_mb carry it on.
     const uint64_t before = eng->budget_bytes();
     auto bud = req.find("budget_mb");
     if (bud != req.end()) {
       const uint64_t mb = uint_of(*bud, "budget_mb");
       if (mb == 0 || mb > kMaxBudgetMb) bad("\"budget_mb\" out of range");
       eng->set_budget_bytes(mb << 20);
+    } else if (!keep) {
+      eng->set_budget_bytes(cfg.budget_bytes);
     }
     ScanStats st;
     std::vector<GroupInfo> out;
@@ -335,8 +339,7 @@ struct Handler::Impl {
       out = eng->scan(specs, keep, st);
     } catch (...) {
       eng->set_budget_bytes(before);
-      if (!keep) types.clear();
-      sync_types();
+      sync_types();  // the engine's group list is the truth: it may or may not have cleared it
       throw;
     }
     if (!keep) types.clear();
