@@ -250,3 +250,5 @@ let undo t =
           Ok (Printf.sprintf "restored #%d to %s" w.wn (Interp.decode w.wi w.prev)))
 
 let writes t = List.map (fun w -> (w.waddr, w.wi.vtype, w.prev, w.next)) t.undo
+
+let current t = Option.map (fun h -> outcome_of (tally ()) h.current) t.hunt

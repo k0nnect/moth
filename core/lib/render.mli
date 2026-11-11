@@ -3,6 +3,9 @@
 (** the counts line, then one line per note in a fixed order; a dead end is one line alone *)
 val outcome : Session.outcome -> string
 
+(** the counts line alone: the total shown (the wide tier's under [Showing_wide]) and its tags *)
+val counts : Session.outcome -> string
+
 (** one line per row: number, value, address, tag *)
 val rows : Session.row list -> string
 

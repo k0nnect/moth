@@ -1,7 +1,7 @@
 (tests
- (names test_sanity test_value test_interp test_wire test_session test_render test_crossover test_anticheat)
+ (names test_sanity test_value test_interp test_wire test_session test_render test_crossover test_anticheat test_daemon)
  (modules :standard \ test_helper_conn)
- (libraries moth_core yojson alcotest unix))
+ (libraries moth_core yojson alcotest unix threads.posix))
 
 (test
  (name test_helper_conn)

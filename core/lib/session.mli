@@ -43,3 +43,7 @@ val undo : t -> (string, string) result
 
 (** the writes [undo] can still reverse: addr, vtype, previous, new; newest first *)
 val writes : t -> (int64 * string * Helper_api.value * Helper_api.value) list
+
+(** the hunt as it stands, or [None] when there is none: the counts, tags, groups and the notes
+    the groups imply ([Showing_wide], [Untracked]); [ms] and [bytes] are 0 *)
+val current : t -> outcome option

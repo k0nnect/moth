@@ -35,6 +35,12 @@ let outcome () =
   check_str "dead end alone" "nothing left that fits. that step was not applied, so you can try a different number."
     (Render.outcome (plain ~main:4 ~dead_end:true [ ("whole number", 4) ] [ Untracked; Lost 3 ]))
 
+let counts () =
+  let o ?(main = 0) ?(wide = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end = false; ms = 0.; bytes = 0; groups = [] } in
+  check_str "counts line" "4 matches (4 whole number)" (Render.counts (o ~main:4 [ ("whole number", 4) ] [ Fell_back Down; Untracked ]));
+  check_str "wide when showing wide" "3 matches (3 whole number (1-byte))" (Render.counts (o ~wide:3 [ ("whole number (1-byte)", 3) ] [ Showing_wide ]));
+  check_str "none" "0 matches" (Render.counts (o [] []))
+
 let commas () =
   List.iter
     (fun (n, s) -> check_str s s (Render.commas n))
@@ -57,4 +63,4 @@ let rows () =
 
 let () =
   Alcotest.run "render"
-    [ ("render", [ Alcotest.test_case "outcome" `Quick outcome; Alcotest.test_case "commas" `Quick commas; Alcotest.test_case "rows" `Quick rows ]) ]
+    [ ("render", [ Alcotest.test_case "outcome" `Quick outcome; Alcotest.test_case "counts" `Quick counts;Alcotest.test_case "commas" `Quick commas; Alcotest.test_case "rows" `Quick rows ]) ]

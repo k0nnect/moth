@@ -366,6 +366,27 @@ let game_closes () =
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   check_int "hunt kept" 1 (ok (Session.next_number s "5")).main
 
+let current () =
+  let s, f = fresh () in
+  check_bool "no hunt yet" true (Session.current s = None);
+  queue_scan f ~stats:(stats ~bytes:4096 3.) [ gi "i32" 2; gi "f32" 1; gi "u8" 40; gi ~tracked:false "i32u" 900000 ];
+  let found = ok (Session.find s "100") in
+  let o = Option.get (Session.current s) in
+  check_int "main" 3 o.main;
+  check_int "wide" 40 o.wide;
+  check_ids "groups" (ids_of found) (ids_of o);
+  check_bool "by tag" true (o.by_tag = found.by_tag);
+  check_bool "notes from the groups" true (o.notes = [ Session.Untracked ]);
+  check_bool "not a dead end" false o.dead_end;
+  check_bool "no step cost" true (o.ms = 0. && o.bytes = 0);
+  queue_narrow f ~applied:true [ gi "i32" 1; gi "f32" 0; gi "u8" 0 ];
+  queue_scan f [ gi ~tracked:false "i32u" 800000 ];
+  ignore (ok (Session.next_number s "85"));
+  check_int "follows the hunt" 1 (Option.get (Session.current s)).main;
+  queue_error f "narrow" gone;
+  ignore (Session.next_number s "5");
+  check_bool "gone with the game" true (Session.current s = None)
+
 let () =
   let t n f = Alcotest.test_case n `Quick f in
   Alcotest.run "session"
@@ -382,6 +403,7 @@ let () =
           t "unfit groups" unfit_groups;
           t "relations" relations;
           t "stats and lost" stats_and_lost;
+          t "current" current;
         ] );
       ( "results",
         [
