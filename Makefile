@@ -7,7 +7,7 @@ DUNE := opam exec -- dune
 CMAKE := cmake -G "Unix Makefiles"
 JOBS ?= $(shell sysctl -n hw.ncpu)
 
-.PHONY: setup build test test-native test-core bench-native helper clean
+.PHONY: setup build test test-native test-core bench-native helper smoke clean
 
 setup:
 	opam init --bare --no-setup -y
@@ -41,6 +41,12 @@ helper:
 	cmake --build build/win64 -j $(JOBS)
 	$(CMAKE) -S helper -B build/win32 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$(CURDIR)/helper/cmake/mingw-w64-i686.cmake
 	cmake --build build/win32 -j $(JOBS)
+
+smoke: helper
+	@mkdir -p build && rm -f build/smoke.out
+	@(printf '{"id":1,"op":"ps"}\n{"id":2,"op":"bye"}\n' | nc -l 127.0.0.1 47113 > build/smoke.out) & \
+	 sleep 1; "$(WINE)" --bottle "$(MOTH_TEST_BOTTLE)" --workdir "$(CURDIR)/bin" "$(CURDIR)/bin/moth-helper.exe" 47113 smoketoken >/dev/null 2>&1; wait
+	@grep -q '"hello"' build/smoke.out && grep -q 'smoketoken' build/smoke.out && grep -q 'moth-helper.exe' build/smoke.out && echo "smoke ok"
 
 clean:
 	rm -rf build bin _build
