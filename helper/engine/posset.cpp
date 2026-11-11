@@ -4,25 +4,38 @@
 
 namespace moth {
 
+PositionSet::Builder::Builder(uint32_t align, uint64_t base, uint32_t span)
+    : align_(align), first_(first_offset(align, base)) {
+  const uint64_t slots = span > first_ ? (uint64_t{span} - first_ + align - 1) / align : 0;
+  nwords_ = static_cast<size_t>((slots + 31) / 32);
+  block_.base = base;
+  block_.span = span;
+}
+
+// Once the list holds more offsets than the bitmap has words, the bitmap is smaller.
+void PositionSet::Builder::to_bitmap() {
+  std::vector<uint32_t> offsets;
+  offsets.swap(block_.words);
+  block_.words.assign(nwords_, 0);
+  block_.bitmap = true;
+  for (uint32_t o : offsets) set_bit(o);
+}
+
+PositionSet::Block PositionSet::Builder::finish() {
+  // a list grown one offset at a time may have spare room; storage counts capacity, so trim it
+  if (!block_.bitmap && block_.words.capacity() != block_.words.size())
+    block_.words = std::vector<uint32_t>(block_.words.begin(), block_.words.end());
+  return std::move(block_);
+}
+
 void PositionSet::add_block(uint64_t base, uint32_t span, std::span<const uint32_t> offsets) {
-  if (offsets.empty()) return;
-  Block b;
-  b.base = base;
-  b.span = span;
-  b.count = static_cast<uint32_t>(offsets.size());
-  const uint32_t first = first_offset(base);
-  const uint64_t slots = span > first ? (uint64_t{span} - first + align_ - 1) / align_ : 0;
-  const uint64_t nwords = (slots + 31) / 32;
-  if (nwords < offsets.size()) {
-    b.bitmap = true;
-    b.words.assign(static_cast<size_t>(nwords), 0);
-    for (uint32_t o : offsets) {
-      const uint32_t slot = (o - first) / align_;
-      b.words[slot / 32] |= 1u << (slot % 32);
-    }
-  } else {
-    b.words.assign(offsets.begin(), offsets.end());
-  }
+  Builder b(align_, base, span);
+  b.add(offsets, 0);
+  append(b.finish());
+}
+
+void PositionSet::append(Block b) {
+  if (b.count == 0) return;
   count_ += b.count;
   word_bytes_ += b.words.capacity() * sizeof(uint32_t);
   blocks_.push_back(std::move(b));

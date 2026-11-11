@@ -34,7 +34,7 @@ struct EngineConfig {
   uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed once a scan ends
   uint64_t value_cap = 2'000'000;         // a group keeps values only while it has at most this many positions
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
-  unsigned workers = 1;
+  unsigned workers = 1;                   // threads searching a scan's blocks; 0: hardware threads - 1, from 1 to 8
 };
 
 struct Item {
@@ -51,7 +51,9 @@ class Engine {
  public:
   explicit Engine(ProcessMemory& mem, EngineConfig cfg = {});
 
-  // Searches every writable region for each group. keep=false replaces all groups; keep=true
+  // Searches every writable region for each group. Blocks are read on the calling thread in
+  // address order, searched on workers_used() threads, and added to the groups in address order,
+  // so the result is the same for any worker count. keep=false replaces all groups; keep=true
   // replaces only groups with a listed id, and the listed groups then follow the others in
   // groups(). Returns the listed groups in request order. If the storage is then over
   // budget_bytes, listed groups are untracked from the last one backwards until it fits.
@@ -69,7 +71,8 @@ class Engine {
   // Returns applied. With atomic=true, if the listed groups would be left with zero matches in
   // total, nothing changes and it returns false. Groups not listed are untouched. out gets the
   // listed groups in request order, as they stand afterwards.
-  // Positions are read in runs (see engine.cpp); a position whose memory can no longer be read is
+  // Positions are read in runs shared by the listed groups (see engine.cpp), so groups from one
+  // scan read the memory they share once; a position whose memory can no longer be read is
   // dropped and counted in stats.lost, which stays 0 when nothing changes. After an applied narrow
   // a group with at most value_cap positions stores the values just read, unless values it did not
   // have before would take storage over budget_bytes.
@@ -92,6 +95,11 @@ class Engine {
 
   std::vector<GroupInfo> groups() const;
   uint64_t storage_bytes() const;  // heap bytes held by every group's positions and values
+  unsigned workers_used() const { return workers_; }  // EngineConfig::workers, resolved
+  // The most raw 32-bit offsets (matches not yet compacted into positions) that the last scan's
+  // workers had room for at once. A worker compacts each 256 KiB slice of a block before the
+  // next, so this stays within one slice's worth per worker.
+  uint64_t peak_raw_offsets() const { return peak_raw_offsets_; }
 
  private:
   struct Group {
@@ -109,13 +117,15 @@ class Engine {
   static void untrack(Group& g);
   size_t index_of(const std::string& id) const;
   const Group& find(const std::string& id) const;
-  void add_hits(Group& g, uint64_t base, size_t span, const uint8_t* data, const std::vector<uint32_t>& offsets);
+  void add_found(Group& g, PositionSet::Block b, const uint8_t* data);
   void fit_budget(std::vector<Group>& fresh, uint64_t kept, bool with_values);
-  Group narrowed(const Group& g, const Pred& p, std::vector<uint8_t>& buf, ScanStats& stats);
+  std::vector<Group> narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items, ScanStats& stats);
   void fit_gained_values(std::vector<Group>& fresh, const std::vector<size_t>& at);
 
   ProcessMemory& mem_;
   EngineConfig cfg_;
+  unsigned workers_;
+  uint64_t peak_raw_offsets_ = 0;
   std::vector<Group> groups_;
 };
 

@@ -20,11 +20,46 @@ class PositionSet {
     std::vector<uint32_t> words;
   };
 
+  // Builds one block from its offsets, given a few at a time: ascending, below span, and aligned
+  // to align by absolute address. It holds them as a list until the bitmap would be smaller, then
+  // as the bitmap, so it never needs much more than the finished block, which is the same block
+  // add_block makes from the same offsets.
+  class Builder {
+   public:
+    Builder(uint32_t align, uint64_t base, uint32_t span);
+    void add(uint32_t o) {
+      block_.count++;
+      if (block_.bitmap) {
+        set_bit(o);
+        return;
+      }
+      block_.words.push_back(o);
+      if (block_.words.size() > nwords_) to_bitmap();
+    }
+    void add(std::span<const uint32_t> offsets, uint32_t shift) {  // adds each offset + shift
+      for (uint32_t o : offsets) add(o + shift);
+    }
+    Block finish();  // call once
+
+   private:
+    void set_bit(uint32_t o) {
+      const uint32_t slot = (o - first_) / align_;
+      block_.words[slot / 32] |= 1u << (slot % 32);
+    }
+    void to_bitmap();
+
+    uint32_t align_, first_;
+    size_t nwords_;  // the bitmap's size in words
+    Block block_;
+  };
+
   explicit PositionSet(uint32_t align) : align_(align) {}
 
   // Appends one block. Blocks arrive in ascending address order without overlapping. Offsets are
   // ascending, below span, and aligned to align by absolute address. An empty block is not stored.
   void add_block(uint64_t base, uint32_t span, std::span<const uint32_t> offsets);
+  // Appends a block a Builder made with this set's align, under the same rules.
+  void append(Block b);
 
   uint64_t count() const { return count_; }
   uint64_t bytes() const { return word_bytes_ + blocks_.capacity() * sizeof(Block); }  // heap held
@@ -51,7 +86,8 @@ class PositionSet {
 
  private:
   // the first offset in a block at base whose absolute address is a multiple of align
-  uint32_t first_offset(uint64_t base) const { return static_cast<uint32_t>((align_ - base % align_) % align_); }
+  static uint32_t first_offset(uint32_t align, uint64_t base) { return static_cast<uint32_t>((align - base % align) % align); }
+  uint32_t first_offset(uint64_t base) const { return first_offset(align_, base); }
   // the offset of the lowest set bit of bits, in bitmap word w
   uint32_t offset_of(uint32_t first, size_t w, uint32_t bits) const {
     return first + static_cast<uint32_t>((w * 32 + std::countr_zero(bits)) * align_);

@@ -2,7 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <thread>
 
 #include "engine/block_scan.hpp"
 
@@ -14,9 +21,17 @@ namespace {
 // starting in its last bytes is seen whole. scan_block's limit keeps it from being found twice.
 constexpr size_t kOverlap = 7;
 
-// A narrow reads a group's positions in runs: a run ends at the end of a block, or where the next
-// position is more than this far past the previous one.
+// A narrow reads positions in runs: a run ends at the end of a block, or where the next position,
+// of any listed group, is more than this far past the previous one.
 constexpr uint32_t kRunGap = 64u << 10;
+
+// A worker searches a block this many bytes at a time and compacts each slice's matches into the
+// block's positions before the next, so a value matching everywhere (0) never has a whole block's
+// raw offsets held at once. Smaller slices saved no more memory and cost speed.
+constexpr size_t kSlice = size_t{256} << 10;
+
+// At most this many blocks that have been read wait for a worker.
+constexpr size_t kQueue = 4;
 
 bool compares_with_last(const Pred& p) {
   return p.op == Pred::LtPrev || p.op == Pred::GtPrev || p.op == Pred::EqPrev || p.op == Pred::NePrev;
@@ -37,9 +52,190 @@ bool listed(const std::vector<GroupSpec>& specs, const std::string& id) {
   return std::any_of(specs.begin(), specs.end(), [&](const GroupSpec& s) { return s.id == id; });
 }
 
+// 0 means one thread fewer than the hardware has, kept between 1 and 8.
+unsigned resolve_workers(unsigned workers) {
+  if (workers != 0) return workers;
+  const int hardware = static_cast<int>(std::thread::hardware_concurrency());  // 0 when unknown
+  return static_cast<unsigned>(std::max(1, std::min(8, hardware - 1)));
+}
+
+// A byte buffer that is always read into before use, so it is never zero-filled.
+class Bytes {
+ public:
+  uint8_t* data() { return p_.get(); }
+  // At least n bytes. Growing does not keep the old contents.
+  uint8_t* reserve(size_t n) {
+    if (n > n_) {
+      p_.reset(new uint8_t[n]);
+      n_ = n;
+    }
+    return p_.get();
+  }
+
+ private:
+  std::unique_ptr<uint8_t[]> p_;
+  size_t n_ = 0;
+};
+
+// One block of a scan: read by the calling thread, then searched by a worker.
+struct Job {
+  uint64_t base = 0;
+  uint32_t span = 0;       // the block's own bytes; data holds up to kOverlap more
+  size_t got = 0;          // bytes read
+  size_t limit = 0;        // bytes searched: positions start below this
+  Bytes data;
+  std::vector<PositionSet::Block> found;  // per group, set by the worker
+  bool searched = false;
+};
+
+// Searches a job's block kSlice bytes at a time, compacting each slice's matches before the next.
+// hits is the worker's own scratch for one slice's raw offsets.
+void search(Job& j, std::span<const GroupSpec> groups, std::vector<std::vector<uint32_t>>& hits) {
+  std::vector<PositionSet::Builder> found;
+  found.reserve(groups.size());
+  for (const GroupSpec& g : groups) found.emplace_back(g.align, j.base, j.span);
+  for (size_t s = 0; s < j.limit; s += kSlice) {
+    // the slice's values may run on into the bytes after it, which are in the buffer
+    scan_block(j.data.data() + s, j.got - s, std::min(kSlice, j.limit - s), j.base + s, groups, hits);
+    for (size_t i = 0; i < groups.size(); i++) {
+      found[i].add(hits[i], static_cast<uint32_t>(s));
+      hits[i].clear();
+    }
+  }
+  j.found.clear();
+  for (PositionSet::Builder& b : found) j.found.push_back(b.finish());
+}
+
+// Worker threads that search a scan's blocks. Only the calling thread submits and takes jobs: it
+// submits them in address order and takes them back searched, in the same order. It submits only
+// while fewer than workers + kQueue jobs are out, so at most kQueue wait while every worker holds
+// one. Destruction stops the workers after their current block and joins them; an exception a
+// worker throws is rethrown by take.
+class Searchers {
+ public:
+  Searchers(std::span<const GroupSpec> groups, unsigned workers, size_t job_bytes)
+      : groups_(groups), job_bytes_(job_bytes), max_out_(workers + kQueue) {
+    try {
+      for (unsigned i = 0; i < workers; i++) threads_.emplace_back([this] { work(); });
+    } catch (...) {
+      stop();
+      throw;
+    }
+  }
+  ~Searchers() { stop(); }
+  Searchers(const Searchers&) = delete;
+  Searchers& operator=(const Searchers&) = delete;
+
+  bool full() const { return out_.size() >= max_out_; }
+
+  // A job to read into, recycled or new. Call only when not full.
+  Job* acquire() {
+    if (idle_.empty()) {
+      jobs_.push_back(std::make_unique<Job>());
+      idle_.push_back(jobs_.back().get());
+    }
+    Job* j = idle_.back();
+    idle_.pop_back();
+    j->data.reserve(job_bytes_);
+    return j;
+  }
+  void release(Job* j) { idle_.push_back(j); }  // a job taken back, or never submitted
+
+  void submit(Job* j) {
+    out_.push_back(j);
+    {
+      std::lock_guard lock(mu_);
+      j->searched = false;
+      waiting_.push_back(j);
+    }
+    work_cv_.notify_one();
+  }
+
+  // The oldest job out once it is searched; null if none is out, or if it is not searched yet and
+  // wait is false.
+  Job* take(bool wait) {
+    if (out_.empty()) return nullptr;
+    Job* j = out_.front();
+    {
+      std::unique_lock lock(mu_);
+      if (wait) done_cv_.wait(lock, [&] { return j->searched || error_; });
+      if (error_) std::rethrow_exception(error_);
+      if (!j->searched) return nullptr;
+    }
+    out_.pop_front();
+    return j;
+  }
+
+  // Joins the workers and returns the raw offsets they had room for, which is the most they held
+  // at once: each one's scratch only grows while it runs. Called once every job is taken back.
+  uint64_t finish() {
+    stop();
+    return raw_offsets_;
+  }
+
+ private:
+  void work() {
+    std::vector<std::vector<uint32_t>> hits(groups_.size());
+    try {
+      for (;;) {
+        Job* j;
+        {
+          std::unique_lock lock(mu_);
+          work_cv_.wait(lock, [&] { return stopping_ || !waiting_.empty(); });
+          if (stopping_) break;
+          j = waiting_.front();
+          waiting_.pop_front();
+        }
+        search(*j, groups_, hits);
+        {
+          std::lock_guard lock(mu_);
+          j->searched = true;
+        }
+        done_cv_.notify_one();
+      }
+    } catch (...) {
+      {
+        std::lock_guard lock(mu_);
+        if (!error_) error_ = std::current_exception();
+      }
+      done_cv_.notify_one();
+    }
+    uint64_t room = 0;
+    for (const std::vector<uint32_t>& h : hits) room += h.capacity();
+    std::lock_guard lock(mu_);
+    raw_offsets_ += room;
+  }
+
+  void stop() {
+    {
+      std::lock_guard lock(mu_);
+      stopping_ = true;
+    }
+    work_cv_.notify_all();
+    for (std::thread& t : threads_)
+      if (t.joinable()) t.join();
+  }
+
+  const std::span<const GroupSpec> groups_;
+  const size_t job_bytes_;
+  const size_t max_out_;
+  // the calling thread's own
+  std::vector<std::unique_ptr<Job>> jobs_;
+  std::vector<Job*> idle_;
+  std::deque<Job*> out_;  // submitted and not yet taken back, oldest first
+  // shared with the workers, under mu_
+  std::mutex mu_;
+  std::condition_variable work_cv_, done_cv_;
+  std::deque<Job*> waiting_;  // submitted and not yet picked up by a worker
+  bool stopping_ = false;
+  std::exception_ptr error_;
+  uint64_t raw_offsets_ = 0;
+  std::vector<std::thread> threads_;
+};
+
 }  // namespace
 
-Engine::Engine(ProcessMemory& mem, EngineConfig cfg) : mem_(mem), cfg_(cfg) {
+Engine::Engine(ProcessMemory& mem, EngineConfig cfg) : mem_(mem), cfg_(cfg), workers_(resolve_workers(cfg.workers)) {
   if (cfg_.block_size == 0 || cfg_.block_size > (size_t{1} << 30))
     throw EngineError("bad_request", "block_size must be between 1 byte and 1 GiB");
 }
@@ -62,30 +258,46 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
 
   std::vector<Region> regions = mem_.writable_regions();
   std::sort(regions.begin(), regions.end(), [](const Region& a, const Region& b) { return a.base < b.base; });
-  std::vector<uint8_t> buf(cfg_.block_size + kOverlap);
-  std::vector<std::vector<uint32_t>> hits(specs.size());
 
+  peak_raw_offsets_ = 0;
+  Searchers searchers(specs, workers_, cfg_.block_size + kOverlap);
+  // Adds the oldest searched block's matches to the groups, in address order whatever the
+  // worker count. Returns false when no block is out, or wait is false and it is not searched yet.
+  auto add_next = [&](bool wait) {
+    Job* j = searchers.take(wait);
+    if (j == nullptr) return false;
+    for (size_t i = 0; i < fresh.size(); i++) add_found(fresh[i], std::move(j->found[i]), j->data.data());
+    // Positions alone never shrink, so untracking on them now matches what the final check
+    // would decide, and keeps memory near the budget during the walk instead of after it.
+    fit_budget(fresh, kept, false);
+    searchers.release(j);
+    return true;
+  };
   for (const Region& r : regions) {
     stats.regions++;
     for (uint64_t off = 0; off < r.size; off += cfg_.block_size) {
+      while (searchers.full()) add_next(true);
+      Job* j = searchers.acquire();
       const uint64_t left = r.size - off;
-      const size_t span = static_cast<size_t>(std::min<uint64_t>(cfg_.block_size, left));
-      const size_t want = static_cast<size_t>(std::min<uint64_t>(span + kOverlap, left));
-      const size_t got = std::min(mem_.read(r.base + off, buf.data(), want), want);
-      const size_t limit = std::min(span, got);  // a short read searches what arrived
-      stats.bytes += limit;
-      stats.unreadable_bytes += span - limit;
-      if (limit == 0) continue;
-      scan_block(buf.data(), got, limit, r.base + off, specs, hits);
-      for (size_t i = 0; i < fresh.size(); i++) {
-        add_hits(fresh[i], r.base + off, span, buf.data(), hits[i]);
-        hits[i].clear();
+      j->base = r.base + off;
+      j->span = static_cast<uint32_t>(std::min<uint64_t>(cfg_.block_size, left));
+      const size_t want = static_cast<size_t>(std::min<uint64_t>(j->span + kOverlap, left));
+      j->got = std::min(mem_.read(j->base, j->data.data(), want), want);
+      j->limit = std::min<size_t>(j->span, j->got);  // a short read searches what arrived
+      stats.bytes += j->limit;
+      stats.unreadable_bytes += j->span - j->limit;
+      if (j->limit == 0) {
+        searchers.release(j);
+        continue;
       }
-      // Positions alone never shrink, so untracking on them now matches what the final check
-      // would decide, and keeps memory near the budget during the walk instead of after it.
-      fit_budget(fresh, kept, false);
+      searchers.submit(j);
+      while (add_next(false)) {
+      }
     }
   }
+  while (add_next(true)) {
+  }
+  peak_raw_offsets_ = searchers.finish();
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
   fit_budget(fresh, kept, true);
 
@@ -99,23 +311,24 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
   return out;
 }
 
-void Engine::add_hits(Group& g, uint64_t base, size_t span, const uint8_t* data,
-                      const std::vector<uint32_t>& offsets) {
-  g.count += offsets.size();
+// Adds a block's matches to g: always to its count; to its positions while it is tracked; and
+// their values, read from the block's bytes, while its count is within value_cap.
+void Engine::add_found(Group& g, PositionSet::Block b, const uint8_t* data) {
+  g.count += b.count;
   if (!g.tracked) return;
-  g.positions.add_block(base, static_cast<uint32_t>(span), offsets);
-  if (!g.has_values) return;
-  if (g.count > cfg_.value_cap) {
+  if (g.has_values && g.count > cfg_.value_cap) {
     std::vector<uint64_t>().swap(g.values);
     g.has_values = false;
-    return;
   }
-  const size_t w = width_of(g.spec.type);
-  for (uint32_t o : offsets) {
-    uint64_t v = 0;
-    std::memcpy(&v, data + o, w);  // little-endian host
-    g.values.push_back(v);
+  if (g.has_values) {
+    const size_t w = width_of(g.spec.type);
+    g.positions.for_each_in(b, [&](uint32_t o) {
+      uint64_t v = 0;
+      std::memcpy(&v, data + o, w);  // little-endian host
+      g.values.push_back(v);
+    });
   }
+  g.positions.append(std::move(b));
 }
 
 // Untracks fresh groups from the last one backwards until kept plus their storage fits the
@@ -164,14 +377,9 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
 
   // The replacements are built beside the groups, so nothing changes until the narrow applies.
-  std::vector<Group> fresh;
-  fresh.reserve(items.size());
-  std::vector<uint8_t> buf;
+  std::vector<Group> fresh = narrowed(at, items, stats);
   uint64_t total = 0;
-  for (size_t i = 0; i < items.size(); i++) {
-    fresh.push_back(narrowed(groups_[at[i]], items[i].pred, buf, stats));
-    total += fresh.back().count;
-  }
+  for (const Group& g : fresh) total += g.count;
   // Reads also fail once the game closes; that is reported, not taken as lost matches.
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
 
@@ -188,57 +396,131 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
   return applied;
 }
 
-// g's positions whose value now matches p, with values captured while the count is within
-// value_cap. Each run is read with one call; positions its read did not reach are counted lost.
-Engine::Group Engine::narrowed(const Group& g, const Pred& p, std::vector<uint8_t>& buf, ScanStats& stats) {
-  struct Run { uint32_t first, last; };
-  const ValueType t = g.spec.type;
-  const size_t w = width_of(t);
-  Group out(g.spec);
-  uint64_t index = 0;  // of the position being tested, in g, which is also its stored value's index
-  std::vector<Run> runs;
-  std::vector<uint32_t> keep;
-  for (const PositionSet::Block& b : g.positions.blocks()) {
+// The listed groups' replacements, in request order: each group's positions whose value now matches
+// its predicate, with values captured while its count is within value_cap.
+// Groups from one scan share their blocks, so a block is narrowed together with every listed
+// group's block at the same base and span: their positions are merged into runs, each run is read
+// with one call, and every group is tested on the same bytes. Blocks that differ (groups from scans
+// of a changed memory map) are read on their own. A position its run's read did not reach is lost.
+std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items,
+                                            ScanStats& stats) {
+  struct Lane {
+    const Group* old;
+    const Pred* pred;
+    Group out;
+    size_t block = 0;    // the next of old's blocks to narrow
+    uint64_t index = 0;  // of the next position in old, which is also its stored value's index
+  };
+  // Positions first..last of a block (offsets), whose values take bytes [first, end).
+  struct Run {
+    uint32_t first, last, end;
+    size_t at = 0, got = 0;  // where its bytes are in the buffer, and how many were read
+  };
+  std::vector<Lane> lanes;
+  lanes.reserve(at.size());
+  for (size_t i = 0; i < at.size(); i++) lanes.push_back({&groups_[at[i]], &items[i].pred, Group(groups_[at[i]].spec)});
+  std::vector<size_t> set;  // the lanes narrowing the current block
+  std::vector<Run> spans, runs;
+  Bytes buf;
+  for (;;) {
+    // the lowest next block among the lanes, and every lane whose next block is the same
+    const PositionSet::Block* head = nullptr;
+    set.clear();
+    for (size_t i = 0; i < lanes.size(); i++) {
+      const std::vector<PositionSet::Block>& blocks = lanes[i].old->positions.blocks();
+      if (lanes[i].block == blocks.size()) continue;
+      const PositionSet::Block& b = blocks[lanes[i].block];
+      if (head != nullptr && b.base == head->base && b.span == head->span) {
+        set.push_back(i);
+      } else if (head == nullptr || b.base < head->base || (b.base == head->base && b.span < head->span)) {
+        head = &b;
+        set.assign(1, i);
+      }
+    }
+    if (head == nullptr) break;
+    const uint64_t base = head->base;
+
+    // Each lane's own runs, then merged: two join when one starts within kRunGap of the other's
+    // last position, which is the run rule applied to all the lanes' positions together.
+    spans.clear();
+    for (size_t i : set) {
+      const Group& g = *lanes[i].old;
+      const uint32_t w = static_cast<uint32_t>(width_of(g.spec.type));
+      const size_t from = spans.size();
+      g.positions.for_each_in(g.positions.blocks()[lanes[i].block], [&](uint32_t o) {
+        if (spans.size() == from || o - spans.back().last > kRunGap) {
+          spans.push_back({o, o, o + w});
+        } else {
+          spans.back().last = o;
+          spans.back().end = o + w;
+        }
+      });
+    }
+    if (set.size() > 1) std::sort(spans.begin(), spans.end(), [](const Run& a, const Run& b) { return a.first < b.first; });
     runs.clear();
-    g.positions.for_each_in(b, [&](uint32_t o) {
-      if (runs.empty() || o - runs.back().last > kRunGap) runs.push_back({o, o});
-      else runs.back().last = o;
-    });
-    keep.clear();
-    size_t r = 0, got = 0;
-    g.positions.for_each_in(b, [&](uint32_t o) {
-      if (o > runs[r].last) r++;
-      const Run& run = runs[r];
-      if (o == run.first) {
-        const size_t want = run.last - run.first + w;
-        if (buf.size() < want) buf.resize(want);
-        got = std::min(mem_.read(b.base + run.first, buf.data(), want), want);
-        stats.bytes += got;
+    for (const Run& s : spans) {
+      if (!runs.empty() && s.first <= runs.back().last + kRunGap) {
+        runs.back().last = std::max(runs.back().last, s.last);
+        runs.back().end = std::max(runs.back().end, s.end);
+      } else {
+        runs.push_back(s);
       }
-      const uint64_t prev = g.has_values ? g.values[static_cast<size_t>(index)] : 0;
-      index++;
-      const size_t off = o - run.first;
-      if (off + w > got) {
-        stats.lost++;
-        return;
-      }
-      uint64_t cur = 0;
-      std::memcpy(&cur, buf.data() + off, w);  // little-endian host
-      if (!matches(p, t, cur, prev)) return;
-      keep.push_back(o);
-      out.count++;
-      if (!out.has_values) return;
-      if (out.count > cfg_.value_cap) {
-        std::vector<uint64_t>().swap(out.values);
-        out.has_values = false;
-        return;
-      }
-      out.values.push_back(cur);
-    });
-    out.positions.add_block(b.base, b.span, keep);
+    }
+
+    // each run read once, packed one after another into the buffer
+    size_t need = 0;
+    for (Run& r : runs) {
+      r.at = need;
+      need += r.end - r.first;
+    }
+    uint8_t* data = buf.reserve(need);
+    for (Run& r : runs) {
+      const size_t want = r.end - r.first;
+      r.got = std::min(mem_.read(base + r.first, data + r.at, want), want);
+      stats.bytes += r.got;
+    }
+
+    for (size_t i : set) {
+      Lane& lane = lanes[i];
+      const Group& g = *lane.old;
+      const PositionSet::Block& b = g.positions.blocks()[lane.block++];
+      const ValueType t = g.spec.type;
+      const size_t w = width_of(t);
+      Group& out = lane.out;
+      PositionSet::Builder keep(g.spec.align, b.base, b.span);
+      size_t r = 0;
+      g.positions.for_each_in(b, [&](uint32_t o) {
+        while (runs[r].last < o) r++;  // every position is in a run; other lanes' runs are skipped
+        const uint64_t prev = g.has_values ? g.values[static_cast<size_t>(lane.index)] : 0;
+        lane.index++;
+        const size_t off = o - runs[r].first;
+        if (off + w > runs[r].got) {
+          stats.lost++;
+          return;
+        }
+        uint64_t cur = 0;
+        std::memcpy(&cur, data + runs[r].at + off, w);  // little-endian host
+        if (!matches(*lane.pred, t, cur, prev)) return;
+        keep.add(o);
+        out.count++;
+        if (!out.has_values) return;
+        if (out.count > cfg_.value_cap) {
+          std::vector<uint64_t>().swap(out.values);
+          out.has_values = false;
+          return;
+        }
+        out.values.push_back(cur);
+      });
+      out.positions.append(keep.finish());
+    }
   }
-  out.values.shrink_to_fit();
-  return out;
+  std::vector<Group> fresh;
+  fresh.reserve(lanes.size());
+  for (Lane& lane : lanes) {
+    lane.out.values.shrink_to_fit();
+    fresh.push_back(std::move(lane.out));
+  }
+  return fresh;
 }
 
 // Values a narrowed group gains (it had none, and is now within value_cap) are kept, in request

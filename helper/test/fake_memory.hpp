@@ -88,4 +88,21 @@ class FakeMemory : public ProcessMemory {
   bool alive_ = true;
 };
 
+// Fills [base, base + size) with xorshift64 output from seed, the same bytes for the same seed.
+// The range must lie in one writable region.
+inline void fill_xorshift(FakeMemory& m, uint64_t base, size_t size, uint64_t seed) {
+  uint64_t x = seed != 0 ? seed : 1;
+  std::vector<uint8_t> chunk(size_t{1} << 20);
+  for (size_t done = 0; done < size; done += chunk.size()) {
+    const size_t n = size - done < chunk.size() ? size - done : chunk.size();
+    for (size_t i = 0; i < n; i += 8) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      std::memcpy(chunk.data() + i, &x, n - i < 8 ? n - i : 8);
+    }
+    if (!m.write(base + done, chunk.data(), n)) throw std::out_of_range("fake memory: cannot fill there");
+  }
+}
+
 }  // namespace moth::test

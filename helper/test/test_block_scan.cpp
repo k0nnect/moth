@@ -1,4 +1,8 @@
+#include <cfloat>
 #include <cmath>
+#include <cstring>
+#include <utility>
+#include <vector>
 
 #include "doctest/doctest.h"
 #include "test/test_util.hpp"
@@ -54,4 +58,84 @@ TEST_CASE("type helpers") {
   CHECK(parse_type("f64", t)); CHECK(t == F64);
   CHECK_FALSE(parse_type("i33", t));
   CHECK(width_of(U16) == 2); CHECK(is_float(F32)); CHECK(is_signed(I8)); CHECK_FALSE(is_signed(U64));
+}
+
+// Beyond the brief: scan_block tests a range on integer keys, not with matches(); pin them together.
+
+namespace {
+
+// Bit patterns of type t a range test could get wrong: for 1- and 2-byte types all of them;
+// otherwise extremes, NaNs and infinities, values at and next to each bound, and random bits.
+std::vector<uint64_t> patterns(ValueType t, const std::vector<std::pair<double, double>>& ranges) {
+  const size_t w = width_of(t);
+  const uint64_t mask = w == 8 ? ~0ULL : (1ULL << (w * 8)) - 1, sign = 1ULL << (w * 8 - 1);
+  std::vector<uint64_t> out;
+  if (w <= 2) {
+    for (uint64_t p = 0; p <= mask; p++) out.push_back(p);
+    return out;
+  }
+  for (uint64_t p : {0ULL, 1ULL, mask, mask - 1, sign, sign - 1, sign + 1}) out.push_back(p);
+  uint64_t x = 0x6d6f7468;
+  for (int i = 0; i < 2000; i++) {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    out.push_back(x & mask);
+  }
+  for (auto [lo, hi] : ranges) {
+    for (double b : {lo, hi}) {
+      if (!std::isfinite(b)) continue;
+      if (t == F32) {
+        float f = std::fabs(b) <= FLT_MAX ? static_cast<float>(b) : std::copysign(INFINITY, static_cast<float>(b));
+        for (int i = 0; i < 3; i++) f = std::nextafterf(f, -INFINITY);
+        for (int i = 0; i < 7; i++, f = std::nextafterf(f, INFINITY)) out.push_back(bits(f));
+      } else if (t == F64) {
+        double d = b;
+        for (int i = 0; i < 3; i++) d = std::nextafter(d, -INFINITY);
+        for (int i = 0; i < 7; i++, d = std::nextafter(d, INFINITY)) out.push_back(bits(d));
+      } else {
+        // integers around b; 64-bit ones far from zero round to doubles 1024 or 2048 apart
+        const double top = std::ldexp(1.0, static_cast<int>(w * 8) - (is_signed(t) ? 1 : 0));
+        if (!(b > (is_signed(t) ? -top : -1.0) && b < top)) continue;
+        const uint64_t c = is_signed(t) ? static_cast<uint64_t>(static_cast<int64_t>(std::floor(b)))
+                                        : static_cast<uint64_t>(std::floor(b));
+        for (int64_t d = -1100; d <= 1100; d++) out.push_back((c + static_cast<uint64_t>(d)) & mask);
+      }
+    }
+  }
+  const float fs[] = {0.0f, -0.0f, INFINITY, -INFINITY, NAN, -NAN, FLT_MIN, FLT_TRUE_MIN, -FLT_TRUE_MIN, FLT_MAX, -FLT_MAX};
+  const double ds[] = {0.0, -0.0, INFINITY, -INFINITY, NAN, -NAN, DBL_TRUE_MIN, -DBL_TRUE_MIN, DBL_MAX, -DBL_MAX};
+  if (t == F32) {
+    for (float f : fs) out.push_back(bits(f));
+    out.push_back(0x7f800001);  // a signalling NaN
+  }
+  if (t == F64) {
+    for (double d : ds) out.push_back(bits(d));
+    out.push_back(0xfff0000000000001);  // a negative signalling NaN
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("a range finds exactly the values matches() accepts, for every type") {
+  const std::vector<std::pair<double, double>> ranges = {
+      {99, 101}, {0.99, 1.01}, {-1, 1}, {-INFINITY, INFINITY}, {0, 0}, {1, -1}, {NAN, 1}, {-1, NAN},
+      {1.5, 2.5}, {0.1, 0.30000000000000004}, {-0.0, 0.0}, {-1e300, 1e300}, {1e300, INFINITY},
+      {-INFINITY, -1e300}, {-129, 128}, {-32769, 65536}, {-5, -2}, {1e-45, 1e-44},
+      {-2147483648.5, 2147483647.5}, {4294967295.0, 4294967296.5}, {-9.3e18, 9.3e18},
+      {1.8446744073709552e19, INFINITY}, {3.4028234663852886e38, INFINITY}};
+  for (ValueType t : {I8, U8, I16, U16, I32, U32, I64, U64, F32, F64}) {
+    const std::vector<uint64_t> ps = patterns(t, ranges);
+    const size_t w = width_of(t);
+    Buf b(ps.size() * w);
+    for (size_t i = 0; i < ps.size(); i++) std::memcpy(b.d.data() + i * w, &ps[i], w);  // little-endian host
+    for (auto [lo, hi] : ranges) {
+      V want;
+      for (size_t i = 0; i < ps.size(); i++)
+        if (matches(range(lo, hi), t, ps[i], 0)) want.push_back(static_cast<uint32_t>(i * w));
+      const V got = run(b, b.d.size(), 0, {G("r", t, static_cast<uint32_t>(w), 0, range(lo, hi))})[0];
+      INFO("type ", static_cast<int>(t), ", range (", lo, ", ", hi, ")");
+      CHECK(got.size() == want.size());
+      CHECK(got == want);
+    }
+  }
 }

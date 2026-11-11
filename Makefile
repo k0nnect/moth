@@ -1,4 +1,4 @@
-# moth build entry points. later tasks add: smoke, bench-native, test-integration, bench.
+# moth build entry points. later tasks add: smoke, test-integration, bench.
 WINE ?= $(HOME)/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
 MOTH_TEST_BOTTLE ?= uhmm
 export WINE MOTH_TEST_BOTTLE
@@ -7,7 +7,7 @@ DUNE := opam exec -- dune
 CMAKE := cmake -G "Unix Makefiles"
 JOBS ?= $(shell sysctl -n hw.ncpu)
 
-.PHONY: setup build test test-native test-core helper clean
+.PHONY: setup build test test-native test-core bench-native helper clean
 
 setup:
 	opam init --bare --no-setup -y
@@ -28,6 +28,12 @@ test-native:
 
 test-core:
 	opam exec -- dune test
+
+# engine speed on this machine, native: a relative guide only (the real helper runs under wine)
+bench-native:
+	$(CMAKE) -S helper -B build/native -DCMAKE_BUILD_TYPE=Release
+	cmake --build build/native -j $(JOBS) --target moth_bench
+	build/native/moth_bench
 
 helper:
 	mkdir -p bin
