@@ -17,7 +17,7 @@ if(MINGW)
 else()
   enable_testing()
   add_executable(moth_tests test/test_main.cpp test/test_sanity.cpp test/test_block_scan.cpp
-                 test/test_engine_scan.cpp)
+                 test/test_engine_scan.cpp test/test_engine_narrow.cpp)
   target_link_libraries(moth_tests PRIVATE moth_engine)
   add_test(NAME moth_tests COMMAND moth_tests)
 endif()

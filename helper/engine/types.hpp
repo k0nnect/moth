@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace moth {
 
@@ -15,9 +16,10 @@ bool is_float(ValueType t);
 bool is_signed(ValueType t);  // true for signed integers and floats
 bool parse_type(std::string_view s, ValueType& out);
 
+// code is the bare error code; what() reads "<code>: <message>".
 struct EngineError : std::runtime_error {
   std::string code;
-  EngineError(std::string c, std::string msg) : std::runtime_error(std::move(msg)), code(std::move(c)) {}
+  EngineError(std::string c, const std::string& msg) : std::runtime_error(c + ": " + msg), code(std::move(c)) {}
 };
 
 }  // namespace moth

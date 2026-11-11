@@ -14,6 +14,14 @@ namespace {
 // starting in its last bytes is seen whole. scan_block's limit keeps it from being found twice.
 constexpr size_t kOverlap = 7;
 
+// A narrow reads a group's positions in runs: a run ends at the end of a block, or where the next
+// position is more than this far past the previous one.
+constexpr uint32_t kRunGap = 64u << 10;
+
+bool compares_with_last(const Pred& p) {
+  return p.op == Pred::LtPrev || p.op == Pred::GtPrev || p.op == Pred::EqPrev || p.op == Pred::NePrev;
+}
+
 void validate(const std::vector<GroupSpec>& specs) {
   for (size_t i = 0; i < specs.size(); i++) {
     const GroupSpec& g = specs[i];
@@ -135,6 +143,145 @@ std::vector<Item> Engine::peek(const std::string& id, uint64_t offset, uint64_t 
   return items;
 }
 
+bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vector<GroupInfo>& out,
+                    ScanStats& stats) {
+  const auto start = std::chrono::steady_clock::now();
+  stats = ScanStats{};
+  std::vector<size_t> at;  // each listed group's index in groups_
+  at.reserve(items.size());
+  for (const NarrowItem& it : items) {
+    const size_t k = index_of(it.id);
+    const Group& g = groups_[k];
+    if (!g.tracked)
+      throw EngineError("no_such_group",
+                        "group " + it.id + " is untracked, so it has no positions to narrow; scan it again");
+    if (std::find(at.begin(), at.end(), k) != at.end())
+      throw EngineError("bad_request", "group listed twice: " + it.id);
+    if (compares_with_last(it.pred) && !g.has_values)
+      throw EngineError("no_values", "group " + it.id + " has no stored values");
+    at.push_back(k);
+  }
+  if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
+
+  // The replacements are built beside the groups, so nothing changes until the narrow applies.
+  std::vector<Group> fresh;
+  fresh.reserve(items.size());
+  std::vector<uint8_t> buf;
+  uint64_t total = 0;
+  for (size_t i = 0; i < items.size(); i++) {
+    fresh.push_back(narrowed(groups_[at[i]], items[i].pred, buf, stats));
+    total += fresh.back().count;
+  }
+  // Reads also fail once the game closes; that is reported, not taken as lost matches.
+  if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
+
+  const bool applied = !atomic || total > 0;
+  if (applied) {
+    fit_gained_values(fresh, at);
+    for (size_t i = 0; i < fresh.size(); i++) groups_[at[i]] = std::move(fresh[i]);
+  } else {
+    stats.lost = 0;  // nothing was dropped
+  }
+  out.clear();
+  for (size_t k : at) out.push_back(info(groups_[k]));
+  stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  return applied;
+}
+
+// g's positions whose value now matches p, with values captured while the count is within
+// value_cap. Each run is read with one call; positions its read did not reach are counted lost.
+Engine::Group Engine::narrowed(const Group& g, const Pred& p, std::vector<uint8_t>& buf, ScanStats& stats) {
+  struct Run { uint32_t first, last; };
+  const ValueType t = g.spec.type;
+  const size_t w = width_of(t);
+  Group out(g.spec);
+  uint64_t index = 0;  // of the position being tested, in g, which is also its stored value's index
+  std::vector<Run> runs;
+  std::vector<uint32_t> keep;
+  for (const PositionSet::Block& b : g.positions.blocks()) {
+    runs.clear();
+    g.positions.for_each_in(b, [&](uint32_t o) {
+      if (runs.empty() || o - runs.back().last > kRunGap) runs.push_back({o, o});
+      else runs.back().last = o;
+    });
+    keep.clear();
+    size_t r = 0, got = 0;
+    g.positions.for_each_in(b, [&](uint32_t o) {
+      if (o > runs[r].last) r++;
+      const Run& run = runs[r];
+      if (o == run.first) {
+        const size_t want = run.last - run.first + w;
+        if (buf.size() < want) buf.resize(want);
+        got = std::min(mem_.read(b.base + run.first, buf.data(), want), want);
+        stats.bytes += got;
+      }
+      const uint64_t prev = g.has_values ? g.values[static_cast<size_t>(index)] : 0;
+      index++;
+      const size_t off = o - run.first;
+      if (off + w > got) {
+        stats.lost++;
+        return;
+      }
+      uint64_t cur = 0;
+      std::memcpy(&cur, buf.data() + off, w);  // little-endian host
+      if (!matches(p, t, cur, prev)) return;
+      keep.push_back(o);
+      out.count++;
+      if (!out.has_values) return;
+      if (out.count > cfg_.value_cap) {
+        std::vector<uint64_t>().swap(out.values);
+        out.has_values = false;
+        return;
+      }
+      out.values.push_back(cur);
+    });
+    out.positions.add_block(b.base, b.span, keep);
+  }
+  out.values.shrink_to_fit();
+  return out;
+}
+
+// Values a narrowed group gains (it had none, and is now within value_cap) are kept, in request
+// order, only while all storage stays within budget_bytes. Values a group already had only shrink.
+void Engine::fit_gained_values(std::vector<Group>& fresh, const std::vector<size_t>& at) {
+  auto gains = [&](size_t i) { return fresh[i].has_values && !groups_[at[i]].has_values; };
+  uint64_t total = storage_bytes();
+  for (size_t i = 0; i < fresh.size(); i++)
+    total = total - bytes_of(groups_[at[i]]) + (gains(i) ? fresh[i].positions.bytes() : bytes_of(fresh[i]));
+  for (size_t i = 0; i < fresh.size(); i++) {
+    if (!gains(i)) continue;
+    const uint64_t v = fresh[i].values.capacity() * sizeof(uint64_t);
+    if (total + v <= cfg_.budget_bytes) {
+      total += v;
+      continue;
+    }
+    std::vector<uint64_t>().swap(fresh[i].values);
+    fresh[i].has_values = false;
+  }
+}
+
+void Engine::drop(const std::vector<std::string>& ids) {
+  for (const std::string& id : ids) find(id);  // throws for an unknown id before anything is removed
+  std::erase_if(groups_, [&](const Group& g) { return std::find(ids.begin(), ids.end(), g.spec.id) != ids.end(); });
+}
+
+bool Engine::read_value(uint64_t addr, ValueType type, uint64_t& bits) {
+  if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
+  const size_t w = width_of(type);
+  uint64_t v = 0;
+  if (mem_.read(addr, &v, w) != w) return false;
+  bits = v;  // little-endian host
+  return true;
+}
+
+bool Engine::write_value(uint64_t addr, ValueType type, uint64_t bits, uint64_t& prev_bits) {
+  uint64_t prev = 0;
+  if (!read_value(addr, type, prev)) return false;
+  if (!mem_.write(addr, &bits, width_of(type))) return false;  // the low bytes, little-endian host
+  prev_bits = prev;
+  return true;
+}
+
 std::vector<GroupInfo> Engine::groups() const {
   std::vector<GroupInfo> out;
   out.reserve(groups_.size());
@@ -159,10 +306,12 @@ void Engine::untrack(Group& g) {
   g.has_values = false;
 }
 
-const Engine::Group& Engine::find(const std::string& id) const {
-  for (const Group& g : groups_)
-    if (g.spec.id == id) return g;
+size_t Engine::index_of(const std::string& id) const {
+  for (size_t i = 0; i < groups_.size(); i++)
+    if (groups_[i].spec.id == id) return i;
   throw EngineError("no_such_group", "no group named " + id);
 }
+
+const Engine::Group& Engine::find(const std::string& id) const { return groups_[index_of(id)]; }
 
 }  // namespace moth
