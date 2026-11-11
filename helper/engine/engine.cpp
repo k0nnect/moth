@@ -398,13 +398,17 @@ void Engine::fit_budget(std::vector<Group>& fresh, uint64_t kept, bool with_valu
 
 std::vector<Item> Engine::peek(const std::string& id, uint64_t offset, uint64_t limit) {
   const Group& g = find(id);
+  if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
   std::vector<Item> items;
   if (!g.tracked) return items;
   const size_t w = width_of(g.spec.type);
-  for (uint64_t addr : g.positions.addresses(offset, limit)) {
+  const std::vector<uint64_t> addrs = g.positions.addresses(offset, limit);
+  for (uint64_t addr : addrs) {
     uint64_t bits = 0;
     if (mem_.read(addr, &bits, w) == w) items.push_back({addr, bits});  // little-endian host
   }
+  // reads also fail once the game closes; that is reported, not taken as freed memory
+  if (items.size() < addrs.size() && !mem_.alive()) throw EngineError("target_gone", "the game has closed");
   return items;
 }
 
@@ -621,8 +625,15 @@ bool Engine::read_value(uint64_t addr, ValueType type, uint64_t& bits) {
 bool Engine::write_value(uint64_t addr, ValueType type, uint64_t bits, uint64_t& prev_bits) {
   uint64_t prev = 0;
   if (!read_value(addr, type, prev)) return false;
-  if (!mem_.write(addr, &bits, width_of(type))) return false;  // the low bytes, little-endian host
+  const size_t w = width_of(type);
+  if (!mem_.write(addr, &bits, w)) return false;  // the low bytes, little-endian host
   prev_bits = prev;
+  // what was written is now the last value seen there, for every group that reads those bytes
+  const uint64_t seen = w == 8 ? bits : bits & ((uint64_t{1} << (8 * w)) - 1);
+  for (Group& g : groups_) {
+    uint64_t i = 0;
+    if (g.has_values && width_of(g.spec.type) == w && g.positions.index_of(addr, i)) g.values[static_cast<size_t>(i)] = seen;
+  }
   return true;
 }
 

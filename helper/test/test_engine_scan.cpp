@@ -115,6 +115,22 @@ TEST_CASE("bitmap slots start at the first aligned address of the block") {
   std::vector<uint64_t> seen; s.for_each([&](uint64_t a) { seen.push_back(a); });
   REQUIRE(seen.size() == 250); CHECK(seen.front() == 0x10010); CHECK(seen.back() == 0x1000e + 998);
 }
+TEST_CASE("a position's index is found in offset and bitmap blocks") {
+  std::vector<uint32_t> many;
+  for (uint32_t o = 0; o < 4096; o += 8) many.push_back(o);           // a bitmap
+  PositionSet s(4);
+  s.add_block(0x10000, 4096, std::vector<uint32_t>{8, 4000});           // offsets
+  s.add_block(0x11000, 4096, many);
+  REQUIRE(s.blocks()[1].bitmap);
+  uint64_t i = 99;
+  CHECK(s.index_of(0x10008, i)); CHECK(i == 0);
+  CHECK(s.index_of(0x10000 + 4000, i)); CHECK(i == 1);
+  CHECK(s.index_of(0x11000, i)); CHECK(i == 2);
+  CHECK(s.index_of(0x11000 + 8 * 300, i)); CHECK(i == 302);
+  CHECK(s.index_of(0x11000 + 4088, i)); CHECK(i == 2 + 511);
+  CHECK_FALSE(s.index_of(0x1000c, i)); CHECK_FALSE(s.index_of(0x11004, i)); CHECK_FALSE(s.index_of(0x11002, i));
+  CHECK_FALSE(s.index_of(0xf000, i)); CHECK_FALSE(s.index_of(0x12000, i));
+}
 TEST_CASE("peek pages by index across blocks and reads current values") {
   FakeMemory m; m.add_region(0x10000, 3 * 4096); m.poke<uint8_t>(0x11000, 9);   // second block's first byte
   Engine e(m, {.block_size = 4096}); ScanStats s; e.scan({G("z", U8, 1, 0, eq(0))}, false, s);

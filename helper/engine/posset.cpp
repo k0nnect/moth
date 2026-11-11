@@ -1,5 +1,6 @@
 #include "engine/posset.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace moth {
@@ -39,6 +40,33 @@ void PositionSet::append(Block b) {
   count_ += b.count;
   word_bytes_ += b.words.capacity() * sizeof(uint32_t);
   blocks_.push_back(std::move(b));
+}
+
+bool PositionSet::index_of(uint64_t addr, uint64_t& index) const {
+  uint64_t before = 0;  // positions in the blocks below addr's
+  for (const Block& b : blocks_) {
+    if (addr >= b.base + b.span) {
+      before += b.count;
+      continue;
+    }
+    if (addr < b.base) return false;
+    const uint32_t o = static_cast<uint32_t>(addr - b.base);
+    if (!b.bitmap) {
+      auto it = std::lower_bound(b.words.begin(), b.words.end(), o);
+      if (it == b.words.end() || *it != o) return false;
+      index = before + static_cast<uint64_t>(it - b.words.begin());
+      return true;
+    }
+    const uint32_t first = first_offset(b.base);
+    if (o < first || (o - first) % align_ != 0) return false;
+    const uint32_t slot = (o - first) / align_;
+    const uint32_t word = b.words[slot / 32];
+    if (((word >> (slot % 32)) & 1) == 0) return false;
+    for (size_t w = 0; w < slot / 32; w++) before += static_cast<uint64_t>(std::popcount(b.words[w]));
+    index = before + static_cast<uint64_t>(std::popcount(word & ((1u << (slot % 32)) - 1)));
+    return true;
+  }
+  return false;
 }
 
 std::vector<uint64_t> PositionSet::addresses(uint64_t from, uint64_t n) const {

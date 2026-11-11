@@ -190,6 +190,27 @@ TEST_CASE("read and write touch only the value's width, and report a closed game
   CHECK_THROWS_WITH_AS(e.read_value(0x10000, I32, cur), doctest::Contains("target_gone"), EngineError);
   CHECK_THROWS_WITH_AS(e.write_value(0x10000, I32, 1, prev), doctest::Contains("target_gone"), EngineError);
 }
+TEST_CASE("a write becomes the stored value of every group of its width at that address") {
+  FakeMemory m; three(m); Engine e(m); ScanStats s; std::vector<GroupInfo> g;
+  e.scan({G("a", I32, 4, 0, eq(100)), G("u", U32, 4, 0, eq(100)), G("h", I16, 2, 0, eq(100))}, false, s);
+  uint64_t prev = 0;
+  REQUIRE(e.write_value(0x10000, I32, 999, prev));
+  m.poke<int32_t>(0x10000, 990);                                        // down from what was written
+  CHECK(e.narrow({{"a", {Pred::LtPrev}}, {"u", {Pred::LtPrev}}, {"h", {Pred::LtPrev}}}, true, g, s));
+  REQUIRE(g.size() == 3);
+  CHECK(g[0].count == 1); CHECK(g[1].count == 1); CHECK(e.peek("a", 0, 9)[0].addr == 0x10000);
+  CHECK(g[2].count == 0);                                               // 2-byte: still compares with 100
+  m.poke<int32_t>(0x10010, 7);                                          // a write elsewhere changes nothing stored
+  REQUIRE(e.write_value(0x10010, I32, 7, prev));
+  m.poke<int32_t>(0x10000, 980);
+  CHECK(e.narrow({{"a", {Pred::LtPrev}}}, true, g, s)); CHECK(g[0].count == 1);
+}
+TEST_CASE("peek reports a closed game") {
+  FakeMemory m; three(m); Engine e(m); ScanStats s; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  m.set_alive(false);
+  CHECK_THROWS_WITH_AS(e.peek("a", 0, 9), doctest::Contains("target_gone"), EngineError);
+  CHECK_THROWS_WITH_AS(e.peek("nope", 0, 9), doctest::Contains("no_such_group"), EngineError);
+}
 TEST_CASE("drop refuses an unknown id and then removes nothing") {
   FakeMemory m; three(m); Engine e(m); ScanStats s;
   e.scan({G("a", I32, 4, 0, eq(100)), G("b", I32, 4, 0, eq(0))}, false, s);

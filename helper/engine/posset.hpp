@@ -84,6 +84,9 @@ class PositionSet {
   // Addresses of positions [from, from + n) in ascending order; fewer past the end of the set.
   std::vector<uint64_t> addresses(uint64_t from, uint64_t n) const;
 
+  // Sets index to addr's place among the positions, in ascending order; false if addr is not one.
+  bool index_of(uint64_t addr, uint64_t& index) const;
+
  private:
   // the first offset in a block at base whose absolute address is a multiple of align
   static uint32_t first_offset(uint32_t align, uint64_t base) { return static_cast<uint32_t>((align - base % align) % align); }

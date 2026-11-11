@@ -65,7 +65,7 @@ class Engine {
 
   // Positions [offset, offset + limit) of a group in address order, with their values read now.
   // Positions that cannot be read are left out, so a page may be short. An untracked group
-  // gives none. Throws EngineError no_such_group.
+  // gives none. Throws EngineError no_such_group, or target_gone when the process is not alive.
   std::vector<Item> peek(const std::string& id, uint64_t offset, uint64_t limit);
 
   // Keeps, in each listed group, the positions whose value now matches its predicate. A
@@ -92,6 +92,8 @@ class Engine {
   bool read_value(uint64_t addr, ValueType type, uint64_t& bits);
   // Writes the low bytes of bits as one value of the type, after reading the value there into
   // prev_bits. Returns false if that value cannot be read (nothing is written) or written.
+  // After a write, every group with stored values that holds addr as a position of the same
+  // width stores the written value there, so its next relation compares with it.
   // Throws EngineError target_gone.
   bool write_value(uint64_t addr, ValueType type, uint64_t bits, uint64_t& prev_bits);
 

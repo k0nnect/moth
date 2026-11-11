@@ -132,7 +132,10 @@ TEST_CASE("attach, detach, status and target_gone") {
   st = J(h.handle_line(R"({"op":"status"})"));
   CHECK(st["attached"]["pid"] == 2); CHECK(st["groups"].size() == 0);
   CHECK(code(h, R"({"op":"peek","group":"z","offset":0,"limit":1})") == "no_such_group");
+  h.handle_line(R"({"op":"scan","keep":false,"groups":[{"id":"z","type":"u8","align":1,"exclude_align":0,"pred":{"op":"eq","v":"0"}}]})");
+  CHECK(code(h, R"({"op":"peek","group":"z","offset":0,"limit":1})") == "ok");
   p.mem(2).set_alive(false);
+  CHECK(code(h, R"({"op":"peek","group":"z","offset":0,"limit":1})") == "target_gone");
   CHECK(code(h, R"({"op":"read","addr":"0x20000","type":"u8"})") == "target_gone");
   CHECK(code(h, R"({"op":"scan","keep":false,"groups":[]})") == "target_gone");
   CHECK(code(h, R"({"op":"detach"})") == "ok");
