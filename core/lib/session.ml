@@ -36,6 +36,7 @@ let create h = { h; hunt = None; listing = []; undo = [] }
 let no_hunt = "no hunt in progress. start one with: moth find <number>"
 let too_many = "too many matches to compare by change yet. type the new number instead."
 let game_closed = "the game closed. attach again once it's running."
+let helper_lost = "lost contact with moth's helper. attach again."
 let page = 10
 let listable = 1000
 
@@ -43,15 +44,21 @@ exception Helper_failed of err
 
 let call = function Ok x -> x | Error e -> raise (Helper_failed e)
 
-(* Runs one step. A helper error ends it; target_gone also ends the hunt, and the writes, whose
-   addresses mean nothing in the next run of the game. *)
+(* Runs one step. A helper error ends it; losing the game or the helper also ends the hunt, and
+   the writes, whose addresses mean nothing once attached again. *)
 let guard t f =
+  let clear () =
+    t.hunt <- None;
+    t.listing <- [];
+    t.undo <- []
+  in
   try f () with
-  | Helper_failed e when e.code = "target_gone" ->
-      t.hunt <- None;
-      t.listing <- [];
-      t.undo <- [];
+  | Helper_failed { code = "target_gone"; _ } ->
+      clear ();
       Error game_closed
+  | Helper_failed { code = "helper_lost"; _ } ->
+      clear ();
+      Error helper_lost
   | Helper_failed e -> Error (if e.message = "" then e.code else e.message)
 
 (* the helper's time, bytes read and lost candidates over one step *)
@@ -171,8 +178,9 @@ let next_number t text =
                 Ok (outcome_of ?fell_back tl current)
               in
               if applied then finish fits (narrowed @ rescanned)
-              else if List.exists (fun (i : group_info) -> i.count > 0) rescanned then
-                (* only the rescan matched: the old tracked groups are out *)
+              else if List.exists (fun (i : group_info) -> i.tracked && i.count > 0) rescanned then
+                (* only the rescan matched: the old tracked groups are out. A rescan that came back
+                   untracked again holds only a count of how common the number is, not a match. *)
                 finish (fun g -> fits g && not g.info.tracked) rescanned
               else
                 let r = relation_between m hunt.last in

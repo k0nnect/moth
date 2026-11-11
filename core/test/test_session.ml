@@ -154,6 +154,21 @@ let dead_end_keeps_untracked () =
   check_int "main" 5 o.main;
   check_int "wide" 2 o.wide
 
+let untracked_rescan_is_not_a_match () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 50; gi ~tracked:false "u8" 4_000_000 ];
+  ignore (ok (Session.find s "30"));
+  queue_narrow f ~applied:false [];
+  queue_scan f [ gi ~tracked:false "u8" 3_900_000 ];
+  queue_narrow f ~applied:true [ gi "i32" 4 ];
+  let o = ok (Session.next_number s "29") in
+  check_ids "nothing dropped" [] (dropped f);
+  check_int "fallback narrow sent" 2 (narrow_calls f);
+  check_pred "fallback" Lt_prev (last_narrow_pred f "i32");
+  check_bool "fell back" true (List.mem (Session.Fell_back Down) o.notes);
+  check_int "main" 4 o.main;
+  check_bool "still untracked" true (List.mem Session.Untracked o.notes)
+
 let unfit_groups () =
   let s, f = fresh () in
   queue_scan f [ gi "i32" 500; gi "f32" 40; gi "u8" 30 ];
@@ -330,6 +345,18 @@ let game_closes () =
   check_err "closed during results" closed (Session.results s ~all:false);
   check_err "undo cleared" "nothing to undo" (Session.undo s);
   check_bool "writes cleared" true (Session.writes s = []);
+  (* losing the helper ends the hunt the same way *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "100"));
+  queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
+  ignore (ok (Session.results s ~all:false));
+  queue_write f ~prev:(Vint 100L);
+  ignore (ok (Session.set s ~row:1 "5"));
+  queue_error f "narrow" { code = "helper_lost"; message = "" };
+  check_err "helper lost" "lost contact with moth's helper. attach again." (Session.next_number s "5");
+  check_err "hunt cleared" no_hunt (Session.next_number s "5");
+  check_err "undo cleared too" "nothing to undo" (Session.undo s);
   (* other helper errors pass through and keep the hunt *)
   let s, f = fresh () in
   queue_scan f [ gi "i32" 500 ];
@@ -351,6 +378,7 @@ let () =
           t "untracked rescan" untracked_rescan;
           t "untracked and narrow both apply" untracked_and_narrow_both_apply;
           t "dead end keeps untracked" dead_end_keeps_untracked;
+          t "an untracked rescan is not a match" untracked_rescan_is_not_a_match;
           t "unfit groups" unfit_groups;
           t "relations" relations;
           t "stats and lost" stats_and_lost;

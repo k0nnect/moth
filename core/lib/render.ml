@@ -28,7 +28,7 @@ let note_line = function
   | Session.Fell_back r -> Printf.sprintf "no exact match for that number. kept the ones that %s instead." (went r)
   | Showing_wide -> "nothing matched as a plain number. showing other ways it could be stored."
   | Untracked -> "some rarer forms are too common to track yet. they'll be rechecked on your next number."
-  | Lost n -> Printf.sprintf "%s matches disappeared because the game freed that memory." (commas n)
+  | Lost n -> Printf.sprintf "%s %s disappeared because the game freed that memory." (commas n) (if n = 1 then "match" else "matches")
 
 let outcome (o : Session.outcome) =
   if o.dead_end then dead_end

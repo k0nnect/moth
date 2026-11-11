@@ -21,6 +21,8 @@ let outcome () =
     (Render.outcome (plain ~main:70 [ ("whole number", 50); ("decimal", 20) ] [ Untracked ]));
   check_str "lost" "12 matches (12 whole number)\n1,200 matches disappeared because the game freed that memory."
     (Render.outcome (plain ~main:12 [ ("whole number", 12) ] [ Lost 1200 ]));
+  check_str "lost one" "12 matches (12 whole number)\n1 match disappeared because the game freed that memory."
+    (Render.outcome (plain ~main:12 [ ("whole number", 12) ] [ Lost 1 ]));
   check_str "notes in order"
     "2 matches (2 whole number ×100)\n\
      no exact match for that number. kept the ones that went up instead.\n\
