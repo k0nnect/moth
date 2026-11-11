@@ -1,6 +1,6 @@
-_build/
-_opam/
-build/
-bin/
+/_build/
+/_opam/
+/build/
+/bin/
 .superpowers/
 .DS_Store
