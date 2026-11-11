@@ -16,12 +16,16 @@ let hello token = Printf.sprintf {|{"hello":{"token":"%s","version":1,"pid":4242
 
 let field name = function `Assoc l -> List.assoc name l | _ -> failwith "not an object"
 
+(* the newest request line the fake helper read *)
+let last_request = ref ""
+
 (* how the fake helper answers: ps works, scan fails with not_attached, [`Lose] closes on ps, [`Wrong_id] answers with the wrong id *)
 let serve ?(on_ps = `Answer) (ic, oc) =
   let rec loop () =
     match input_line ic with
     | exception End_of_file -> ()
     | line ->
+        last_request := line;
         let j = Yojson.Safe.from_string line in
         let id = match field "id" j with `Int n -> n | _ -> -1 in
         let op = match field "op" j with `String s -> s | _ -> "" in
@@ -33,7 +37,10 @@ let serve ?(on_ps = `Answer) (ic, oc) =
             | `Lose -> raise Exit
             | `Error_wrong_id -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"x"}}|} (id + 5)))
         | "scan" -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"attach first"}}|} id)
-        | "peek" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"7"}]}|} id ^ "")
+        | "peek" when field "group" j = `String "f" ->
+            send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"nan"},{"addr":"0x14","v":85},{"addr":"0x18","v":"-inf"}]}|} id)
+        | "peek" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"7"}]}|} id)
+        | "write" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"prev":"inf","prev_bits":"0x7f800000"}|} id)
         | "bye" -> raise Exit
         | _ -> send oc (Printf.sprintf {|{"id":%d,"ok":true}|} id));
         loop ()
@@ -60,9 +67,24 @@ let start ?on_ps ?(tokens = [ `Right ]) () = Helper_conn.start ~launch:(fake_hel
 let basics () =
   let h = ok (start ()) in
   check_bool "ps" true (h.ps () = Ok [ (208, "disco.exe") ]);
-  check_bool "peek" true (h.peek ~id:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
+  check_bool "peek" true (h.peek ~id:"i32" ~vtype:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
   check_bool "error mapped" true (match h.scan ~keep:false [] with Error { code = "not_attached"; _ } -> true | _ -> false);
   check_bool "detach" true (h.detach () = Ok ());
+  h.close ()
+
+let typed_values () =
+  let h = ok (start ()) in
+  (match h.peek ~id:"f" ~vtype:"f32" ~offset:0 ~limit:5 with
+  | Ok [ { addr = 0x10L; v = Vfloat a }; { addr = 0x14L; v = Vfloat b }; { addr = 0x18L; v = Vfloat c } ] ->
+      check_bool "nan" true (Float.is_nan a);
+      check_bool "number" true (b = 85.);
+      check_bool "-inf" true (c = Float.neg_infinity)
+  | _ -> Alcotest.fail "peek of a float group");
+  check_bool "a whole number as its type" true (h.peek ~id:"u" ~vtype:"u64" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
+  check_bool "write a value" true (h.write ~addr:0x10L ~vtype:"f32" (Put_value (Vfloat 2.5)) = Ok { prev = Vfloat Float.infinity; prev_bits = 0x7f800000L });
+  check_bool "sends v" true (Yojson.Safe.from_string !last_request = Yojson.Safe.from_string {|{"id":3,"op":"write","addr":"0x10","type":"f32","v":2.5}|});
+  ignore (h.write ~addr:0x10L ~vtype:"f32" (Put_bits 0x7fc00001L));
+  check_bool "sends bits" true (Yojson.Safe.from_string !last_request = Yojson.Safe.from_string {|{"id":4,"op":"write","addr":"0x10","type":"f32","bits":"0x7fc00001"}|});
   h.close ()
 
 let wrong_token () =
@@ -131,6 +153,7 @@ let () =
       ( "conn",
         [
           Alcotest.test_case "requests" `Quick basics;
+          Alcotest.test_case "values by type, writes by value or bytes" `Quick typed_values;
           Alcotest.test_case "wrong token" `Quick wrong_token;
           Alcotest.test_case "never connects" `Quick never_connects;
           Alcotest.test_case "launch fails" `Quick launch_fails;

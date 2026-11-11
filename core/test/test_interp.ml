@@ -78,6 +78,10 @@ let fixes () =
   check_str "zero" "0" (show (Vfloat 0.));
   check_str "85.3" "85.3" (show (Vfloat 85.3));
   check_str "neg big" "-2500000.25" (show (Vfloat (-2500000.25)));
-  check_str "min_int scaled" "-92233720368547758.08" (Interp.decode c (Vint Int64.min_int))
+  check_str "min_int scaled" "-92233720368547758.08" (Interp.decode c (Vint Int64.min_int));
+  check_str "nan" "nan" (show (Vfloat Float.nan));
+  check_str "negative nan" "nan" (show (Vfloat (Float.neg Float.nan)));
+  check_str "inf" "inf" (show (Vfloat Float.infinity));
+  check_str "-inf" "-inf" (show (Vfloat Float.neg_infinity))
 
 let () = Alcotest.run "interp" [ ("plan", [ Alcotest.test_case "cases" `Quick cases; Alcotest.test_case "fixes" `Quick fixes ]) ]

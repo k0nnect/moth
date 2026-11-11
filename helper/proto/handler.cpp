@@ -119,17 +119,24 @@ uint64_t parse_value(const json& v, ValueType t) {
   return parse_int(v.get_ref<const std::string&>(), t);
 }
 
+// A float as a JSON number, or as "nan", "inf" or "-inf", which JSON numbers cannot be.
+json format_float(double d) {
+  if (std::isnan(d)) return "nan";
+  if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
+  return d;
+}
+
 json format_value(ValueType t, uint64_t bits) {
   if (t == ValueType::F32) {
     float f;
     const uint32_t b = static_cast<uint32_t>(bits);
     std::memcpy(&f, &b, sizeof f);
-    return static_cast<double>(f);
+    return format_float(static_cast<double>(f));
   }
   if (t == ValueType::F64) {
     double d;
     std::memcpy(&d, &bits, sizeof d);
-    return d;
+    return format_float(d);
   }
   bits &= width_mask(t);
   if (is_signed(t)) {
@@ -141,8 +148,10 @@ json format_value(ValueType t, uint64_t bits) {
   return std::to_string(bits);
 }
 
-uint64_t parse_addr(const std::string& s) {
-  if (s.size() < 3 || s.size() > 18 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) bad("address must be a 0x hex string");
+// "0x" and 1 to max_digits hex digits; what names the field in the error.
+uint64_t parse_hex(const std::string& s, size_t max_digits, const std::string& what) {
+  if (s.size() < 3 || s.size() > 2 + max_digits || s[0] != '0' || (s[1] != 'x' && s[1] != 'X'))
+    bad(what + " must be a 0x hex string of at most " + std::to_string(max_digits) + " digits");
   uint64_t a = 0;
   for (size_t i = 2; i < s.size(); i++) {
     const char c = s[i];
@@ -150,11 +159,16 @@ uint64_t parse_addr(const std::string& s) {
     if (c >= '0' && c <= '9') d = static_cast<uint64_t>(c - '0');
     else if (c >= 'a' && c <= 'f') d = static_cast<uint64_t>(c - 'a' + 10);
     else if (c >= 'A' && c <= 'F') d = static_cast<uint64_t>(c - 'A' + 10);
-    else bad("address must be a 0x hex string");
+    else bad(what + " must be a 0x hex string");
     a = a << 4 | d;
   }
   return a;
 }
+
+uint64_t parse_addr(const std::string& s) { return parse_hex(s, 16, "address"); }
+
+// A value's raw bytes: "0x" and up to two hex digits per byte of the type.
+uint64_t parse_bits(const json& v, ValueType t) { return parse_hex(str_of(v, "bits"), 2 * width_of(t), "\"bits\""); }
 
 std::string hex_addr(uint64_t a) {
   static const char* digits = "0123456789abcdef";
@@ -164,6 +178,14 @@ std::string hex_addr(uint64_t a) {
     a >>= 4;
   } while (a != 0);
   return "0x" + s;
+}
+
+// A value's raw bytes as "0x" and two lowercase hex digits per byte of the type.
+std::string hex_bits(uint64_t bits, ValueType t) {
+  static const char* digits = "0123456789abcdef";
+  std::string s = "0x";
+  for (size_t i = 2 * width_of(t); i-- > 0;) s.push_back(digits[(bits >> (4 * i)) & 15]);
+  return s;
 }
 
 // A predicate for a group of type t. allow_prev: previous-value predicates are accepted (narrow only).
@@ -301,10 +323,14 @@ struct Handler::Impl {
       need_attached();
       const uint64_t addr = parse_addr(get_str(req, "addr"));
       const ValueType t = get_type(req);
-      const uint64_t bits = parse_value(field(req, "v"), t);
+      // a value, or raw bytes (to put back exactly what a write replaced)
+      const auto by_bits = req.find("bits");
+      if (by_bits != req.end() && req.contains("v")) bad("give \"v\" or \"bits\", not both");
+      const uint64_t bits = by_bits != req.end() ? parse_bits(*by_bits, t) : parse_value(field(req, "v"), t);
       uint64_t prev = 0;
       if (!eng->write_value(addr, t, bits, prev)) throw EngineError("write_failed", "cannot write " + hex_addr(addr));
       r["prev"] = format_value(t, prev);
+      r["prev_bits"] = hex_bits(prev, t);
     } else {
       throw EngineError("unknown_op", "unknown op \"" + op + "\"");
     }

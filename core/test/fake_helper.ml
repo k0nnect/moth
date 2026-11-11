@@ -8,8 +8,8 @@ type call =
   | Scan of { keep : bool; specs : group_spec list }
   | Narrow of { atomic : bool; items : (string * pred) list }
   | Drop of string list
-  | Peek of { id : string; offset : int; limit : int }
-  | Write of { addr : int64; vtype : string; v : value }
+  | Peek of { id : string; vtype : string; offset : int; limit : int }
+  | Write of { addr : int64; vtype : string; v : put }
 
 type script = {
   mutable calls : call list; (* newest first *)
@@ -17,7 +17,7 @@ type script = {
   narrows : (bool * group_info list * stats, err) result Queue.t;
   drops : (unit, err) result Queue.t;
   peeks : (string, (item list, err) result Queue.t) Hashtbl.t; (* by group; "" answers any group *)
-  writes : (value, err) result Queue.t;
+  writes : (replaced, err) result Queue.t;
 }
 
 let zero_stats = { regions = 0; bytes = 0; unreadable_bytes = 0; lost = 0; ms = 0. }
@@ -57,8 +57,8 @@ let create () =
           record (Drop ids);
           match Queue.take_opt f.drops with Some r -> r | None -> Ok ());
       peek =
-        (fun ~id ~offset ~limit ->
-          record (Peek { id; offset; limit });
+        (fun ~id ~vtype ~offset ~limit ->
+          record (Peek { id; vtype; offset; limit });
           let q = peek_queue f id in
           if Queue.is_empty q then next "peek" (peek_queue f "") else Queue.take q);
       read = (fun ~addr:_ ~vtype:_ -> unscripted "read");
@@ -75,7 +75,7 @@ let create () =
 let queue_scan ?(stats = zero_stats) f infos = Queue.push (Ok (infos, stats)) f.scans
 let queue_narrow ?(stats = zero_stats) f ~applied infos = Queue.push (Ok (applied, infos, stats)) f.narrows
 let queue_peek f id items = Queue.push (Ok items) (peek_queue f id)
-let queue_write f ~prev = Queue.push (Ok prev) f.writes
+let queue_write ?(prev_bits = 0L) f ~prev = Queue.push (Ok { prev; prev_bits }) f.writes
 
 let queue_error f op (e : err) =
   match op with
@@ -111,4 +111,5 @@ let narrow_calls = count (function Narrow _ -> true | _ -> false)
 let write_calls = count (function Write _ -> true | _ -> false)
 let dropped f = List.concat_map (function Drop ids -> ids | _ -> []) (calls f)
 let peeks f = List.filter_map (function Peek p -> Some (p.id, p.offset, p.limit) | _ -> None) (calls f)
+let peek_vtypes f = List.filter_map (function Peek p -> Some (p.id, p.vtype) | _ -> None) (calls f)
 let last_write = newest "write" (function Write w -> Some (w.addr, w.vtype, w.v) | _ -> None)

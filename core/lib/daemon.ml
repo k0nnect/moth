@@ -102,7 +102,7 @@ let watch st (h : Helper_api.helper) : Helper_api.helper =
     scan = (fun ~keep specs -> see (h.scan ~keep specs));
     narrow = (fun ~atomic items -> see (h.narrow ~atomic items));
     drop = (fun ids -> see (h.drop ids));
-    peek = (fun ~id ~offset ~limit -> see (h.peek ~id ~offset ~limit));
+    peek = (fun ~id ~vtype ~offset ~limit -> see (h.peek ~id ~vtype ~offset ~limit));
     read = (fun ~addr ~vtype -> see (h.read ~addr ~vtype));
     write = (fun ~addr ~vtype v -> see (h.write ~addr ~vtype v));
     detach = (fun () -> see (h.detach ()));
@@ -167,16 +167,31 @@ let pick ~bottle what procs =
           let pids = List.sort compare (List.map fst many) in
           Error (sprintf "more than one %s is running (pids %s). attach by pid." name (String.concat ", " (List.map string_of_int pids))))
 
+(* the anti-cheat named in [found], if any: the helper is closed and attaching refused *)
+let refuse_anticheat st found =
+  match found with
+  | Some name ->
+      close_helper st;
+      Error (sprintf "moth won't attach: %s is running with this game. moth is for single-player, offline play." name)
+  | None -> Ok ()
+
+(* Process names are checked before anything of the game's is opened; then its modules, and a
+   module list that cannot be read refuses the attach rather than skipping the check. *)
 let attach st ~bottle what =
   let* h = open_helper st bottle in
   let* procs = lift (h.ps ()) in
   let* pid = pick ~bottle what procs in
-  let* modules = lift (h.modules pid) in
-  match Anticheat.check ~processes:(List.map snd procs) ~modules with
-  | Some name ->
-      close_helper st;
-      Error (sprintf "moth won't attach: %s is running with this game. moth is for single-player, offline play." name)
-  | None -> (
+  let processes = List.map snd procs in
+  let* () = refuse_anticheat st (Anticheat.check ~processes ~modules:[]) in
+  let* modules =
+    match h.modules pid with
+    | Ok m -> Ok m
+    | Error { code = "modules_failed"; _ } -> Error (sprintf "couldn't check what's loaded in %s, so moth won't attach. try again." (List.assoc pid procs))
+    | Error e -> Error (message e)
+  in
+  match refuse_anticheat st (Anticheat.check ~processes ~modules) with
+  | Error m -> Error m
+  | Ok () -> (
       match st.target with
       | Some t when t.proc.pid = pid -> Ok t
       | _ ->

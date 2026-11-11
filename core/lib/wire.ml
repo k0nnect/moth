@@ -52,7 +52,10 @@ let value_of_json ~vtype (j : Yojson.Safe.t) =
   match (vtype, j) with
   | ("f32" | "f64"), `Float f -> Vfloat f
   | ("f32" | "f64"), `Int n -> Vfloat (float_of_int n)
-  | ("f32" | "f64"), _ -> fail "a %s value must be a number" vtype
+  | ("f32" | "f64"), `String "nan" -> Vfloat Float.nan
+  | ("f32" | "f64"), `String "inf" -> Vfloat Float.infinity
+  | ("f32" | "f64"), `String "-inf" -> Vfloat Float.neg_infinity
+  | ("f32" | "f64"), _ -> fail "a %s value must be a number, \"nan\", \"inf\" or \"-inf\"" vtype
   | ("i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64"), `String s -> (
       let parsed =
         if not (is_decimal s) then None
@@ -62,6 +65,27 @@ let value_of_json ~vtype (j : Yojson.Safe.t) =
       match parsed with Some n -> Vint n | None -> fail "%S is not a %s value" s vtype)
   | ("i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64"), _ -> fail "a %s value must be a decimal string" vtype
   | _ -> fail "unknown type %S" vtype
+
+let width = function
+  | "i8" | "u8" -> 1
+  | "i16" | "u16" -> 2
+  | "i32" | "u32" | "f32" -> 4
+  | "i64" | "u64" | "f64" -> 8
+  | vtype -> fail "unknown type %S" vtype
+
+let bits_to_json ~vtype bits =
+  let w = width vtype in
+  let bits = if w = 8 then bits else Int64.logand bits (Int64.pred (Int64.shift_left 1L (8 * w))) in
+  `String (Printf.sprintf "0x%0*Lx" (2 * w) bits)
+
+let bits_of_json ~vtype (j : Yojson.Safe.t) =
+  let digits = 2 * width vtype in
+  let bad () = fail "a %s value's bytes must be a 0x hex string of up to %d digits" vtype digits in
+  match j with
+  | `String s when String.length s > 2 && String.length s <= 2 + digits && String.starts_with ~prefix:"0x" s ->
+      let add a c = match hex_digit c with Some d -> Int64.logor (Int64.shift_left a 4) (Int64.of_int d) | None -> bad () in
+      String.fold_left add 0L (String.sub s 2 (String.length s - 2))
+  | _ -> bad ()
 
 let field name (j : Yojson.Safe.t) =
   match j with

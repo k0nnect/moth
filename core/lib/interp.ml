@@ -147,7 +147,9 @@ let trim_zeros s =
   else s
 
 let float_str f =
-  if Float.is_nan f || Float.abs f = Float.infinity then string_of_float f
+  if Float.is_nan f then "nan"
+  else if f = Float.infinity then "inf"
+  else if f = Float.neg_infinity then "-inf"
   else if f = 0. then "0"
   else
     let a = Float.abs f in

@@ -94,20 +94,6 @@ let call c ~timeout ~op fields =
 let decode f reply = try Ok (f reply) with Failure m -> Error { code = "bad_reply"; message = m }
 let ( let* ) = Result.bind
 
-(* peek does not say which type the group holds, so each value is read by its shape: a JSON
-   number is a float, a decimal string an integer (as unsigned only when it is too big for signed) *)
-let peek_items reply =
-  let vtype_of = function
-    | `Assoc l -> ( match List.assoc_opt "v" l with Some (`String s) -> if Int64.of_string_opt s = None then "u64" else "i64" | _ -> "f64")
-    | _ -> "f64"
-  in
-  match reply with
-  | `Assoc l -> (
-      match List.assoc_opt "items" l with
-      | Some (`List is) -> List.concat_map (fun i -> Wire.items ~vtype:(vtype_of i) (`List [ i ])) is
-      | _ -> failwith "\"items\" must be a list")
-  | _ -> failwith "reply is not an object"
-
 let make c =
   let short = 30. and long = 300. in
   let req ?(timeout = short) op fields f =
@@ -139,18 +125,19 @@ let make c =
             (applied, Wire.group_infos (field "groups" r), Wire.stats (field "stats" r))));
     drop = (fun ids -> req "drop" [ ("ids", `List (List.map (fun i -> `String i) ids)) ] ignore);
     peek =
-      (fun ~id ~offset ~limit ->
+      (fun ~id ~vtype ~offset ~limit ->
         req "peek"
           [ ("group", `String id); ("offset", `Int offset); ("limit", `Int limit) ]
-          (fun r -> peek_items r));
+          (fun r -> Wire.items ~vtype (field "items" r)));
     read =
       (fun ~addr ~vtype ->
         req "read" [ ("addr", Wire.addr_to_json addr); ("type", `String vtype) ] (fun r -> Wire.value_of_json ~vtype (field "v" r)));
     write =
-      (fun ~addr ~vtype v ->
+      (fun ~addr ~vtype put ->
+        let what = match put with Put_value v -> ("v", Wire.value_to_json v) | Put_bits b -> ("bits", Wire.bits_to_json ~vtype b) in
         req "write"
-          [ ("addr", Wire.addr_to_json addr); ("type", `String vtype); ("v", Wire.value_to_json v) ]
-          (fun r -> Wire.value_of_json ~vtype (field "prev" r)));
+          [ ("addr", Wire.addr_to_json addr); ("type", `String vtype); what ]
+          (fun r -> { prev = Wire.value_of_json ~vtype (field "prev" r); prev_bits = Wire.bits_of_json ~vtype (field "prev_bits" r) }));
     detach = (fun () -> req "detach" [] ignore);
     close =
       (fun () ->

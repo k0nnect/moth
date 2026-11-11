@@ -23,7 +23,9 @@ type group = { interp : Interp.t; info : group_info }
 type hunt = { current : group list; last : Value.t }
 
 type listed = { at : int; li : Interp.t; laddr : int64 }
-type write = { wn : int; wi : Interp.t; waddr : int64; prev : value; next : value }
+
+(* prev_bits: the bytes the write replaced, which undo puts back exactly *)
+type write = { wn : int; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
 
 type t = {
   h : helper;
@@ -215,7 +217,7 @@ let results t ~all =
           let listed g = g.info.tracked && g.info.count > 0 && g.info.count <= listable && (g.interp.tier = Interp.Main || wide_too) in
           let found =
             List.concat_map
-              (fun g -> List.map (fun (it : item) -> (g.interp, it)) (call (t.h.peek ~id:g.info.id ~offset:0 ~limit:page)))
+              (fun g -> List.map (fun (it : item) -> (g.interp, it)) (call (t.h.peek ~id:g.info.id ~vtype:g.interp.vtype ~offset:0 ~limit:page)))
               (List.filter listed hunt.current)
           in
           let numbered = List.mapi (fun k (i, it) -> (k + 1, i, it)) found in
@@ -236,16 +238,16 @@ let set t ~row text =
           | Error e -> Error e
           | Ok next ->
               guard t (fun () ->
-                  let prev = call (t.h.write ~addr:l.laddr ~vtype:l.li.vtype next) in
-                  t.undo <- { wn = row; wi = l.li; waddr = l.laddr; prev; next } :: t.undo;
-                  Ok (Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li prev)))))
+                  let r = call (t.h.write ~addr:l.laddr ~vtype:l.li.vtype (Put_value next)) in
+                  t.undo <- { wn = row; wi = l.li; waddr = l.laddr; prev = r.prev; prev_bits = r.prev_bits; next } :: t.undo;
+                  Ok (Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li r.prev)))))
 
 let undo t =
   match t.undo with
   | [] -> Error "nothing to undo"
   | w :: rest ->
       guard t (fun () ->
-          ignore (call (t.h.write ~addr:w.waddr ~vtype:w.wi.vtype w.prev));
+          ignore (call (t.h.write ~addr:w.waddr ~vtype:w.wi.vtype (Put_bits w.prev_bits)));
           t.undo <- rest;
           Ok (Printf.sprintf "restored #%d to %s" w.wn (Interp.decode w.wi w.prev)))
 

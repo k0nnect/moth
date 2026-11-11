@@ -1,3 +1,4 @@
+#include <limits>
 #include <string>
 
 #include "doctest/doctest.h"
@@ -142,6 +143,53 @@ TEST_CASE("attach, detach, status and target_gone") {
   CHECK(code(h, R"({"op":"read","addr":"0x20000","type":"u8"})") == "not_attached");
   CHECK(J(h.handle_line(R"({"op":"attach","pid":1})"))["name"] == "a.exe");
   CHECK(code(h, R"({"op":"read","addr":"0x10000","type":"u8"})") == "ok");
+}
+
+TEST_CASE("float values that are not finite are strings") {
+  FakePlatform p; p.add(1, "t.exe", 64); auto& m = p.mem(1); m.add_region(0x10000, 4096);
+  m.poke<float>(0x10000, 100.0f); m.poke<double>(0x10008, 100.0);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  h.handle_line(R"({"op":"scan","keep":false,"groups":[
+     {"id":"f32","type":"f32","align":4,"exclude_align":0,"pred":{"op":"range","lo":99.0,"hi":101.0}},
+     {"id":"f64","type":"f64","align":8,"exclude_align":0,"pred":{"op":"range","lo":99.0,"hi":101.0}}]})");
+  m.poke<float>(0x10000, std::numeric_limits<float>::quiet_NaN());
+  m.poke<double>(0x10008, -std::numeric_limits<double>::infinity());
+  CHECK(J(h.handle_line(R"({"op":"peek","group":"f32","offset":0,"limit":5})"))["items"][0]["v"] == "nan");
+  CHECK(J(h.handle_line(R"({"op":"peek","group":"f64","offset":0,"limit":5})"))["items"][0]["v"] == "-inf");
+  m.poke<float>(0x10010, std::numeric_limits<float>::infinity());
+  CHECK(J(h.handle_line(R"({"op":"read","addr":"0x10010","type":"f32"})"))["v"] == "inf");
+  CHECK(J(h.handle_line(R"({"op":"read","addr":"0x10008","type":"f64"})"))["v"] == "-inf");
+  CHECK(J(h.handle_line(R"({"op":"read","addr":"0x10000","type":"f32"})"))["v"] == "nan");
+  auto wr = J(h.handle_line(R"({"op":"write","addr":"0x10000","type":"f32","v":5.5})"));
+  CHECK(wr["prev"] == "nan"); CHECK(wr["prev_bits"] == "0x7fc00000");
+  CHECK(J(h.handle_line(R"({"op":"read","addr":"0x10000","type":"f32"})"))["v"].get<double>() == 5.5);
+}
+
+TEST_CASE("a write replies with the bytes it replaced, and can put bytes back") {
+  FakePlatform p; p.add(1, "t.exe", 64); auto& m = p.mem(1); m.add_region(0x10000, 4096);
+  m.poke<int32_t>(0x10000, 100); m.poke<uint64_t>(0x10008, 0x7ff8000000000123ull);   // a nan with a payload
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  auto wr = J(h.handle_line(R"({"op":"write","addr":"0x10000","type":"i32","v":"-2"})"));
+  CHECK(wr["prev"] == "100"); CHECK(wr["prev_bits"] == "0x00000064");
+  wr = J(h.handle_line(R"({"op":"write","addr":"0x10000","type":"i32","bits":"0x00000064"})"));
+  CHECK(wr["prev"] == "-2"); CHECK(wr["prev_bits"] == "0xfffffffe"); CHECK(m.peek<int32_t>(0x10000) == 100);
+  wr = J(h.handle_line(R"({"op":"write","addr":"0x10008","type":"f64","v":1.5})"));
+  CHECK(wr["prev"] == "nan"); CHECK(wr["prev_bits"] == "0x7ff8000000000123");
+  CHECK(code(h, R"({"op":"write","addr":"0x10008","type":"f64","bits":"0x7ff8000000000123"})") == "ok");
+  CHECK(m.peek<uint64_t>(0x10008) == 0x7ff8000000000123ull);
+  CHECK(J(h.handle_line(R"({"op":"write","addr":"0x10000","type":"u8","bits":"0x7"})"))["prev_bits"] == "0x64");
+  CHECK(m.peek<int32_t>(0x10000) == 7);
+  for (const char* bad : {R"("bits":"0x")", R"("bits":"0x123")", R"("bits":"12")", R"("bits":"0xzz")", R"("bits":7)",
+                          R"("bits":"0x01","v":"1")"})
+    CHECK(code(h, std::string(R"({"op":"write","addr":"0x10000","type":"u8",)") + bad + "}") == "bad_request");
+  CHECK(code(h, R"({"op":"write","addr":"0x10000","type":"i16","bits":"0x10000"})") == "bad_request");
+}
+
+TEST_CASE("modules that cannot be listed are an error") {
+  FakePlatform p; p.add(1, "t.exe", 64); p.set_modules(1, {"t.exe"}); p.fail_modules(1);
+  Handler h(p);
+  auto r = J(h.handle_line(R"({"op":"modules","pid":1})"));
+  CHECK(r["ok"] == false); CHECK(r["error"]["code"] == "modules_failed");
 }
 
 TEST_CASE("drop and reply shape") {

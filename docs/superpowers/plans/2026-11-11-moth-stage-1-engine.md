@@ -90,23 +90,24 @@ bin/                             build output, gitignored
 | op | request fields | reply fields |
 | --- | --- | --- |
 | `ps` | | `processes:[{pid,name}]` |
-| `modules` | `pid` | `modules:[name]` |
+| `modules` | `pid` | `modules:[name]` (never empty: a list that cannot be read is the error `modules_failed`) |
 | `attach` | `pid` | `pid, name, bits` (32 or 64) |
 | `scan` | `groups:[G], keep:bool, budget_mb?` | `groups:[I], stats:S` |
 | `narrow` | `groups:[{id,pred:P}], atomic:bool` | `applied:bool, groups:[I], stats:S` |
 | `drop` | `ids:[id]` | |
 | `peek` | `group, offset, limit` | `items:[{addr,v}]` |
 | `read` | `addr, type` | `v` |
-| `write` | `addr, type, v` | `prev` |
+| `write` | `addr, type`, and `v` or `bits` | `prev, prev_bits` |
 | `status` | | `attached:{pid,name,bits}\|null, groups:[I]` |
 | `detach`, `bye` | | |
 
 - `G` = `{"id":"i32","type":"i32","align":4,"exclude_align":0,"pred":P}`. `type` is one of `i8 u8 i16 u16 i32 u32 i64 u64 f32 f64`.
 - `P` = `{"op":"eq","v":"100"}` (integer types) or `{"op":"range","lo":99.0,"hi":101.0}` (float types, both ends exclusive) or `{"op":"lt_prev"}`, `gt_prev`, `eq_prev`, `ne_prev`.
 - `I` = `{"id","count","tracked":bool,"has_values":bool}`. `S` = `{"regions","bytes","unreadable_bytes","lost","ms"}`.
-- Values `v` and `prev`: decimal string for integer types (`"100"`, `"-3"`), JSON number for float types. Addresses: hex string (`"0x1f3a0010"`).
+- Values `v` and `prev`: decimal string for integer types (`"100"`, `"-3"`), JSON number for float types. A float that is not finite is the string `"nan"`, `"inf"` or `"-inf"` in `peek`, `read` and `write` replies; a `write` request's `v` is always a finite number. The core decodes `peek` values by the group's type, which it knows. Addresses: hex string (`"0x1f3a0010"`).
+- `bits` and `prev_bits`: a value's raw bytes, little-endian, as a lowercase `0x` hex string of two digits per byte of the type (`"0x00000064"` for an `i32` 100, `"0x7fc00000"` for an `f32` nan; a request may leave out leading zeros). A `write` carries `v` or `bits`, not both. `undo` writes back `prev_bits`, so it restores exactly the previous bytes for every type.
 - `scan` with `keep:false` replaces every group. With `keep:true` it replaces only the groups it lists.
-- Error codes: `bad_request`, `unknown_op`, `not_attached`, `no_such_process`, `access_denied`, `no_such_group`, `no_values`, `target_gone`, `read_failed`, `write_failed`.
+- Error codes: `bad_request`, `unknown_op`, `not_attached`, `no_such_process`, `access_denied`, `modules_failed`, `no_such_group`, `no_values`, `target_gone`, `read_failed`, `write_failed`.
 
 **Client protocol.** Newline-delimited JSON over the Unix socket `$MOTH_HOME/core.sock`. Request `{"id":<n>,"actor":"user","cmd":"<cmd>","args":[strings],"opts":{...}}`. Reply `{"id":<n>,"ok":true,"result":<json>,"text":"<rendered>"}` or `{"id":<n>,"ok":false,"error":"<text>"}`. `MOTH_HOME` defaults to `~/Library/Application Support/moth`.
 

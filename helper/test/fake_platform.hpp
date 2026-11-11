@@ -19,6 +19,7 @@ class FakePlatform : public Platform {
   FakeMemory& mem(uint32_t pid) { return *procs_.at(pid).mem; }
   void set_modules(uint32_t pid, std::vector<std::string> m) { procs_.at(pid).modules = std::move(m); }
   void deny(uint32_t pid) { denied_.insert(pid); }
+  void fail_modules(uint32_t pid) { modules_fail_.insert(pid); }  // as when the snapshot cannot be taken
 
   std::vector<ProcInfo> processes() override {
     std::vector<ProcInfo> out;
@@ -28,6 +29,7 @@ class FakePlatform : public Platform {
   std::vector<std::string> modules(uint32_t pid) override {
     auto it = procs_.find(pid);
     if (it == procs_.end()) throw EngineError("no_such_process", "no process " + std::to_string(pid));
+    if (modules_fail_.count(pid)) throw EngineError("modules_failed", "cannot list the modules of " + std::to_string(pid));
     return it->second.modules;
   }
   std::unique_ptr<ProcessMemory> open(uint32_t pid, ProcInfo& out) override {
@@ -54,7 +56,7 @@ class FakePlatform : public Platform {
     std::vector<std::string> modules;
   };
   std::map<uint32_t, Proc> procs_;
-  std::set<uint32_t> denied_;
+  std::set<uint32_t> denied_, modules_fail_;
 };
 
 }  // namespace moth::test

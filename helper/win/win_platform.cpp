@@ -38,14 +38,29 @@ class WinPlatform : public Platform {
     return out;
   }
 
+  // Every module loaded in pid. A list that cannot be read is an error, never an empty list, so
+  // the anti-cheat check fails closed. The snapshot fails with ERROR_BAD_LENGTH while the process
+  // is loading or unloading a module; that is tried again a few times.
   std::vector<std::string> modules(uint32_t pid) override {
+    auto failed = [&](DWORD e) {
+      return EngineError("modules_failed", "cannot list the modules of pid " + std::to_string(pid) + ", error " + std::to_string(e));
+    };
+    HANDLE snap;
+    for (int tries = 1;; tries++) {
+      snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+      if (snap != INVALID_HANDLE_VALUE) break;
+      const DWORD e = GetLastError();
+      if (e != ERROR_BAD_LENGTH || tries == 5) throw failed(e);
+      Sleep(10);
+    }
     std::vector<std::string> out;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return out;
     MODULEENTRY32W me;
     me.dwSize = sizeof me;
-    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) out.push_back(utf8(me.szModule));
+    BOOL ok = Module32FirstW(snap, &me);
+    const DWORD first_error = ok ? 0 : GetLastError();  // every process has its own module at least
+    for (; ok; ok = Module32NextW(snap, &me)) out.push_back(utf8(me.szModule));
     CloseHandle(snap);
+    if (out.empty()) throw failed(first_error);
     return out;
   }
 

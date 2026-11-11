@@ -64,8 +64,41 @@ let decoders () =
   check_bool "unknown type" true (raises_failure (fun () -> Wire.value_of_json ~vtype:"i128" (`String "1")));
   check_bool "bad address" true (raises_failure (fun () -> Wire.items ~vtype:"i32" (j {|[{"addr":"10008","v":"1"}]|})));
   check_bool "address too long" true (raises_failure (fun () -> Wire.items ~vtype:"i32" (j {|[{"addr":"0x10000000000000000","v":"1"}]|})));
-  check_bool "missing field" true (raises_failure (fun () -> Wire.group_infos (j {|[{"id":"i32","count":1}]|})))
+  check_bool "missing field" true (raises_failure (fun () -> Wire.group_infos (j {|[{"id":"i32","count":1}]|})));
+  let is_nan = function Vfloat f -> Float.is_nan f | Vint _ -> false in
+  check_bool "nan" true (is_nan (Wire.value_of_json ~vtype:"f32" (`String "nan")));
+  check_bool "f64 nan" true (is_nan (Wire.value_of_json ~vtype:"f64" (`String "nan")));
+  check_bool "inf" true (Wire.value_of_json ~vtype:"f32" (`String "inf") = Vfloat Float.infinity);
+  check_bool "-inf" true (Wire.value_of_json ~vtype:"f64" (`String "-inf") = Vfloat Float.neg_infinity);
+  check_bool "other strings" true (raises_failure (fun () -> Wire.value_of_json ~vtype:"f32" (`String "Infinity")));
+  check_bool "not for whole numbers" true (raises_failure (fun () -> Wire.value_of_json ~vtype:"i32" (`String "nan")));
+  check_bool "items by type" true
+    (match Wire.items ~vtype:"f64" (j {|[{"addr":"0x10","v":"inf"}]|}) with [ { v = Vfloat f; _ } ] -> f = Float.infinity | _ -> false)
+
+let bits () =
+  check_str "i32" {|"0x00000064"|} (js (Wire.bits_to_json ~vtype:"i32" 100L));
+  check_str "only the type's bytes" {|"0xfffe"|} (js (Wire.bits_to_json ~vtype:"i16" (-2L)));
+  check_str "u8" {|"0x07"|} (js (Wire.bits_to_json ~vtype:"u8" 7L));
+  check_str "f64" {|"0x7ff8000000000123"|} (js (Wire.bits_to_json ~vtype:"f64" 0x7ff8000000000123L));
+  check_str "all eight bytes" {|"0xffffffffffffffff"|} (js (Wire.bits_to_json ~vtype:"u64" (-1L)));
+  check_bool "read back" true (Wire.bits_of_json ~vtype:"f32" (`String "0x7fc00001") = 0x7fc00001L);
+  check_bool "fewer digits" true (Wire.bits_of_json ~vtype:"i32" (`String "0x64") = 100L);
+  check_bool "eight bytes" true (Wire.bits_of_json ~vtype:"i64" (`String "0xffffffffffffffff") = -1L);
+  check_bool "too many digits" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i16" (`String "0x10000")));
+  check_bool "no digits" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`String "0x")));
+  check_bool "not hex" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`String "0xzz")));
+  check_bool "no 0x" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`String "64")));
+  check_bool "a number" true (raises_failure (fun () -> Wire.bits_of_json ~vtype:"i32" (`Int 64)));
+  Alcotest.(check (list int)) "widths" [ 1; 1; 2; 2; 4; 4; 4; 8; 8; 8 ] (List.map Wire.width [ "i8"; "u8"; "i16"; "u16"; "i32"; "u32"; "f32"; "i64"; "u64"; "f64" ])
 
 let () =
   Alcotest.run "wire"
-    [ ("wire", [ Alcotest.test_case "requests" `Quick requests; Alcotest.test_case "replies" `Quick replies; Alcotest.test_case "decoders" `Quick decoders ]) ]
+    [
+      ( "wire",
+        [
+          Alcotest.test_case "requests" `Quick requests;
+          Alcotest.test_case "replies" `Quick replies;
+          Alcotest.test_case "decoders" `Quick decoders;
+          Alcotest.test_case "bits" `Quick bits;
+        ] );
+    ]

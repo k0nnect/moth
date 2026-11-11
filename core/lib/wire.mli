@@ -1,6 +1,8 @@
 (** The helper protocol: newline-delimited JSON, as in the plan's "Protocols" table. Integer
-    values are decimal strings, float values JSON numbers, addresses lowercase [0x] hex strings
-    read and printed as unsigned 64-bit.
+    values are decimal strings, float values JSON numbers or, when not finite, the strings
+    ["nan"], ["inf"] and ["-inf"]; addresses lowercase [0x] hex strings read and printed as
+    unsigned 64-bit; a value's raw bytes ([bits], [prev_bits]) a lowercase [0x] hex string of two
+    digits per byte of its type.
 
     The decoders take the value of one reply field (for example the [groups] array, not the whole
     reply) and raise [Failure] when it does not have the shape the table gives. *)
@@ -21,3 +23,12 @@ val stats : Yojson.Safe.t -> Helper_api.stats
 val items : vtype:string -> Yojson.Safe.t -> Helper_api.item list
 val value_to_json : Helper_api.value -> Yojson.Safe.t
 val value_of_json : vtype:string -> Yojson.Safe.t -> Helper_api.value
+
+(** the bytes a value of the type takes: 1, 2, 4 or 8 *)
+val width : string -> int
+
+(** a value's raw bytes (the low [width vtype] bytes of the int64) as [0x] and two digits per byte *)
+val bits_to_json : vtype:string -> int64 -> Yojson.Safe.t
+
+(** [0x] and up to two hex digits per byte of the type *)
+val bits_of_json : vtype:string -> Yojson.Safe.t -> int64

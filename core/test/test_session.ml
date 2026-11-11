@@ -233,13 +233,13 @@ let results_set_undo () =
   check_str "tag" "whole number" (List.hd rows).tag;
   check_bool "row" true (rows = [ { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85" } ]);
   check_bool "one page of 10" true (peeks f = [ ("i32", 0, 10) ]);
-  queue_write f ~prev:(Vint 85L);
+  queue_write f ~prev:(Vint 85L) ~prev_bits:0x55L;
   check_str "set" "set #1 to 999 (was 85)" (ok (Session.set s ~row:1 "999"));
-  check_bool "wrote" true (last_write f = (0x10008L, "i32", Vint 999L));
+  check_bool "wrote" true (last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
   check_bool "recorded" true (Session.writes s = [ (0x10008L, "i32", Vint 85L, Vint 999L) ]);
   queue_write f ~prev:(Vint 999L);
   check_str "undo" "restored #1 to 85" (ok (Session.undo s));
-  check_bool "wrote back" true (last_write f = (0x10008L, "i32", Vint 85L));
+  check_bool "wrote back the bytes" true (last_write f = (0x10008L, "i32", Put_bits 0x55L));
   check_bool "undone" true (Session.writes s = []);
   check_err "undo twice" "nothing to undo" (Session.undo s);
   check_err "bad row" "no result #9. run: moth results" (Session.set s ~row:9 "1");
@@ -258,16 +258,30 @@ let undo_order () =
   ignore (ok (Session.find s "1"));
   queue_peek f "i32x100" [ it 0x5000L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
-  queue_write f ~prev:(Vint 100L);
+  queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
   check_str "first" "set #1 to 2.50 (was 1.00)" (ok (Session.set s ~row:1 "2.5"));
-  queue_write f ~prev:(Vint 250L);
+  queue_write f ~prev:(Vint 250L) ~prev_bits:250L;
   check_str "second" "set #1 to 9.00 (was 2.50)" (ok (Session.set s ~row:1 "9"));
   check_bool "newest first" true (Session.writes s = [ (0x5000L, "i32", Vint 250L, Vint 900L); (0x5000L, "i32", Vint 100L, Vint 250L) ]);
   queue_write f ~prev:(Vint 900L);
   check_str "undo newest" "restored #1 to 2.50" (ok (Session.undo s));
   queue_write f ~prev:(Vint 250L);
   check_str "undo oldest" "restored #1 to 1.00" (ok (Session.undo s));
-  check_bool "wrote the first value back" true (last_write f = (0x5000L, "i32", Vint 100L))
+  check_bool "wrote the first value back" true (last_write f = (0x5000L, "i32", Put_bits 100L))
+
+let undo_puts_bytes_back () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 0; gi "f32" 1 ];
+  ignore (ok (Session.find s "100"));
+  queue_peek f "f32" [ it 0x7000L (Vfloat Float.nan) ];
+  check_str "a nan is shown" "nan" (List.hd (ok (Session.results s ~all:false))).shown;
+  check_bool "peeked as its type" true (peek_vtypes f = [ ("f32", "f32") ]);
+  queue_write f ~prev:(Vfloat Float.nan) ~prev_bits:0x7fc00001L;
+  check_str "set" "set #1 to 5 (was nan)" (ok (Session.set s ~row:1 "5"));
+  check_bool "wrote the value" true (last_write f = (0x7000L, "f32", Put_value (Vfloat 5.)));
+  queue_write f ~prev:(Vfloat 5.) ~prev_bits:0x40a00000L;
+  check_str "undo" "restored #1 to nan" (ok (Session.undo s));
+  check_bool "wrote the bytes back" true (last_write f = (0x7000L, "f32", Put_bits 0x7fc00001L))
 
 let listing_follows_hunt () =
   let s, f = fresh () in
@@ -409,6 +423,7 @@ let () =
         [
           t "results, set, undo" results_set_undo;
           t "undo order" undo_order;
+          t "undo puts the bytes back" undo_puts_bytes_back;
           t "listing follows the hunt" listing_follows_hunt;
           t "results selection" results_selection;
         ] );

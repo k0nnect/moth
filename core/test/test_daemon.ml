@@ -31,21 +31,29 @@ let sock home = Filename.concat home "core.sock"
 
 type fake = {
   mutable procs : (int * string) list;
-  mutable modules : string list;
+  mutable modules : (string list, err) result;
   mutable started : string list; (* bottles, newest first *)
   mutable closed : int;
+  mutable modules_asked : int; (* modules calls *)
+  mutable attaches : int; (* attach calls *)
   script : Fake_helper.script;
 }
 
 let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
   let h, script = Fake_helper.create () in
-  let fk = { procs; modules = [ "UnityPlayer.dll" ]; started = []; closed = 0; script } in
+  let fk = { procs; modules = Ok [ "UnityPlayer.dll" ]; started = []; closed = 0; modules_asked = 0; attaches = 0; script } in
   let helper =
     {
       h with
       ps = (fun () -> Ok fk.procs);
-      modules = (fun _ -> Ok fk.modules);
-      attach = (fun pid -> Ok { pid; name = List.assoc pid fk.procs; bits = 64 });
+      modules =
+        (fun _ ->
+          fk.modules_asked <- fk.modules_asked + 1;
+          fk.modules);
+      attach =
+        (fun pid ->
+          fk.attaches <- fk.attaches + 1;
+          Ok { pid; name = List.assoc pid fk.procs; bits = 64 });
       close = (fun () -> fk.closed <- fk.closed + 1);
     }
   in
@@ -140,13 +148,23 @@ let anticheat () =
       let refusal = "moth won't attach: easy anti-cheat is running with this game. moth is for single-player, offline play." in
       check_err "anticheat" refusal (attach d ~what:"game.exe");
       check_int "helper closed" 1 fk.closed;
+      check_int "modules never asked for" 0 fk.modules_asked;
+      check_int "never attached" 0 fk.attaches;
       check_str "status" "not attached" (text (call d "status" []));
       fk.procs <- [ (208, "game.exe") ];
       check_str "attach" "attached to game.exe (pid 208, 64-bit) in uhmm" (text (attach d ~what:"game.exe"));
-      fk.modules <- [ "kernel32.dll"; "EasyAntiCheat_x64.dll" ];
+      check_int "attached once" 1 fk.attaches;
+      fk.modules <- Ok [ "kernel32.dll"; "EasyAntiCheat_x64.dll" ];
+      fk.attaches <- 0;
       check_err "in the modules" refusal (attach d ~what:"game.exe");
+      check_int "not attached for it" 0 fk.attaches;
       check_str "detached" "not attached" (text (call d "status" []));
-      check_int "closed again" 2 fk.closed)
+      check_int "closed again" 2 fk.closed;
+      (* modules that can't be listed refuse the attach instead of skipping the check *)
+      fk.modules <- Error { code = "modules_failed"; message = "cannot list the modules of pid 208, error 5" };
+      check_err "modules unknown" "couldn't check what's loaded in game.exe, so moth won't attach. try again." (attach d ~what:"game.exe");
+      check_int "still not attached" 0 fk.attaches;
+      check_str "status" "not attached" (text (call d "status" [])))
 
 let outcome_json ?(notes = []) ?(lost = 0) ?(ms = 0.) ?(bytes = 0) ?(wide = 0) ~main by_tag groups =
   `Assoc
@@ -208,7 +226,7 @@ let hunt () =
         (json (call d "results" [] ~opts:[ ("all", "true") ]));
       Fake_helper.queue_write f ~prev:(Vint 60L);
       check_bool "set accepts #" true (Result.is_ok (call d "set" [ "#1"; "999" ]));
-      check_bool "wrote" true (Fake_helper.last_write f = (0x10008L, "i32", Vint 999L));
+      check_bool "wrote" true (Fake_helper.last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
       Fake_helper.queue_write f ~prev:(Vint 999L);
       check_json "set without #" (`Assoc [ ("message", `String "set #2 to 5 (was 999)") ]) (json (call d "set" [ "2"; "5" ]));
       Fake_helper.queue_write f ~prev:(Vint 5L);

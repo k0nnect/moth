@@ -21,6 +21,7 @@ class Platform {
  public:
   virtual ~Platform() = default;
   virtual std::vector<ProcInfo> processes() = 0;
+  // Throws EngineError{"modules_failed"} when the list cannot be read: never an empty list instead.
   virtual std::vector<std::string> modules(uint32_t pid) = 0;
   // Throws EngineError{"no_such_process"} or {"access_denied"}.
   virtual std::unique_ptr<ProcessMemory> open(uint32_t pid, ProcInfo& out) = 0;
