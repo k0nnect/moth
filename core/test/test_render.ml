@@ -75,14 +75,14 @@ let rows () =
   check_str "rows" "#1  85    0x10008     whole number\n#2  85.5  0x7ffe0010  decimal"
     (Render.rows
        [
-         { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85" };
-         { n = 2; addr = 0x7ffe0010L; interp_id = "f32"; tag = "decimal"; shown = "85.5" };
+         { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85"; away = None };
+         { n = 2; addr = 0x7ffe0010L; interp_id = "f32"; tag = "decimal"; shown = "85.5"; away = None };
        ]);
   check_str "wide numbers" "#9   1.00  0xffff800000001000  whole number ×100\n#10  2     0x10                whole number"
     (Render.rows
        [
-         { n = 9; addr = 0xffff800000001000L; interp_id = "i32x100"; tag = "whole number ×100"; shown = "1.00" };
-         { n = 10; addr = 0x10L; interp_id = "i32"; tag = "whole number"; shown = "2" };
+         { n = 9; addr = 0xffff800000001000L; interp_id = "i32x100"; tag = "whole number ×100"; shown = "1.00"; away = None };
+         { n = 10; addr = 0x10L; interp_id = "i32"; tag = "whole number"; shown = "2"; away = None };
        ]);
   check_str "nothing to list" "nothing to list yet. narrow it down with your next number." (Render.rows [])
 

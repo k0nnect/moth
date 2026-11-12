@@ -28,6 +28,10 @@ let fresh () =
 
 let set_text r = (ok r : Session.set_done).text
 
+(* the first page, as the daemon lists it by default *)
+let first_page ?(all = false) s = Session.results s ~all ~from:1 ~limit:20 ~near:None
+let rows_of r = (ok r : Session.listing).rows
+
 let stats ?(bytes = 0) ?(lost = 0) ?(unreadable = 0) ms = { zero_stats with bytes; lost; unreadable_bytes = unreadable; ms }
 let ids_of (o : Session.outcome) = List.map (fun ((g : group_info), _) -> g.id) o.groups
 let fell_back (o : Session.outcome) = List.exists (function Session.Fell_back _ -> true | _ -> false) o.notes
@@ -231,11 +235,11 @@ let results_set_undo () =
   queue_narrow f ~applied:true [ gi "i32" 1; gi "f32" 0 ];
   ignore (ok (Session.next_number s "85"));
   queue_peek f "i32" [ it 0x10008L (Vint 85L) ];
-  let rows = ok (Session.results s ~all:false) in
+  let rows = rows_of (first_page s) in
   check_str "row" "85" (List.hd rows).shown;
   check_str "tag" "whole number" (List.hd rows).tag;
-  check_bool "row" true (rows = [ { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85" } ]);
-  check_bool "one page of 10" true (peeks f = [ ("i32", 0, 10) ]);
+  check_bool "row" true (rows = [ { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85"; away = None } ]);
+  check_bool "only the rows the page needs" true (peeks f = [ ("i32", 0, 1) ]);
   queue_write f ~prev:(Vint 85L) ~prev_bits:0x55L;
   queue_read f (Vint 999L);
   check_str "set" "set #1 to 999 (was 85)" (set_text (Session.set s ~row:1 "999"));
@@ -252,7 +256,7 @@ let results_set_undo () =
   queue_scan f_u8 [ gi "i32" 0; gi "u8" 1 ];
   ignore (ok (Session.find s_u8 "100"));
   queue_peek f_u8 "u8" [ it 0x20000L (Vint 100L) ];
-  check_str "wide row" "whole number (1-byte)" (List.hd (ok (Session.results s_u8 ~all:false))).tag;
+  check_str "wide row" "whole number (1-byte)" (List.hd (rows_of (first_page s_u8))).tag;
   check_err "does not fit" "999999 doesn't fit in a whole number (1-byte)" (Session.set s_u8 ~row:1 "999999");
   check_int "nothing written" 0 (write_calls f_u8)
 
@@ -261,7 +265,7 @@ let undo_order () =
   queue_scan f [ gi "i32x100" 1 ];
   ignore (ok (Session.find s "1"));
   queue_peek f "i32x100" [ it 0x5000L (Vint 100L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
   queue_read f (Vint 250L);
   check_str "first" "set #1 to 2.50 (was 1.00)" (set_text (Session.set s ~row:1 "2.5"));
@@ -280,7 +284,7 @@ let undo_puts_bytes_back () =
   queue_scan f [ gi "i32" 0; gi "f32" 1 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "f32" [ it 0x7000L (Vfloat Float.nan) ];
-  check_str "a nan is shown" "nan" (List.hd (ok (Session.results s ~all:false))).shown;
+  check_str "a nan is shown" "nan" (List.hd (rows_of (first_page s))).shown;
   check_bool "peeked as its type" true (peek_vtypes f = [ ("f32", "f32") ]);
   queue_write f ~prev:(Vfloat Float.nan) ~prev_bits:0x7fc00001L;
   queue_read f (Vfloat 5.);
@@ -299,7 +303,7 @@ let listing_follows_hunt () =
   queue_scan f [ gi "i32" 2 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "i32" [ it 0x1000L (Vint 100L); it 0x2000L (Vint 100L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_narrow f ~applied:false [];
   queue_narrow f ~applied:false [];
   check_bool "dead end" true (ok (Session.next_number s "5")).dead_end;
@@ -315,20 +319,22 @@ let results_selection () =
   queue_scan f [ gi "i32" 2; gi "f32" 2000; gi "i16" 0; gi "u8" 1; gi "i32x100" 1; gi ~tracked:false "i32u" 50 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "i32" [ it 0x1000L (Vint 100L); it 0x2000L (Vint 100L) ];
-  let rows = ok (Session.results s ~all:false) in
-  check_bool "main only, up to 1000 matches" true (peeks f = [ ("i32", 0, 10) ]);
-  check_bool "numbered" true (List.map (fun (r : Session.row) -> r.n) rows = [ 1; 2 ]);
-  queue_peek f "i32" [ it 0x1000L (Vint 100L); it 0x2000L (Vint 100L) ];
+  queue_peek f "f32" (List.init 18 (fun k -> it (Int64.of_int (0x8000 + (4 * k))) (Vfloat 100.)));
+  let rows = rows_of (first_page s) in
+  check_bool "main only, however many matches" true (peeks f = [ ("i32", 0, 2); ("f32", 0, 18) ]);
+  check_bool "numbered" true (List.map (fun (r : Session.row) -> r.n) rows = List.init 20 (fun k -> k + 1));
   queue_peek f "u8" [ it 0x3001L (Vint 100L) ];
   queue_peek f "i32x100" [ it 0x4000L (Vint 10000L) ];
-  let rows = ok (Session.results s ~all:true) in
-  check_bool "all, in plan order" true (List.tl (peeks f) = [ ("i32", 0, 10); ("u8", 0, 10); ("i32x100", 0, 10) ]);
+  queue_peek f "i32" [ it 0x1000L (Vint 100L); it 0x2000L (Vint 100L) ];
+  let rows = rows_of (Session.results s ~all:true ~from:1 ~limit:4 ~near:None) in
+  check_bool "all, fewest first, ties in plan order" true
+    (List.filteri (fun k _ -> k >= 2) (peeks f) = [ ("u8", 0, 1); ("i32x100", 0, 1); ("i32", 0, 2) ]);
   check_bool "numbered across groups" true (List.map (fun (r : Session.row) -> r.n) rows = [ 1; 2; 3; 4 ]);
-  check_ids "interpretations" [ "i32"; "i32"; "u8"; "i32x100" ] (List.map (fun (r : Session.row) -> r.interp_id) rows);
-  let last = List.nth rows 3 in
-  check_str "scaled shown" "100.00" last.shown;
-  check_str "scaled tag" "whole number ×100" last.tag;
-  check_bool "address" true (last.addr = 0x4000L)
+  check_ids "interpretations" [ "u8"; "i32x100"; "i32"; "i32" ] (List.map (fun (r : Session.row) -> r.interp_id) rows);
+  let scaled = List.nth rows 1 in
+  check_str "scaled shown" "100.00" scaled.shown;
+  check_str "scaled tag" "whole number ×100" scaled.tag;
+  check_bool "address" true (scaled.addr = 0x4000L)
 
 let stats_and_lost () =
   let s, f = fresh () in
@@ -395,7 +401,7 @@ let failed_find_and_lost_groups () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
   queue_read f (Vint 5L);
   ignore (set_text (Session.set s ~row:1 "5"));
@@ -409,8 +415,8 @@ let failed_find_and_lost_groups () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "100"));
   queue_error f "peek" { code = "no_such_group"; message = "no group \"i32\"" };
-  check_err "lost listing results" hunt_lost (Session.results s ~all:false);
-  check_err "cleared too" no_hunt (Session.results s ~all:false);
+  check_err "lost listing results" hunt_lost (first_page s);
+  check_err "cleared too" no_hunt (first_page s);
   let s, f = fresh () in
   queue_scan f [ gi "i32" 9 ];
   ignore (ok (Session.find s "100"));
@@ -421,7 +427,7 @@ let out_of_order () =
   let fresh_s, _ = fresh () in
   check_err "no hunt" no_hunt (Session.next_number fresh_s "5");
   check_err "no hunt relation" no_hunt (Session.next_relation fresh_s Down);
-  check_err "no hunt results" no_hunt (Session.results fresh_s ~all:false);
+  check_err "no hunt results" no_hunt (first_page fresh_s);
   check_err "no hunt set" no_hunt (Session.set fresh_s ~row:1 "5");
   check_err "nothing to undo" "nothing to undo" (Session.undo fresh_s);
   check_err "bad number" "'abc' isn't a number" (Session.find fresh_s "abc")
@@ -438,12 +444,12 @@ let game_closes () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 100L);
   queue_read f (Vint 5L);
   ignore (set_text (Session.set s ~row:1 "5"));
   queue_error f "peek" gone;
-  check_err "closed during results" closed (Session.results s ~all:false);
+  check_err "closed during results" closed (first_page s);
   check_err "undo cleared" "nothing to undo" (Session.undo s);
   check_bool "writes cleared" true (Session.writes s = []);
   (* losing the helper ends the hunt the same way *)
@@ -451,7 +457,7 @@ let game_closes () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 100L);
   queue_read f (Vint 5L);
   ignore (set_text (Session.set s ~row:1 "5"));
@@ -514,7 +520,7 @@ let no_baseline_nothing_moved () =
   ignore (ok (Session.next_number s "6"));
   check_pred "after a relation step" (Range { lo = 5.; hi = 7.; floor = 1e-6; moved = false }) (last_narrow_pred f "f32");
   queue_peek f "f32" [ it 0x20L (Vfloat 6.) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vfloat 6.) ~prev_bits:0x40c00000L;
   queue_read f (Vfloat 9.);
   ignore (ok (Session.set s ~row:1 "9"));
@@ -528,7 +534,7 @@ let a_write_the_game_puts_back () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "6"));
   queue_peek f "i32" [ it 0x10L (Vint 6L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_read f (Vint 6L);
   let d = ok (Session.set s ~row:1 "9") in
@@ -544,7 +550,7 @@ let a_write_that_holds () =
   queue_scan f [ gi "i32" 0; gi "f32" 1 ];
   ignore (ok (Session.find s "100"));
   queue_peek f "f32" [ it 0x7000L (Vfloat 100.) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vfloat 100.) ~prev_bits:0x42c80000L;
   queue_read f (Vfloat (Int32.float_of_bits (Int32.bits_of_float 0.1)));
   let d = ok (Session.set s ~row:1 "0.1") in
@@ -558,7 +564,7 @@ let a_write_the_game_keeps_changing () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "6"));
   queue_peek f "i32" [ it 0x10L (Vint 6L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_read f (Vint 7L);
   let d = ok (Session.set s ~row:1 "9") in
@@ -571,7 +577,7 @@ let a_write_that_cannot_be_read_back () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "6"));
   queue_peek f "i32" [ it 0x10L (Vint 6L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_error f "read" { code = "read_failed"; message = "couldn't read 0x10" };
   let d = ok (Session.set s ~row:1 "9") in
@@ -585,7 +591,7 @@ let a_set_or_undo_clears_the_baseline () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "61"));
   queue_peek f "i32" [ it 0x10L (Vint 61L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_write f ~prev:(Vint 61L) ~prev_bits:61L;
   queue_read f (Vint 999L);
   ignore (ok (Session.set s ~row:1 "999"));
@@ -627,7 +633,7 @@ let a_write_check_when_things_fail () =
   queue_scan f [ gi "i32" 1 ];
   ignore (ok (Session.find s "6"));
   queue_peek f "i32" [ it 0x10L (Vint 6L) ];
-  ignore (ok (Session.results s ~all:false));
+  ignore (ok (first_page s));
   queue_error f "write" { code = "write_failed"; message = "couldn't write 0x10" };
   check_err "the write failed" "couldn't write 0x10" (Session.set s ~row:1 "9");
   check_bool "no wait" true (!settles = []);
@@ -644,6 +650,274 @@ let a_write_check_when_things_fail () =
   check_err "the next command finds the game closed" closed (Session.next_number s "5");
   check_err "hunt cleared" no_hunt (Session.next_number s "5");
   check_err "undo cleared" "nothing to undo" (Session.undo s)
+
+(* ---- pages, nearness and kept values ---- *)
+
+let near ?(from = 1) ?(limit = 20) s target = Session.results s ~all:false ~from ~limit ~near:(Some target)
+let aways (l : Session.listing) = List.map (fun (r : Session.row) -> Option.get r.away) l.rows
+let ns (l : Session.listing) = List.map (fun (r : Session.row) -> r.n) l.rows
+let kept_one name kaddr ktag kshown : Session.kept = { name; kaddr; ktag; kshown }
+let kept_names s = List.map (fun (k : Session.kept) -> k.name) (ok (Session.kept s))
+let unknown_xp = "no kept value called xp. see: moth kept"
+let name_rule = "a name is lowercase letters, digits, - and _, starting with a letter."
+
+let small_groups_come_first_and_pages_continue () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 30; gi "f32" 0; gi "i64" 2 ];
+  ignore (ok (Session.find s "5"));
+  queue_peek f "i64" [ it 0x100L (Vint 5L); it 0x200L (Vint 5L) ];
+  queue_peek f "i32" [ it 0x10L (Vint 5L); it 0x14L (Vint 5L); it 0x18L (Vint 5L) ];
+  let l = ok (Session.results s ~all:false ~from:1 ~limit:5 ~near:None) in
+  check_int "total" 32 l.total;
+  check_ids "order" [ "i64"; "i64"; "i32"; "i32"; "i32" ] (List.map (fun (r : Session.row) -> r.interp_id) l.rows);
+  check_bool "the i32 page asked for" true (last_peek f "i32" = (0, 3));
+  queue_peek f "i32" [ it 0x1cL (Vint 5L) ];
+  let l = ok (Session.results s ~all:false ~from:6 ~limit:1 ~near:None) in
+  check_int "numbered on" 6 (List.hd l.rows).n;
+  check_bool "offset 3" true (last_peek f "i32" = (3, 1));
+  check_err "past the end" "no result #33. there are 32." (Session.results s ~all:false ~from:33 ~limit:5 ~near:None)
+
+let pages_across_groups () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 2500; gi "f32" 1; gi "i16" 3 ];
+  ignore (ok (Session.find s "5"));
+  let i32s first k = List.init k (fun i -> it (Int64.of_int (0x10000 + (4 * (first + i)))) (Vint 5L)) in
+  queue_peek f "f32" [ it 0x100L (Vfloat 5.) ];
+  queue_peek f "i16" [ it 0x200L (Vint 5L); it 0x202L (Vint 5L); it 0x204L (Vint 5L) ];
+  queue_peek f "i32" (i32s 0 1);
+  let l = ok (Session.results s ~all:false ~from:1 ~limit:5 ~near:None) in
+  check_ids "a page across three groups" [ "f32"; "i16"; "i16"; "i16"; "i32" ] (List.map (fun (r : Session.row) -> r.interp_id) l.rows);
+  check_bool "each asked for its part" true (peeks f = [ ("f32", 0, 1); ("i16", 0, 3); ("i32", 0, 1) ]);
+  (* more rows of one group than the helper gives in one peek *)
+  queue_peek f "i32" (i32s 0 1000);
+  queue_peek f "i32" (i32s 1000 1000);
+  queue_peek f "i32" (i32s 2000 500);
+  let l = ok (Session.results s ~all:false ~from:5 ~limit:3000 ~near:None) in
+  check_bool "in peeks of at most 1000" true (List.filteri (fun k _ -> k >= 3) (peeks f) = [ ("i32", 0, 1000); ("i32", 1000, 1000); ("i32", 2000, 500) ]);
+  check_int "to the last row" 2500 (List.length l.rows);
+  check_int "numbered on" 2504 (List.nth l.rows 2499).n;
+  check_int "from" 5 l.from;
+  queue_peek f "i32" (i32s 2499 1);
+  let l = ok (Session.results s ~all:false ~from:2504 ~limit:20 ~near:None) in
+  check_bool "the last row alone" true (List.map (fun (r : Session.row) -> (r.n, r.addr)) l.rows = [ (2504, Int64.of_int (0x10000 + (4 * 2499))) ]);
+  check_bool "asked for one" true (last_peek f "i32" = (2499, 1));
+  (* nothing to list is a listing with no rows, wherever it starts *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 0 ];
+  ignore (ok (Session.find s "5"));
+  let l = ok (Session.results s ~all:false ~from:3 ~limit:20 ~near:None) in
+  check_bool "empty" true (l.rows = [] && l.total = 0 && l.from = 3);
+  check_bool "nothing asked" true (peeks f = [])
+
+let near_a_kept_value () =
+  let s, f = fresh () in
+  queue_read f (Vint 15L);
+  check_str "kept" "kept 0x6c551068 as xp (15, whole number)" (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+  queue_scan f [ gi "i32x100" 5093; gi "i64x100" 304 ];
+  ignore (ok (Session.find s "5.32"));
+  queue_peek_from f "i64x100" [ it 0x6c551078L (Vint 532L); it 0x6c559000L (Vint 532L) ];
+  queue_peek_from f "i32x100" [ it 0x6c551078L (Vint 532L); it 0x6c559000L (Vint 532L) ];
+  let l = ok (Session.results s ~all:false ~from:1 ~limit:20 ~near:(Some "xp")) in
+  check_int "two rows, both at the money address" 2 l.total;
+  check_bool "away" true (List.for_all (fun (r : Session.row) -> r.addr = 0x6c551078L && r.away = Some 16) l.rows);
+  check_bool "asked from reach below" true (last_peek_from_addr f "i32x100" = Int64.sub 0x6c551068L 4096L);
+  check_ids "a tie goes in plan order" [ "i32x100"; "i64x100" ] (List.map (fun (r : Session.row) -> r.interp_id) l.rows);
+  check_bool "numbered" true (ns l = [ 1; 2 ]);
+  check_bool "64 at a time" true (List.for_all (fun (_, _, limit) -> limit = 64) (peek_froms f));
+  check_str "shown" "5.32" (List.hd l.rows).shown
+
+let near_an_address () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 3 ];
+  ignore (ok (Session.find s "5"));
+  queue_peek_from f "i32" [ it 0x6c551060L (Vint 5L); it 0x6c551068L (Vint 5L); it 0x6c551070L (Vint 5L) ];
+  let l = ok (Session.results s ~all:false ~from:1 ~limit:20 ~near:(Some "0x6c551068")) in
+  check_bool "nothing kept" true (ok (Session.kept s) = []);
+  check_bool "its own address first, then below before above" true (aways l = [ 0; -8; 8 ] && ns l = [ 1; 2; 3 ]);
+  queue_write f ~prev:(Vint 5L) ~prev_bits:5L;
+  queue_read f (Vint 9L);
+  check_str "set takes the near listing" "set #1 to 9 (was 5)" (set_text (Session.set s ~row:1 "9"));
+  check_bool "at the address" true (last_write f = (0x6c551068L, "i32", Put_value (Vint 9L)))
+
+let near_nothing () =
+  let s, f = fresh () in
+  check_err "no hunt" no_hunt (near s "0x10");
+  queue_scan f [ gi "i32" 3 ];
+  ignore (ok (Session.find s "5"));
+  check_err "an unknown name" unknown_xp (near s "xp");
+  check_bool "nothing asked" true (peek_froms f = []);
+  queue_read f (Vint 5L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551068L "5" ~name:(Some "xp")));
+  queue_peek_from f "i32" [ it 0x6c553000L (Vint 5L) ];
+  check_err "nothing in reach" "nothing within 4 kb of xp." (near s "xp")
+
+(* 64 at a time from reach below, on from the last one, until one is more than reach above *)
+let near_pages_and_the_ends_of_memory () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 5000 ];
+  ignore (ok (Session.find s "5"));
+  let below = List.init 64 (fun k -> it (Int64.of_int (4 * k)) (Vint 5L)) in
+  let above = [ it 0x100L (Vint 5L); it 0x104L (Vint 5L); it 0x1100L (Vint 5L); it 0x1104L (Vint 5L) ] in
+  queue_peek_from f "i32" below;
+  queue_peek_from f "i32" above;
+  let l = ok (near ~limit:100 s "0x100") in
+  check_bool "from the start of memory, then on" true (peek_froms f = [ ("i32", 0L, 64); ("i32", 0xfdL, 64) ]);
+  check_int "every one within reach" 67 l.total;
+  check_bool "nearest first" true (List.filteri (fun k _ -> k < 4) (aways l) = [ 0; -4; 4; -8 ]);
+  check_bool "reach is inclusive" true (List.nth (aways l) 65 = -256 && List.nth (aways l) 66 = 4096);
+  queue_peek_from f "i32" below;
+  queue_peek_from f "i32" above;
+  let l = ok (near ~from:66 ~limit:5 s "0x100") in
+  check_bool "paged" true (ns l = [ 66; 67 ] && aways l = [ -256; 4096 ] && l.total = 67 && l.from = 66);
+  queue_peek_from f "i32" below;
+  queue_peek_from f "i32" above;
+  check_err "past the end" "no result #68. there are 67." (near ~from:68 s "0x100");
+  queue_peek_from f "i32" [ it 0xfffffffffffff010L (Vint 5L); it 0xfffffffffffffff0L (Vint 5L) ];
+  let l = ok (near s "0xFFFFFFFFFFFFF000") in
+  check_bool "at the top of memory, from reach below" true (last_peek_from_addr f "i32" = 0xffffffffffffe000L);
+  check_bool "nothing wraps around" true (aways l = [ 16; 4080 ])
+
+let a_kept_row_outlives_the_hunt () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "15"));
+  queue_peek f "i32" [ it 0x6c551068L (Vint 15L) ];
+  ignore (ok (first_page s));
+  check_str "kept" "kept #1 as xp (15, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "xp")));
+  check_err "a row not listed" "no result #2. run: moth results" (Session.keep_row s ~row:2 ~name:(Some "hp"));
+  queue_scan f [ gi "i32" 40 ];
+  ignore (ok (Session.find s "20"));
+  queue_read f (Vint 20L);
+  check_bool "kept through a new find, read now" true (ok (Session.kept s) = [ kept_one "xp" 0x6c551068L "whole number" "20" ]);
+  check_bool "read as its type" true (reads f = [ (0x6c551068L, "i32") ]);
+  check_err "a row needs a listing" "no result #1. run: moth results" (Session.keep_row s ~row:1 ~name:(Some "hp"))
+
+let keep_at_an_address () =
+  let s, f = fresh () in
+  let plan = Interp.plan (Value.Int 15L) in
+  List.iter (fun (i : Interp.t) -> queue_read f (if i.vtype = "f32" || i.vtype = "f64" then Vfloat 16. else Vint 16L)) plan;
+  check_err "nothing there" "nothing at 0x6c551068 reads as 15." (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp"));
+  check_bool "each interpretation in plan order, as its type" true (reads f = List.map (fun (i : Interp.t) -> (0x6c551068L, i.vtype)) plan);
+  check_bool "nothing kept" true (ok (Session.kept s) = []);
+  (* the first that holds wins; one that can't be read there is passed over *)
+  queue_read f (Vint 0x41700000L);
+  queue_read f (Vfloat 15.);
+  check_str "a decimal" "kept 0x20 as v1 (15, decimal)" (ok (Session.keep_at s ~addr:0x20L "15" ~name:None));
+  queue_error f "read" { code = "read_failed"; message = "cannot read 0x30" };
+  queue_read f (Vfloat 15.);
+  check_str "past a read that failed" "kept 0x30 as v2 (15, decimal)" (ok (Session.keep_at s ~addr:0x30L "15" ~name:None));
+  check_err "not a number" "'x' isn't a number" (Session.keep_at s ~addr:0x40L "x" ~name:None)
+
+let a_kept_value_that_cannot_be_read () =
+  let s, f = fresh () in
+  queue_read f (Vint 15L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+  queue_read f (Vint 16L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551070L "16" ~name:(Some "hp")));
+  queue_error f "read" { code = "read_failed"; message = "cannot read 0x6c551068" };
+  queue_read f (Vint 17L);
+  check_bool "shown as ?, the rest read, as kept" true
+    (ok (Session.kept s) = [ kept_one "xp" 0x6c551068L "whole number" "?"; kept_one "hp" 0x6c551070L "whole number" "17" ])
+
+let names () =
+  let s, f = fresh () in
+  List.iter (fun n -> check_err n name_rule (Session.keep_at s ~addr:0x10L "15" ~name:(Some n))) [ "Xp"; "1up"; String.make 25 'a'; ""; "x p"; "0x10" ];
+  check_bool "nothing read" true (reads f = []);
+  queue_read f (Vint 15L);
+  check_str "xp" "kept 0x10 as xp (15, whole number)" (ok (Session.keep_at s ~addr:0x10L "15" ~name:(Some "xp")));
+  check_err "taken" "there's already a kept value called xp. pick another, or: moth forget xp" (Session.keep_at s ~addr:0x20L "15" ~name:(Some "xp"));
+  queue_read f (Vint 15L);
+  check_str "the first free name" "kept 0x30 as v1 (15, whole number)" (ok (Session.keep_at s ~addr:0x30L "15" ~name:None));
+  queue_read f (Vint 15L);
+  check_str "the next" "kept 0x40 as v2 (15, whole number)" (ok (Session.keep_at s ~addr:0x40L "15" ~name:None));
+  let long = "a-b_c9" ^ String.make 18 'z' in
+  queue_read f (Vint 15L);
+  check_str "24, with digits, - and _" ("kept 0x50 as " ^ long ^ " (15, whole number)") (ok (Session.keep_at s ~addr:0x50L "15" ~name:(Some long)));
+  (* a row's name is held to the same rule *)
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "15"));
+  queue_peek f "i32" [ it 0x60L (Vint 15L) ];
+  ignore (ok (first_page s));
+  check_err "a number is not a name" name_rule (Session.keep_row s ~row:1 ~name:(Some "5"));
+  check_err "nor is an address" name_rule (Session.keep_row s ~row:1 ~name:(Some "0x10"));
+  List.iter (fun _ -> queue_read f (Vint 15L)) [ 1; 2; 3; 4 ];
+  check_ids "nothing else kept" [ "xp"; "v1"; "v2"; long ] (kept_names s)
+
+let at_most_64_kept () =
+  let s, f = fresh () in
+  for k = 1 to 64 do
+    queue_read f (Vint 15L);
+    ignore (ok (Session.keep_at s ~addr:(Int64.of_int (16 * k)) "15" ~name:None))
+  done;
+  let full = "that's 64 kept values, the most moth holds. forget one first." in
+  check_err "full" full (Session.keep_at s ~addr:0x10000L "15" ~name:(Some "xp"));
+  check_err "full, with no name" full (Session.keep_at s ~addr:0x10000L "15" ~name:None);
+  check_str "forget" "forgot v7" (ok (Session.forget s "v7"));
+  check_err "forgotten" "no kept value called v7. see: moth kept" (Session.forget s "v7");
+  queue_read f (Vint 15L);
+  check_str "its name is free again" "kept 0x10000 as v7 (15, whole number)" (ok (Session.keep_at s ~addr:0x10000L "15" ~name:None));
+  for _ = 1 to 64 do queue_read f (Vint 15L) done;
+  let names = kept_names s in
+  check_int "64" 64 (List.length names);
+  check_str "kept last, listed last" "v7" (List.nth names 63)
+
+let set_a_kept_value () =
+  let s, f = fresh () in
+  queue_read f (Vint 15L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+  queue_write f ~prev:(Vint 15L) ~prev_bits:15L;
+  queue_read f (Vint 95L);
+  let d = ok (Session.set_kept s ~name:"xp" "95") in
+  check_str "set" "set xp to 95 (was 15)" d.text;
+  check_bool "held" true d.held;
+  check_bool "the write" true (d.w = { where = 0x6c551068L; wtype = "i32"; bits_before = 15L; bits_after = 95L });
+  check_bool "wrote as its type" true (last_write f = (0x6c551068L, "i32", Put_value (Vint 95L)));
+  check_bool "recorded" true (Session.writes s = [ (0x6c551068L, "i32", Vint 15L, Vint 95L) ]);
+  queue_write f ~prev:(Vint 95L) ~prev_bits:95L;
+  check_str "undo" "restored xp to 15" (said (Session.undo s));
+  check_bool "wrote back the bytes" true (last_write f = (0x6c551068L, "i32", Put_bits 15L));
+  queue_write f ~prev:(Vint 15L) ~prev_bits:15L;
+  queue_read f (Vint 15L);
+  check_str "checked as set is"
+    "set xp to 95 (was 15)\nthe game put it straight back to 15. it's worked out from something else, so writing here won't stick."
+    (set_text (Session.set_kept s ~name:"xp" "95"));
+  check_err "a number it can't hold" "this value is a whole number, and 1.5 has a decimal part" (Session.set_kept s ~name:"xp" "1.5");
+  check_str "forgot" "forgot xp" (ok (Session.forget s "xp"));
+  queue_write f ~prev:(Vint 15L) ~prev_bits:15L;
+  check_str "a forgotten value's write is still undone by name" "restored xp to 15" (said (Session.undo s));
+  (* it clears the baseline as set does *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 3 ];
+  ignore (ok (Session.find s "61"));
+  queue_read f (Vint 61L);
+  ignore (ok (Session.keep_at s ~addr:0x10L "61" ~name:(Some "hp")));
+  queue_write f ~prev:(Vint 61L) ~prev_bits:61L;
+  queue_read f (Vint 999L);
+  ignore (ok (Session.set_kept s ~name:"hp" "999"));
+  queue_narrow f ~applied:false [];
+  check_bool "dead end" true (ok (Session.next_number s "995")).dead_end;
+  check_int "no fallback narrow" 1 (narrow_calls f)
+
+let unknown_names () =
+  let s, _ = fresh () in
+  check_err "set" unknown_xp (Session.set_kept s ~name:"xp" "95");
+  check_err "forget" unknown_xp (Session.forget s "xp")
+
+let kept_values_and_a_closed_game () =
+  let s, f = fresh () in
+  queue_read f (Vint 15L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+  (* a lost group ends the hunt, not the kept values *)
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "5"));
+  queue_error f "peek" { code = "no_such_group"; message = "no group \"i32\"" };
+  check_err "hunt lost" hunt_lost (first_page s);
+  queue_read f (Vint 15L);
+  check_bool "still kept" true (ok (Session.kept s) = [ kept_one "xp" 0x6c551068L "whole number" "15" ]);
+  queue_error f "read" gone;
+  check_err "closed" closed (Session.kept s);
+  check_bool "cleared" true (ok (Session.kept s) = []);
+  check_err "set by name" unknown_xp (Session.set_kept s ~name:"xp" "9")
 
 let () =
   let t n f = Alcotest.test_case n `Quick f in
@@ -682,4 +956,21 @@ let () =
           t "a write check when things fail" a_write_check_when_things_fail;
         ] );
       ("errors", [ t "out of order" out_of_order; t "game closes" game_closes; t "failed find, lost groups" failed_find_and_lost_groups ]);
+      ( "pages, near, kept",
+        [
+          t "small groups come first and pages continue" small_groups_come_first_and_pages_continue;
+          t "pages across groups" pages_across_groups;
+          t "near a kept value" near_a_kept_value;
+          t "near an address" near_an_address;
+          t "near nothing, or no such name" near_nothing;
+          t "near: pages and the ends of memory" near_pages_and_the_ends_of_memory;
+          t "a kept row outlives the hunt" a_kept_row_outlives_the_hunt;
+          t "keep at an address" keep_at_an_address;
+          t "a kept value that cannot be read" a_kept_value_that_cannot_be_read;
+          t "names" names;
+          t "at most 64 kept" at_most_64_kept;
+          t "set a kept value" set_a_kept_value;
+          t "unknown names" unknown_names;
+          t "kept values and a closed game" kept_values_and_a_closed_game;
+        ] );
     ]

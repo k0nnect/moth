@@ -1,7 +1,8 @@
 (** The hunt: what to ask the helper for each number or change the user reports, and what
     came of it. The helper holds the candidates; this keeps the groups (one per interpretation
-    from [Interp.plan], in plan order), the last number typed, the last results listing and the
-    writes that can still be undone. *)
+    from [Interp.plan], in plan order), the last number typed, the last results listing, the
+    writes that can still be undone and the values kept by name. Losing the game or the helper
+    ends the hunt and drops the writes and the kept values; a lost group ends only the hunt. *)
 
 type t
 type relation = Down | Up | Same | Changed
@@ -24,7 +25,12 @@ type outcome = {
   groups : (Helper_api.group_info * Interp.tier) list;
 }
 
-type row = { n : int; addr : int64; interp_id : string; tag : string; shown : string }
+(** one result: its number in the listing, where it is, the interpretation and how it reads;
+    [away], in a listing near a value, is its signed distance from that value in bytes *)
+type row = { n : int; addr : int64; interp_id : string; tag : string; shown : string; away : int option }
+
+(** a page of a listing: its rows, how many rows the whole listing has, and the first row asked for *)
+type listing = { rows : row list; total : int; from : int }
 
 (** one write as it was made: where, as which type, the raw bytes it replaced and the ones it put
     there (see [Wire.bits_of_value]) *)
@@ -49,8 +55,19 @@ val next_number : t -> string -> (outcome, string) result
 
 val next_relation : t -> relation -> (outcome, string) result
 
-(** lists the hunt's smaller groups; [set] uses the latest listing until the hunt changes *)
-val results : t -> all:bool -> (row list, string) result
+(** 4096: how far a listing near a value looks, in bytes, each way *)
+val reach : int
+
+(** rows [from] to [from + limit - 1] (1-based) of a listing of the groups shown: the tracked
+    ones with matches in main, and in wide too under [all] or when only wide is left.
+
+    Without [near], the groups go fewest matches first, ties in plan order, each in address
+    order, numbered from 1 across that order; [total] is their counts summed. With [near] (a kept
+    value's name, or a [0x] address), the rows are every position within [reach] bytes of that
+    address, its own included, nearest first, ties in plan order. Either way a [from] past
+    [total] (when there are any) is an error. The page's rows are the ones [set] and [keep_row]
+    take, until the hunt changes or another listing replaces them. *)
+val results : t -> all:bool -> from:int -> limit:int -> near:string option -> (listing, string) result
 
 (** writes the number, waits ([settle]), then reads the address back: the game putting back the
     bytes the write replaced, or anything else there, is a second line and [held = false]. The
@@ -59,6 +76,26 @@ val set : t -> row:int -> string -> (set_done, string) result
 
 (** writes back the exact bytes the newest write replaced *)
 val undo : t -> (string * written, string) result
+
+(** a kept value: its name, address and tag, and how it reads now (["?"] when it can't be read) *)
+type kept = { name : string; kaddr : int64; ktag : string; kshown : string }
+
+(** keeps a row of the latest listing by name, or as the first of [v1], [v2], ... not in use. A
+    name is a lowercase letter and up to 23 lowercase letters, digits, [_] or [-]; at most 64
+    values are kept. Kept values outlast the hunt. *)
+val keep_row : t -> row:int -> name:string option -> (string, string) result
+
+(** keeps the address as the first interpretation of the number, in plan order, that reads as it
+    there *)
+val keep_at : t -> addr:int64 -> string -> name:string option -> (string, string) result
+
+(** the kept values, read now, in the order kept *)
+val kept : t -> (kept list, string) result
+
+val forget : t -> string -> (string, string) result
+
+(** [set] for a kept value, named in its texts and in [undo]'s *)
+val set_kept : t -> name:string -> string -> (set_done, string) result
 
 (** the writes [undo] can still reverse: addr, vtype, previous, new; newest first *)
 val writes : t -> (int64 * string * Helper_api.value * Helper_api.value) list

@@ -400,7 +400,7 @@ let handle st ~cmd ~args ~opts =
         (match List.assoc_opt (String.lowercase_ascii a) relations with Some r -> Session.next_relation s r | None -> Session.next_number s a)
   | "results", _ ->
       let* s = session () in
-      Result.map rows (Session.results s ~all:(List.assoc_opt "all" opts = Some "true"))
+      Result.map (fun (l : Session.listing) -> rows l.rows) (Session.results s ~all:(List.assoc_opt "all" opts = Some "true") ~from:1 ~limit:20 ~near:None)
   | "set", [ row; v ] ->
       let* s = session () in
       let* d = Session.set s ~row:(Option.get (row_number row)) v in
