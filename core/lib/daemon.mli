@@ -11,7 +11,8 @@ type start_helper = bottle:string -> (Helper_api.helper, string) result
 
     MOTH_BUDGET_MB is read once, here: a whole number from 1 to 65536 is the memory budget, in
     MiB, that every hunt's [find] sends with its scan; anything else is ignored, with a line in
-    the log (unset or empty, quietly). *)
+    the log (unset or empty, quietly). MOTH_SNAPSHOT_MB likewise: a whole number from 1 to
+    1048576 is the most memory, in MiB, a [snapshot] may take, sent with each one. *)
 val run : home:string -> start_helper:start_helper -> unit
 
 (** the real helper under CrossOver's wine, its output appended to [home]/helper.log *)

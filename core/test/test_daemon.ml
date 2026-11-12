@@ -661,7 +661,11 @@ let keep_by_name () =
       Fake_helper.queue_read f (Vint 60L);
       check_str "kept" "xp  60  0x10008  whole number" (text (call d "kept" []));
       check_json "kept json"
-        (`List [ `Assoc [ ("name", `String "xp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "60") ] ])
+        (`List
+           [
+             `Assoc
+               [ ("name", `String "xp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "60"); ("set_to", `Null); ("put_back", `Bool false) ];
+           ])
         (json (call d "kept" []));
       Fake_helper.queue_write f ~prev:(Vint 60L) ~prev_bits:0x3cL;
       Fake_helper.queue_read f (Vint 95L);
@@ -712,8 +716,8 @@ let keep_by_address () =
       check_json "unreadable json"
         (`List
           [
-            `Assoc [ ("name", `String "xp"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "15") ];
-            `Assoc [ ("name", `String "v1"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "?") ];
+            `Assoc [ ("name", `String "xp"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "15"); ("set_to", `Null); ("put_back", `Bool false) ];
+            `Assoc [ ("name", `String "v1"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "?"); ("set_to", `Null); ("put_back", `Bool false) ];
           ])
         (json (call d "kept" [])))
 
@@ -890,6 +894,110 @@ let budget () =
               Alcotest.(check (option int)) ("MOTH_BUDGET_MB=" ^ v) want (Fake_helper.last_scan_budget fk.script))))
     [ ("64", Some 64); ("abc", None); ("1", Some 1); ("65536", Some 65536); ("0", None); ("65537", None); ("", None) ]
 
+(* ---- stage 1c: snapshot ---- *)
+
+let blind = [ gi "i32" 1000; gi "f32" 1000; gi "i16" 2000; gi "i64" 500; gi "f64" 500; gi "u8" 4000 ]
+let snapshot_text = "snapshot of 4 kb taken. change the value in the game, then tell moth how it moved: moth next down, up, same or changed."
+
+let a_snapshot_hunt () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      check_err "not attached" not_attached (call d "snapshot" []);
+      ignore (text (attach d));
+      Fake_helper.queue_snapshot f ~stats:{ Fake_helper.zero_stats with bytes = 4096 } blind;
+      let r = call d "snapshot" [] in
+      check_str "text" snapshot_text (text r);
+      let open Yojson.Safe.Util in
+      check_json "notes" (`List [ `String "snapshot" ]) (member "notes" (json r));
+      check_int "bytes" 4096 (member "bytes" (json r) |> to_int);
+      check_bool "the blind plan" true
+        (Fake_helper.last_snapshot_groups f = [ ("i32", "i32", 4); ("f32", "f32", 4); ("i16", "i16", 2); ("i64", "i64", 8); ("f64", "f64", 8); ("u8", "u8", 1) ]);
+      check_int "one call" 1 (Fake_helper.snapshot_calls f);
+      (* status reads plainly: the counts, no number to be blank *)
+      check_str "status" (attached ^ "\n5,000 matches (1,000 whole number, 1,000 decimal, 2,000 whole number (2-byte), 500 whole number (8-byte), 500 decimal (8-byte))")
+        (text (call d "status" []));
+      check_int "status json" 5000 (member "hunt" (json (call d "status" [])) |> member "main" |> to_int);
+      check_err "nothing to list yet" "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed." (call d "results" []);
+      Fake_helper.queue_narrow f ~applied:true [ gi "i32" 3; gi "f32" 2; gi "i16" 0; gi "i64" 0; gi "f64" 0; gi "u8" 0 ];
+      check_str "next down" "5 matches (3 whole number, 2 decimal)" (text (call d "next" [ "down" ]));
+      check_str "status after a step" (attached ^ "\n5 matches (3 whole number, 2 decimal)") (text (call d "status" []));
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 5L) } ];
+      Fake_helper.queue_peek f "f32" [ { addr = 0x10010L; v = Some (Vfloat 5.) } ];
+      check_bool "results lists" true (String.length (text (call d "results" [])) > 0);
+      let log = json (call d "log" [] ~opts:[ ("n", "9") ]) in
+      check_strs "one event per command"
+        [ "snapshot"; "attach"; "snapshot"; "status"; "status"; "results"; "next"; "status"; "results" ]
+        (List.rev_map (fun e -> member "cmd" e |> to_string) (to_list log)))
+
+let snapshot_usage () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      check_err "extra" "snapshot takes no arguments" (call d "snapshot" [ "extra" ]);
+      check_int "the helper was not called" 0 (Fake_helper.snapshot_calls fk.script);
+      check_bool "usage check" true (Daemon.check_usage ~cmd:"snapshot" ~args:[] ~opts:[] = Ok ()))
+
+let snapshot_too_big () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 3;
+      Fake_helper.queue_error f "snapshot" { code = "too_big"; message = "4516605952 to snapshot, limit 1073741824" };
+      let msg = "the game has 4.2 gb of memory to snapshot, more than moth's limit of 1.0 gb. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>" in
+      check_err "too big" msg (call d "snapshot" []);
+      check_str "the hunt there was" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
+      let log = json (call d "log" [] ~opts:[ ("n", "3") ]) in
+      let open Yojson.Safe.Util in
+      check_bool "logged as an error" false (index 1 log |> member "ok" |> to_bool);
+      check_str "with the text" msg (index 1 log |> member "summary" |> to_string))
+
+let kept_put_back () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 1 ];
+      ignore (text (call d "find" [ "10" ]));
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 10L) } ];
+      ignore (text (call d "results" []));
+      ignore (text (call d "keep" [ "#1"; "hp" ]));
+      Fake_helper.queue_read f (Vint 10L);
+      check_json "never written by name"
+        (`List
+           [
+             `Assoc
+               [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `Null); ("put_back", `Bool false) ];
+           ])
+        (json (call d "kept" []));
+      Fake_helper.queue_write f ~prev:(Vint 10L) ~prev_bits:10L;
+      Fake_helper.queue_read f (Vint 20L);
+      ignore (text (call d "set" [ "hp"; "20" ]));
+      (* the game wrote 10 back *)
+      Fake_helper.queue_read f (Vint 10L);
+      Fake_helper.queue_read f (Vint 10L);
+      check_json "put back"
+        (`List
+           [
+             `Assoc
+               [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `String "20"); ("put_back", `Bool true) ];
+           ])
+        (json (call d "kept" []));
+      check_bool "the text line" true (String.ends_with ~suffix:"you set it to 20; the game put it back." (text (call d "kept" []))))
+
+(* MOTH_SNAPSHOT_MB is read when the daemon starts *)
+let snapshot_cap () =
+  List.iter
+    (fun (v, want) ->
+      let fk, sh = fake () in
+      with_env "MOTH_SNAPSHOT_MB" v (fun () ->
+          with_daemon sh (fun d ->
+              ignore (text (attach d));
+              Fake_helper.queue_snapshot fk.script blind;
+              ignore (text (call d "snapshot" []));
+              Alcotest.(check (option int)) ("MOTH_SNAPSHOT_MB=" ^ v) want (Fake_helper.last_snapshot_cap fk.script))))
+    [ ("2048", Some 2048); ("abc", None); ("0", None); ("", None); ("1", Some 1); ("1048576", Some 1048576); ("1048577", None); ("-5", None); ("12abc", None); (" 2048", None) ]
+
 let usage () =
   let check n w g = Alcotest.(check (result unit string)) n w g in
   check "unknown" (Error "unknown command: frob. run: moth help") (Daemon.check_usage ~cmd:"frob" ~args:[] ~opts:[]);
@@ -965,6 +1073,11 @@ let () =
           t "status notices a closed game" closed_game;
           t "status, helper lost" status_helper_lost;
           t "memory budget" budget;
+          t "snapshot hunt" a_snapshot_hunt;
+          t "snapshot usage" snapshot_usage;
+          t "snapshot too big" snapshot_too_big;
+          t "kept shows a put back" kept_put_back;
+          t "snapshot cap" snapshot_cap;
         ] );
       ( "lifecycle",
         [

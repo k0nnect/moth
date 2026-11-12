@@ -8,6 +8,7 @@ let usage =
   attach --bottle <bottle> <game.exe>  attach to a running game, by name or pid
   status                               what moth is attached to, and the hunt so far
   find <number>                        start a hunt for a number the game shows
+  snapshot                             start a hunt with no number: remember everything, then narrow by how the value moves
   next <number>                        narrow the hunt to the number it shows now
   next down|up|same|changed            narrow the hunt by how the number moved
   results [--all] [-n <rows>] [--from <row>] [--near <name|0xaddr>]  list the matches left (-n from 1 to 200, default 20)

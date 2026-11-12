@@ -27,6 +27,8 @@ Build output (`_build/`, `_opam/`, `build/`, `bin/`) is gitignored.
 
 `MOTH_BUDGET_MB` is read once, when the daemon starts. A whole number from 1 to 65536 is the most memory, in MiB, the helper may use to hold a hunt's candidates; every `find` sends it with its scan. Past it, the helper stops tracking groups from the end of the hunt's list (the `untracked` note) and searches them again on the next number. Unset or empty, the helper's own budget holds (1536 MiB). Anything else is ignored, with a line in `core.log`. A running daemon keeps the value it started with: `moth stop` first, then run the next command with the new value.
 
+`MOTH_SNAPSHOT_MB` is read the same way, once, when the daemon starts: a whole number from 1 to 1048576 is the most memory, in MiB, that a `snapshot` may take. The default is 8192. A snapshot costs as much memory as the game's writable memory, held by the helper until the hunt has narrowed. While a snapshot hunt narrows, the helper can briefly hold about the snapshot plus twice the budget. Anything else is ignored, with a line in `core.log`.
+
 ## engine speed
 
     make bench-native   # builds build/native/moth_bench and runs it

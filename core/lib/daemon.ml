@@ -67,6 +67,7 @@ type state = {
   sock : string;
   start_helper : start_helper;
   budget_mb : int option; (* from MOTH_BUDGET_MB, for every session *)
+  snapshot_mb : int option; (* from MOTH_SNAPSHOT_MB, for every session *)
   mutable conn : (string * Helper_api.helper) option; (* the helper and the bottle it runs in *)
   mutable target : target option; (* always in the helper's bottle *)
   mutable lost : bool; (* the helper said helper_lost during this request *)
@@ -206,7 +207,7 @@ let attach st ~bottle what =
       (* the helper lets go of the old target when it attaches to the new one *)
       st.target <- None;
       let* proc = lift (h.attach pid) in
-      let t = { proc; bottle; session = Session.create ?budget_mb:st.budget_mb h } in
+      let t = { proc; bottle; session = Session.create ?budget_mb:st.budget_mb ?snapshot_mb:st.snapshot_mb h } in
       st.gone <- false;
       st.target <- Some t;
       Ok t
@@ -271,7 +272,17 @@ let listing ?near ~all (l : Session.listing) =
   (`Assoc [ ("rows", `List (List.map row l.rows)); ("total", `Int l.total); ("from", `Int l.from) ], Render.listing ?near ~all l)
 
 let kept ks =
-  ( `List (List.map (fun (k : Session.kept) -> `Assoc [ ("name", `String k.name); ("addr", hex k.kaddr); ("tag", `String k.ktag); ("shown", `String k.kshown) ]) ks),
+  ( `List (List.map (fun (k : Session.kept) -> 
+         `Assoc
+           [
+             ("name", `String k.name);
+             ("addr", hex k.kaddr);
+             ("tag", `String k.ktag);
+             ("shown", `String k.kshown);
+             ("set_to", match k.set_to with Some v -> `String v | None -> `Null);
+             ("put_back", `Bool k.put_back);
+           ])
+         ks),
     Render.kept ks )
 
 let said m = (`Assoc [ ("message", `String m) ], m)
@@ -417,6 +428,7 @@ let check_usage ~cmd ~args ~opts =
       none
   | "attach" -> need (List.length args = 1 && List.mem_assoc "bottle" opts) "attach needs a bottle and a process: moth attach --bottle <bottle> <game.exe>"
   | "find" -> need (List.length args = 1) "find needs a number"
+  | "snapshot" -> none
   | "next" -> need (List.length args = 1) "next needs a number, or one of: down, up, same, changed"
   | "results" ->
       let* () = none in
@@ -461,6 +473,9 @@ let handle st ~cmd ~args ~opts =
   | "find", [ n ] ->
       let* s = session () in
       Result.map outcome (Session.find s n)
+  | "snapshot", _ ->
+      let* s = session () in
+      Result.map outcome (Session.snapshot s)
   | "next", [ a ] ->
       let* s = session () in
       Result.map outcome
@@ -587,15 +602,16 @@ let rec loop st listener wake =
           loop st listener wake
         end
 
-(* MOTH_BUDGET_MB: a whole number of MiB from 1 to 65536; unset or empty, no budget *)
-let budget_from_env () =
-  match Sys.getenv_opt "MOTH_BUDGET_MB" with
+(* an env var holding a whole number of MiB from 1 to [max]; unset or empty, none; anything
+   else is ignored, with a line in the log *)
+let mb_from_env name max =
+  match Sys.getenv_opt name with
   | None | Some "" -> None
   | Some v -> (
       match int_of_string_opt v with
-      | Some n when is_digits v && n >= 1 && n <= 65536 -> Some n
+      | Some n when is_digits v && n >= 1 && n <= max -> Some n
       | _ ->
-          say "ignoring MOTH_BUDGET_MB=%S: it must be a whole number from 1 to 65536" v;
+          say "ignoring %s=%S: it must be a whole number from 1 to %d" name v max;
           None)
 
 let run ~home ~start_helper =
@@ -611,7 +627,8 @@ let run ~home ~start_helper =
       home;
       sock;
       start_helper;
-      budget_mb = budget_from_env ();
+      budget_mb = mb_from_env "MOTH_BUDGET_MB" 65536;
+      snapshot_mb = mb_from_env "MOTH_SNAPSHOT_MB" 1048576;
       conn = None;
       target = None;
       lost = false;
