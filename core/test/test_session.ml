@@ -1442,8 +1442,10 @@ let a_kept_value_that_moved_on () =
   check_bool "undone: set_to" true (k.set_to = None);
   check_bool "undone: reading what it replaced is no put back" false k.put_back
 
-(* only the newest write made by name counts: a row's write does not, another write's undo leaves
-   it, and a value forgotten and kept again under the same name starts with none *)
+(* R13: a kept value's newest write is the newest on the undo list at its address and type, by row
+   or by name: another address's write and its undo leave it, a value forgotten and kept again
+   under the same name has the write still on the list, and undoing that write falls back to the
+   one before it *)
 let what_a_kept_value_remembers () =
   let s, f = fresh () in
   queue_scan f [ gi "i32" 2 ];
@@ -1460,25 +1462,148 @@ let what_a_kept_value_remembers () =
   queue_read f (Vint 20L);
   ignore (ok (Session.set s ~row:1 "20"));
   let k = conc () in
-  check_bool "a row's write is not the kept value's" true (k.set_to = None && not k.put_back);
+  check_bool "a row's write is the kept value's" true (k.set_to = Some "20" && k.put_back);
   queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
   queue_read f (Vint 30L);
   ignore (ok (Session.set_kept s ~name:"conc" "30"));
   queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
   queue_read f (Vint 40L);
   ignore (ok (Session.set s ~row:2 "40"));
+  let k = conc () in
+  check_bool "another address's write leaves it" true (k.set_to = Some "30" && k.put_back);
   queue_write f ~prev:(Vint 40L) ~prev_bits:40L;
   check_str "undo the other write" "restored #2 to 13" (said (Session.undo s));
   let k = conc () in
   check_bool "another write's undo leaves it" true (k.set_to = Some "30" && k.put_back);
+  let writes = Session.writes s in
   check_str "forget" "forgot conc" (ok (Session.forget s "conc"));
+  check_bool "forget leaves the writes" true (Session.writes s = writes);
   queue_read f (Vint 13L);
   ignore (ok (Session.keep_at s ~addr:0x10L "13" ~name:(Some "conc")));
   let k = conc () in
-  check_bool "kept again: no write" true (k.set_to = None && not k.put_back);
+  check_bool "kept again: the write still on the list" true (k.set_to = Some "30" && k.put_back);
   queue_write f ~prev:(Vint 30L) ~prev_bits:30L;
   check_str "the old write is undone by name" "restored conc to 13" (said (Session.undo s));
-  check_bool "the new one has none still" true ((conc ()).set_to = None)
+  check_bool "the write before it is the newest now" true ((conc ()).set_to = Some "20")
+
+(* R13: a write made by row counts as one made by name, whether the value is kept before it or
+   after; keep right after a real set reads the value just written *)
+let a_write_by_row () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "13"));
+  queue_peek f "i32" [ it 0x10L (Vint 13L) ];
+  ignore (ok (first_page s));
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 20L);
+  check_str "set" "set #1 to 20 (was 13)" (set_text (Session.set s ~row:1 "20"));
+  queue_read f (Vint 20L);
+  check_str "kept, reading the value just written" "kept #1 as conc (20, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "conc")));
+  queue_read f (Vint 20L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "set, then kept: the write" true (k.set_to = Some "20" && (not k.put_back) && k.kshown = "20");
+  queue_read f (Vint 13L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "set, then kept: put back" true (k.set_to = Some "20" && k.put_back);
+  queue_error f "read" { code = "read_failed"; message = "cannot read 0x10" };
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "never put back when it can't be read" true (k.set_to = Some "20" && (not k.put_back) && k.kshown = "?");
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "13"));
+  queue_peek f "i32" [ it 0x10L (Vint 13L) ];
+  ignore (ok (first_page s));
+  queue_read f (Vint 13L);
+  ignore (ok (Session.keep_row s ~row:1 ~name:(Some "conc")));
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 20L);
+  ignore (ok (Session.set s ~row:1 "20"));
+  queue_read f (Vint 13L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "kept, then set: put back" true (k.set_to = Some "20" && k.put_back)
+
+(* R13: undoing a write takes it off the list, so the kept value falls back to the write before it,
+   or to none: two sets by name, then a row's set at its address *)
+let an_undo_falls_back () =
+  let s, f = fresh () in
+  queue_read f (Vint 13L);
+  ignore (ok (Session.keep_at s ~addr:0x10L "13" ~name:(Some "conc")));
+  let conc v =
+    queue_read f (Vint v);
+    List.hd (ok (Session.kept s))
+  in
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 20L);
+  ignore (ok (Session.set_kept s ~name:"conc" "20"));
+  queue_write f ~prev:(Vint 20L) ~prev_bits:20L;
+  queue_read f (Vint 25L);
+  ignore (ok (Session.set_kept s ~name:"conc" "25"));
+  queue_write f ~prev:(Vint 25L) ~prev_bits:25L;
+  check_str "undo the second" "restored conc to 20" (said (Session.undo s));
+  (* the game works it out again: back to what it was before the first write *)
+  let k = conc 13L in
+  check_bool "the first write, put back" true (k.set_to = Some "20" && k.put_back);
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  check_str "undo the first" "restored conc to 13" (said (Session.undo s));
+  let k = conc 13L in
+  check_bool "a single write undone: none" true (k.set_to = None && not k.put_back);
+  (* a write by name, then one by row at its address, undone *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "13"));
+  queue_peek f "i32" [ it 0x10L (Vint 13L) ];
+  ignore (ok (first_page s));
+  queue_read f (Vint 13L);
+  ignore (ok (Session.keep_row s ~row:1 ~name:(Some "conc")));
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 30L);
+  ignore (ok (Session.set_kept s ~name:"conc" "30"));
+  queue_write f ~prev:(Vint 30L) ~prev_bits:30L;
+  queue_read f (Vint 40L);
+  ignore (ok (Session.set s ~row:1 "40"));
+  queue_read f (Vint 40L);
+  check_bool "the row's write is the newest" true ((List.hd (ok (Session.kept s))).set_to = Some "40");
+  queue_write f ~prev:(Vint 40L) ~prev_bits:40L;
+  check_str "undo the row's write" "restored #1 to 30" (said (Session.undo s));
+  queue_read f (Vint 13L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "the write by name is the newest again" true (k.set_to = Some "30" && k.put_back)
+
+(* R13: a write as another value type at the kept value's address is not its write; one as the same
+   type, in an earlier hunt and through another interpretation, is, shown as the kept value shows
+   numbers *)
+let which_writes_count () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 0; gi "i16" 1 ];
+  ignore (ok (Session.find s "13"));
+  queue_peek f "i16" [ it 0x10L (Vint 13L) ];
+  ignore (ok (first_page s));
+  queue_read f (Vint 13L);
+  check_str "kept as a whole number" "kept 0x10 as hp (13, whole number)" (ok (Session.keep_at s ~addr:0x10L "13" ~name:(Some "hp")));
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 20L);
+  ignore (ok (Session.set s ~row:1 "20"));
+  check_bool "written as a 2-byte number" true (last_write f = (0x10L, "i16", Put_value (Vint 20L)));
+  queue_read f (Vint 13L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "another type's write is not adopted" true (k.set_to = None && not k.put_back);
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 1 ];
+  ignore (ok (Session.find s "10698"));
+  queue_peek f "i32" [ it 0x2a0L (Vint 10698L) ];
+  ignore (ok (first_page s));
+  queue_write f ~prev:(Vint 10698L) ~prev_bits:10698L;
+  queue_read f (Vint 20000L);
+  ignore (ok (Session.set s ~row:1 "20000"));
+  queue_scan f [ gi "i32x100" 1 ];
+  ignore (ok (Session.find s "200"));
+  queue_peek f "i32x100" [ it 0x2a0L (Vint 20000L) ];
+  ignore (ok (first_page s));
+  queue_read f (Vint 20000L);
+  ignore (ok (Session.keep_row s ~row:1 ~name:(Some "money")));
+  queue_read f (Vint 10698L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "a write from an earlier hunt, as the kept value shows it" true (k.set_to = Some "200.00" && k.put_back)
 
 (* a float is compared by its bytes: reading the bytes written is no put back, however the floats
    compare, and -0 is not the 0 a write replaced *)
@@ -1567,6 +1692,9 @@ let () =
           t "a kept value that moved on" a_kept_value_that_moved_on;
           t "what a kept value remembers" what_a_kept_value_remembers;
           t "a kept float, by its bytes" a_kept_float_by_its_bytes;
+          t "a write by row" a_write_by_row;
+          t "an undo falls back" an_undo_falls_back;
+          t "which writes count" which_writes_count;
         ] );
       ( "snapshot",
         [

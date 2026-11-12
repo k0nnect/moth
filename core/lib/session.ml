@@ -32,13 +32,12 @@ type hunt = { current : group list; last : Value.t option; blind : bool }
 (* a row of the latest listing, which set and keep_row take by its number *)
 type listed = { at : int; li : Interp.t; laddr : int64; lshown : string }
 
-(* wid: the write's number, in the order made. wlabel: how the texts name it, "#2" or a kept
-   name. prev_bits: the bytes the write replaced, which undo puts back exactly *)
-type write = { wid : int; wlabel : string; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
+(* wlabel: how the texts name it, "#2" or a kept name. prev_bits: the bytes the write replaced,
+   which undo puts back exactly *)
+type write = { wlabel : string; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
 
-(* a value kept by name: where it is, read and written as [ki]. kset: the newest write made to
-   it by name, until that write is undone *)
-type keeping = { kname : string; kat : int64; ki : Interp.t; kset : write option }
+(* a value kept by name: where it is, read and written as [ki] *)
+type keeping = { kname : string; kat : int64; ki : Interp.t }
 
 type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
 type set_done = { text : string; w : written; held : bool option }
@@ -51,12 +50,11 @@ type t = {
   mutable hunt : hunt option;
   mutable listing : listed list; (* the rows of the last results listing, until the hunt changes *)
   mutable undo : write list; (* newest first *)
-  mutable next_wid : int; (* the number the next write gets *)
   mutable named : keeping list; (* the values kept by name, in the order kept *)
 }
 
 let create ?budget_mb ?snapshot_mb ?(settle = fun () -> Unix.sleepf 0.25) h =
-  { h; budget_mb; snapshot_mb; settle; hunt = None; listing = []; undo = []; next_wid = 0; named = [] }
+  { h; budget_mb; snapshot_mb; settle; hunt = None; listing = []; undo = []; named = [] }
 
 let no_hunt = "no hunt in progress. start one with: moth find <number>"
 let too_many = "too many matches to compare by change yet. type the new number instead, or start again by change alone: moth snapshot"
@@ -463,18 +461,16 @@ let results t ~all ~from ~limit ~near =
 
 (* writes the number at [addr] as [i] and records it for undo; then, a moment later, the raw
    bytes there say whether the game kept it. [label] names it in the texts: "#2", or a kept
-   value's name. A write made through a kept value, [by_name], is that value's newest. *)
-let write_checked ?(by_name = false) t ~label (i : Interp.t) addr text =
+   value's name. *)
+let write_checked t ~label (i : Interp.t) addr text =
   match Result.bind (Value.parse text) (Interp.encode i) with
   | Error e -> Error e
   | Ok next ->
       guard t (fun () ->
           let vtype = i.vtype in
           let r = call (t.h.write ~addr ~vtype (Put_value next)) in
-          let made = { wid = t.next_wid; wlabel = label; wi = i; waddr = addr; prev = r.prev; prev_bits = r.prev_bits; next } in
-          t.next_wid <- t.next_wid + 1;
+          let made = { wlabel = label; wi = i; waddr = addr; prev = r.prev; prev_bits = r.prev_bits; next } in
           t.undo <- made :: t.undo;
-          if by_name then t.named <- List.map (fun k -> if k.kname = label then { k with kset = Some made } else k) t.named;
           forget_last t;
           let w = { where = addr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
           let text = Printf.sprintf "set %s to %s (was %s)" label (Interp.decode i next) (Interp.decode i r.prev) in
@@ -519,8 +515,6 @@ let undo t =
           let vtype = w.wi.vtype in
           let r = call (t.h.write ~addr:w.waddr ~vtype (Put_bits w.prev_bits)) in
           t.undo <- rest;
-          (* a kept value whose newest write this was has none to speak of now *)
-          t.named <- List.map (fun k -> match k.kset with Some s when s.wid = w.wid -> { k with kset = None } | _ -> k) t.named;
           forget_last t;
           let done_ = { where = w.waddr; wtype = vtype; bits_before = r.prev_bits; bits_after = w.prev_bits } in
           Ok (Printf.sprintf "restored %s to %s" w.wlabel (Interp.decode w.wi w.prev), done_))
@@ -549,7 +543,7 @@ let new_name t name =
       let rec free k = if find_kept t (Printf.sprintf "v%d" k) = None then Printf.sprintf "v%d" k else free (k + 1) in
       Ok (free 1)
 
-let add_kept t name i addr = t.named <- t.named @ [ { kname = name; kat = addr; ki = i; kset = None } ]
+let add_kept t name i addr = t.named <- t.named @ [ { kname = name; kat = addr; ki = i } ]
 
 (* the value at [addr] as [i]'s type, or [None] when that memory can't be read *)
 let read_as t (i : Interp.t) addr =
@@ -596,14 +590,16 @@ let kept t =
         (List.map
            (fun k ->
              let now = read_as t k.ki k.kat in
-             (* the game put the newest write by name back when the raw bytes there now are the
-                ones it replaced and not the ones it wrote, as the write's own check reads them *)
+             (* its newest write: the newest still to undo at its address as its type, however it
+                was made. It reads as it did before that write when the raw bytes there now are
+                the ones it replaced and not the ones it wrote, as the write's own check reads
+                them. *)
              let set_to, put_back =
-               match k.kset with
+               match List.find_opt (fun w -> w.waddr = k.kat && w.wi.vtype = k.ki.vtype) t.undo with
                | None -> (None, false)
                | Some w ->
-                   let bits v = Wire.bits_of_value ~vtype:w.wi.vtype v in
-                   (Some (Interp.decode w.wi w.next), match now with Some v -> bits v = w.prev_bits && bits v <> bits w.next | None -> false)
+                   let bits v = Wire.bits_of_value ~vtype:k.ki.vtype v in
+                   (Some (Interp.decode k.ki w.next), match now with Some v -> bits v = w.prev_bits && bits v <> bits w.next | None -> false)
              in
              { name = k.kname; kaddr = k.kat; ktag = Interp.describe k.ki; kshown = shown_as k.ki now; set_to; put_back })
            t.named))
@@ -617,7 +613,7 @@ let forget t name =
 
 let set_kept t ~name text =
   match find_kept t name with
-  | Some k -> write_checked ~by_name:true t ~label:name k.ki k.kat text
+  | Some k -> write_checked t ~label:name k.ki k.kat text
   | None when parse_addr name <> None ->
       (* an address is changed through a kept value *)
       Error (Printf.sprintf "no kept value called %s. to change an address, keep it first: moth keep %s <the number it shows>" name name)

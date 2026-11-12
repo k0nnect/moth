@@ -116,9 +116,11 @@ val set : t -> row:int -> string -> (set_done, string) result
 val undo : t -> (string * written, string) result
 
 (** a kept value: its name, address and tag, and how it reads now (["?"] when it can't be read).
-    [set_to]: the newest write made to it through [set_kept], as shown, until that write is
-    undone. [put_back]: the bytes there now are the ones that write replaced, not the ones it
-    wrote: the game put the value back. *)
+    [set_to]: what its newest write wrote, shown as the kept value shows numbers. Its newest
+    write is the newest that [undo] can still reverse at its address and as its value type,
+    however it was made: by row or by name, before or after it was kept. [put_back]: it reads as
+    it did before that write (the bytes there now are the ones the write replaced, not the ones
+    it wrote); never when it can't be read. *)
 type kept = { name : string; kaddr : int64; ktag : string; kshown : string; set_to : string option; put_back : bool }
 
 (** keeps a row of the latest listing by name, or as the first of [v1], [v2], ... not in use, and
@@ -136,9 +138,8 @@ val kept : t -> (kept list, string) result
 
 val forget : t -> string -> (string, string) result
 
-(** [set] for a kept value, named in its texts and in [undo]'s; [kept] then says whether the game
-    put it back. A name that is not kept but has the form of an address gets an answer saying to
-    keep it first. *)
+(** [set] for a kept value, named in its texts and in [undo]'s. A name that is not kept but has
+    the form of an address gets an answer saying to keep it first. *)
 val set_kept : t -> name:string -> string -> (set_done, string) result
 
 (** the writes [undo] can still reverse: addr, vtype, previous, new; newest first *)
