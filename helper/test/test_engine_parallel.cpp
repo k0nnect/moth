@@ -292,6 +292,84 @@ TEST_CASE("a read that throws stops the workers and leaves the engine usable") {
   m.reads_left = 1 << 30;
   CHECK(e.scan({G("z", U8, 1, 0, eq(0))}, false, s)[0].count == (16u << 20));
 }
+TEST_CASE("a narrow's runs hold a bounded amount beyond their bytes, and copy no values a group cannot keep") {
+  // 16 MiB of zeros: u64 0 at every byte but the last 7, far over a value_cap of 100,000. A
+  // narrow keeps them all, so the group ends without values.
+  FakeMemory m; m.add_region(0x10000000, 16u << 20);
+  for (unsigned w : {1u, 8u}) {
+    Engine e(m, {.value_cap = 100'000, .block_size = 1u << 20, .workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    REQUIRE(e.scan({G("q", U64, 1, 0, eq(0))}, false, s)[0].count == (16u << 20) - 7);
+    CHECK(e.narrow({{"q", range(-1, 1)}}, true, g, s)); CHECK(g[0].count == (16u << 20) - 7); CHECK_FALSE(g[0].has_values);
+    CHECK(e.peak_narrow_held_bytes() > 0);
+    CHECK(e.peak_narrow_held_bytes() <= (w + 4) * (1u << 20));
+    CHECK(e.peak_narrow_held_bytes() <= 100'000 * 8);          // no more values copied than the cap allows
+  }
+}
+TEST_CASE("values a run has no room for are taken from its bytes, each at its own place") {
+  // 2 MiB of random bytes: u64 at every byte, 2,097,145 places, all with values. One 1 MiB run's
+  // values take 8 MiB, more than all the room runs may hold, so most are taken from the run's bytes.
+  FakeMemory m; m.add_region(0x10000000, 2u << 20); fill_xorshift(m, 0x10000000, 2u << 20, 99);
+  const uint64_t changed[] = {0x10000100, 0x100ff000, 0x101f0000};
+  for (unsigned w : {1u, 8u}) {
+    Engine e(m, {.value_cap = 4'000'000, .block_size = 1u << 20, .workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    REQUIRE(e.scan({G("q", U64, 1, 0, range(-1, 2e19))}, false, s)[0].has_values);
+    CHECK(e.narrow({{"q", {Pred::EqPrev}}}, true, g, s)); CHECK(g[0].count == (2u << 20) - 7); CHECK(g[0].has_values);
+    CHECK(e.peak_narrow_held_bytes() <= (w + 4) * (1u << 20));
+    for (uint64_t at : changed) m.poke<uint8_t>(at, m.peek<uint8_t>(at) ^ 0xff);
+    CHECK(e.narrow({{"q", {Pred::NePrev}}}, true, g, s)); CHECK(g[0].count == 24);   // the 8 places over each byte
+    for (uint64_t at : changed) m.poke<uint8_t>(at, m.peek<uint8_t>(at) ^ 0xff);
+  }
+}
+TEST_CASE("the room runs hold stays within its bound when blocks are split across runs") {
+  // the steps of the first narrow test above, whose 1 MiB blocks are split by stretches of 0xff
+  const Pred tiny = range(-1e-30, 1e-30);
+  for (unsigned w : {1u, 2u}) {
+    FakeMemory m; mixed(m);
+    Engine e(m, {.value_cap = 2'000'000, .block_size = 1u << 20, .workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    e.scan({G("i", I32, 4, 0, eq(3)), G("f", F32, 4, 0, tiny), G("b", U8, 1, 0, eq(0x5a))}, false, s);
+    spread(m, 8191 * 4, 0, 5, true); m.remove_region(kMixed[1][0]);
+    Pred moved = range(-10, 10); moved.moved = true;
+    CHECK(e.narrow({{"i", moved}, {"f", tiny}, {"b", {Pred::EqPrev}}}, true, g, s));
+    CHECK(e.peak_narrow_held_bytes() <= (w + 4) * (1u << 20));
+    spread(m, 8191 * 4, 0, 4, false);
+    CHECK(e.narrow({{"b", {Pred::EqPrev}}, {"i", {Pred::LtPrev}}, {"f", eq(0)}}, true, g, s)); CHECK(g[2].has_values);
+    CHECK(e.peak_narrow_held_bytes() > 0); CHECK(e.peak_narrow_held_bytes() <= (w + 4) * (1u << 20));
+  }
+}
+TEST_CASE("a group that passes value_cap part way through a narrow, and one that ends at it, end the same on any worker count") {
+  // c: i32 7 at every place of 4 MiB, four 1 MiB runs; 48,576 of them change, so exactly 1,000,000
+  // (value_cap) are left and c gains values. a: i32 0 at every place of 8 MiB, eight runs, which
+  // passes the cap in its fourth run.
+  using Outcome = std::tuple<std::vector<std::tuple<uint64_t, bool>>, uint64_t, std::vector<std::vector<std::pair<uint64_t, uint64_t>>>, uint64_t>;
+  auto place = [](uint64_t i) { return 0x10000000 + i * 4; };
+  auto run = [&](unsigned w) {
+    FakeMemory m; m.add_region(0x10000000, 4u << 20); m.add_region(0x20000000, 8u << 20);
+    std::vector<int32_t> sevens(1u << 20, 7); REQUIRE(m.write(0x10000000, sevens.data(), 4u << 20));
+    Engine e(m, {.value_cap = 1'000'000, .block_size = 1u << 20, .workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    const auto sc = e.scan({G("c", I32, 4, 0, eq(7)), G("a", I32, 4, 0, eq(0))}, false, s);
+    REQUIRE(sc[0].count == (1u << 20)); REQUIRE(sc[1].count == (2u << 20)); REQUIRE_FALSE(sc[0].has_values);
+    for (uint64_t k = 0; k < 48'576; k++) m.poke<int32_t>(place(k * 21), 8);
+    Outcome o;
+    CHECK(e.narrow({{"c", eq(7)}, {"a", eq(0)}}, true, g, s));
+    for (const GroupInfo& i : g) std::get<0>(o).emplace_back(i.count, i.has_values);
+    std::get<1>(o) = e.storage_bytes();
+    std::get<2>(o) = rows({e.peek("c", 0, 1u << 30), e.peek("a", 0, 1u << 30)});
+    for (uint64_t i = 1'030'000; i < 1'030'100; i++) m.poke<int32_t>(place(i), 6);   // in the last run
+    m.poke<int32_t>(place(100'001), 6);                                             // in the first
+    CHECK(e.narrow({{"c", {Pred::LtPrev}}}, true, g, s)); std::get<3>(o) = g[0].count;
+    return o;
+  };
+  const Outcome one = run(1);
+  REQUIRE(std::get<0>(one).size() == 2);
+  CHECK(std::get<0>(one)[0] == std::tuple<uint64_t, bool>{1'000'000, true});
+  CHECK(std::get<0>(one)[1] == std::tuple<uint64_t, bool>{2u << 20, false});
+  CHECK(std::get<3>(one) == 101);
+  for (unsigned w : {2u, 4u, 8u}) {
+    const Outcome other = run(w);
+    CHECK(std::get<0>(other) == std::get<0>(one)); CHECK(std::get<1>(other) == std::get<1>(one));
+    CHECK(std::get<2>(other) == std::get<2>(one)); CHECK(std::get<3>(other) == std::get<3>(one));
+  }
+}
 TEST_CASE("a narrow on several workers that is refused, or whose read throws, changes nothing") {
   ThrowingMemory m; m.add_region(0x10000000, 16u << 20);              // zeros: every place matches
   Engine e(m, {.block_size = 1u << 20, .workers = 4}); ScanStats s; std::vector<GroupInfo> g;

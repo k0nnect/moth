@@ -156,24 +156,31 @@ unsigned resolve_workers(unsigned workers) {
   return static_cast<unsigned>(std::max(1, std::min(8, hardware - 1)));
 }
 
-// A byte buffer that is always read into before use, so it is never zero-filled.
-class Bytes {
+// A buffer that is always written before it is read, so it is never zero-filled.
+template <class T> class Buffer {
  public:
-  uint8_t* data() { return p_.get(); }
-  const uint8_t* data() const { return p_.get(); }
-  // At least n bytes. Growing does not keep the old contents.
-  uint8_t* reserve(size_t n) {
+  T* data() { return p_.get(); }
+  const T* data() const { return p_.get(); }
+  // Room for at least n items. Growing does not keep the old contents.
+  T* reserve(size_t n) {
     if (n > n_) {
-      p_.reset(new uint8_t[n]);
+      p_.reset();
+      p_.reset(new T[n]);
       n_ = n;
     }
     return p_.get();
   }
+  void release() {
+    p_.reset();
+    n_ = 0;
+  }
+  size_t capacity() const { return n_; }
 
  private:
-  std::unique_ptr<uint8_t[]> p_;
+  std::unique_ptr<T[]> p_;
   size_t n_ = 0;
 };
+using Bytes = Buffer<uint8_t>;
 
 // One block of a scan: read by the calling thread, then searched by a worker.
 struct Job {
@@ -248,6 +255,7 @@ template <class Job> class Workers {
     return j;
   }
   void release(Job* j) { idle_.push_back(j); }  // a job taken back, or never submitted
+  const std::vector<Job*>& idle() const { return idle_; }  // the jobs released and not acquired again
 
   void submit(Job* j) {
     out_.push_back(j);
@@ -404,11 +412,14 @@ struct Part {
   uint32_t first = 0, last = 0;   // the first and last position
   bool alone = false;             // the group's only part of the block: the worker builds the narrowed block
   bool closes = false;            // the group's last part of the block
-  bool values = false;            // the values of the positions kept are wanted
+  // Otherwise the positions kept go in the run's kept words from kept_at: as a list, or as a bitmap
+  // of the places from first to last when that is smaller.
+  bool bitmap = false;
+  size_t kept_at = 0, kept_words = 0;
+  uint64_t copy = 0;              // the values of the first this many positions kept are copied
+  size_t values_at = 0;           // into the run's values from here
   // set by the worker
   PositionSet::Block kept_block;  // alone: the positions kept, as the narrowed block
-  std::vector<uint32_t> kept;     // otherwise: the positions kept
-  Bytes kept_values;              // if values: theirs, packed in order
   uint64_t count = 0, lost = 0;   // positions kept, and positions whose bytes were not all read
 };
 
@@ -420,7 +431,9 @@ struct RunJob {
   bool whole = false;  // all of them were
   Bytes data;
   std::vector<Part> parts;
-  bool done = false;   // compared
+  Buffer<uint32_t> kept;  // the parts' positions kept, for blocks split across runs
+  Bytes values;           // the parts' values copied
+  bool done = false;      // compared
 };
 
 // Calls f(offset) for each of a part's positions, ascending.
@@ -449,15 +462,19 @@ template <size_t W> uint64_t load(const uint8_t* p) {
 
 // Compares a part's positions, W bytes each, with their stored values. A position whose bytes
 // were not all read is lost.
-template <size_t W> void compare(const RunJob& j, Part& p) {
-  std::optional<PositionSet::Builder> keep;
+template <size_t W> void compare(RunJob& j, Part& p) {
+  std::optional<PositionSet::Builder> keep;  // the positions kept: the narrowed block, or
+  uint32_t* list = nullptr;                  // the kept offsets, or
+  uint32_t* bits = nullptr;                  // a bit for each place from first to last
   if (p.alone) {
     keep.emplace(p.align, p.block->base, p.block->span);
+  } else if (p.bitmap) {
+    bits = j.kept.data() + p.kept_at;
+    std::fill(bits, bits + p.kept_words, 0u);
   } else {
-    p.kept.clear();
-    p.kept.reserve(static_cast<size_t>(p.n));
+    list = j.kept.data() + p.kept_at;
   }
-  uint8_t* const values = p.values ? p.kept_values.reserve(static_cast<size_t>(p.n) * W) : nullptr;
+  uint8_t* const values = p.copy > 0 ? j.values.data() + p.values_at : nullptr;
   const uint8_t* const data = j.data.data();
   uint64_t i = p.index, count = 0, lost = 0;
   size_t k = 0;  // the first span of arrived that ends at or past the value's bytes; only moves forward
@@ -473,11 +490,15 @@ template <size_t W> void compare(const RunJob& j, Part& p) {
       }
     }
     if (!matches(*p.pred, p.type, load<W>(data + x), prev)) return;
-    if (keep)
+    if (keep) {
       keep->add(o);
-    else
-      p.kept.push_back(o);
-    if (values != nullptr) std::memcpy(values + static_cast<size_t>(count) * W, data + x, W);
+    } else if (list != nullptr) {
+      list[count] = o;
+    } else {
+      const uint32_t place = (o - p.first) / p.align;
+      bits[place / 32] |= 1u << (place % 32);
+    }
+    if (count < p.copy) std::memcpy(values + static_cast<size_t>(count) * W, data + x, W);
     count++;
   });
   if (keep) p.kept_block = keep->finish();
@@ -715,6 +736,7 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
   const auto start = std::chrono::steady_clock::now();
   stats = ScanStats{};
   narrow_threads_used_ = 0;
+  peak_narrow_held_bytes_ = 0;
   std::vector<size_t> at;  // each listed group's index in groups_
   at.reserve(items.size());
   for (const NarrowItem& it : items) {
@@ -763,6 +785,14 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
 // run by run in the same order, so they are built exactly as one thread would build them. A
 // group's block that lies in one run is built whole by the worker; one that spans several is put
 // together from their kept positions.
+// Beyond its own bytes, a run needs room for the positions kept in blocks split across runs and for
+// the values its worker copies. That room is set aside before the run is handed out, and kept for
+// the next run when it comes back, and all of it stays within (workers + kQueue) * block_size,
+// unless one run's kept positions alone need more. A worker copies the values of the positions it
+// keeps only within its group's room under value_cap, less what runs already out may copy, and
+// within that allowance; the calling thread takes any other value it needs from the run's bytes
+// when it takes the run back. The narrowed blocks the workers build are the groups' new positions,
+// at most a bit per place, and are not counted.
 std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items,
                                             ScanStats& stats) {
   struct Lane {
@@ -772,6 +802,7 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
     size_t block = 0;    // the next of old's blocks to narrow
     uint64_t index = 0;  // of that block's first position in old, which is also its stored value's index
     std::optional<PositionSet::Builder> pending = std::nullopt;  // a narrowed block put together from several runs
+    uint64_t promised = 0;  // the values runs out may copy
   };
   // Positions first..last of a block (offsets), whose values take bytes [first, end): the spans
   // [from, to) of the block's spans, in address order.
@@ -789,6 +820,8 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
   // per lane, for the current block: its first and last run, and its part in the run being filled
   std::vector<size_t> first_run(lanes.size()), last_run(lanes.size()), part(lanes.size());
   Listing listing(mem_);    // the readable regions, listed once if a read fails
+  const uint64_t allowance = (uint64_t{workers_} + kQueue) * cfg_.block_size;
+  uint64_t held = 0;        // the room the runs have, out or back, beyond their own bytes
 
   // After lanes, so the workers stop before the groups their runs point into go away.
   Workers<RunJob> comparers(workers_, [](RunJob& j, unsigned) { compare_run(j); });
@@ -801,24 +834,46 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
       Lane& lane = lanes[p.lane];
       Group& out = lane.out;
       stats.lost += p.lost;
-      if (p.alone) {
-        out.positions.append(std::move(p.kept_block));
-      } else {
-        if (!lane.pending) lane.pending.emplace(p.align, p.block->base, p.block->span);
-        lane.pending->add(p.kept, 0);
-        if (p.closes) {
-          out.positions.append(lane.pending->finish());
-          lane.pending.reset();
-        }
-      }
+      lane.promised -= p.copy;
+      // As one position at a time would: values go once the count passes value_cap.
       out.count += p.count;
-      if (!out.has_values) continue;
-      // As one position at a time would: values go once the count passes value_cap. Until then
-      // out had values when the run was handed out, so the worker kept them.
-      if (out.count > cfg_.value_cap)
-        forget_values(out);
-      else
-        out.values.append(p.kept_values.data(), p.count);
+      if (out.has_values && out.count > cfg_.value_cap) forget_values(out);
+      // The values the worker copied, then the rest from the run's bytes, in position order.
+      const uint64_t copied = std::min(p.count, p.copy);
+      if (out.has_values) out.values.append(j->values.data() + p.values_at, copied);
+      const bool fill = out.has_values && copied < p.count;
+      uint64_t k = 0;
+      auto kept = [&](uint32_t o) {
+        if (fill && k >= copied) out.values.append(j->data.data() + (o - j->first));
+        k++;
+      };
+      if (p.alone) {
+        if (fill) out.positions.for_each_in(p.kept_block, kept);
+        out.positions.append(std::move(p.kept_block));
+        continue;
+      }
+      if (!lane.pending) lane.pending.emplace(p.align, p.block->base, p.block->span);
+      const uint32_t* words = j->kept.data() + p.kept_at;
+      auto add = [&](uint32_t o) {
+        lane.pending->add(o);
+        kept(o);
+      };
+      if (!p.bitmap) {
+        for (uint64_t i = 0; i < p.count; i++) add(words[i]);
+      } else {
+        for (size_t w = 0; w < p.kept_words; w++)
+          for (uint32_t bits = words[w]; bits != 0; bits &= bits - 1)
+            add(p.first + static_cast<uint32_t>((w * 32 + static_cast<size_t>(std::countr_zero(bits))) * p.align));
+      }
+      if (p.closes) {
+        out.positions.append(lane.pending->finish());
+        lane.pending.reset();
+      }
+    }
+    if (held > allowance) {  // only after one run's kept positions alone needed more
+      held -= j->values.capacity() + 4 * uint64_t{j->kept.capacity()};
+      j->values.release();
+      j->kept.release();
     }
     comparers.release(j);
     return true;
@@ -896,13 +951,68 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
           p.first = sp.first;
           p.alone = first_run[sp.lane] == last_run[sp.lane];
           p.closes = last_run[sp.lane] == r;
-          p.values = lane.out.has_values;
         }
         Part& p = j->parts[part[sp.lane]];
         p.last = sp.last;
         p.n += sp.n;
       }
       j->parts.resize(parts);
+
+      // Room for the positions kept in a split block: a list, or a bitmap of the places from the
+      // part's first position to its last, whichever is smaller.
+      size_t kept_words = 0;
+      for (Part& p : j->parts) {
+        if (p.alone) continue;
+        const uint64_t bitmap_words = ((p.last - p.first) / p.align + 1 + 31) / 32;
+        p.bitmap = p.n > bitmap_words;
+        p.kept_at = kept_words;
+        p.kept_words = static_cast<size_t>(p.bitmap ? bitmap_words : p.n);
+        kept_words += p.kept_words;
+      }
+      // what growing this run's room to hold the kept positions and v bytes of values adds
+      auto growth = [&](uint64_t v) {
+        return (v > j->values.capacity() ? v - j->values.capacity() : 0) +
+               4 * uint64_t{kept_words > j->kept.capacity() ? kept_words - j->kept.capacity() : 0};
+      };
+      // Room for the values copied: within each group's room under value_cap, less what runs out
+      // may copy. While the allowance is short, the room of runs back from the workers is freed,
+      // then runs out are waited for; after that fewer values are copied, and this run's own room
+      // for values gives way to its kept positions.
+      for (;;) {
+        uint64_t want = 0;
+        for (Part& p : j->parts) {
+          const Lane& lane = lanes[p.lane];
+          const uint64_t used = std::min(cfg_.value_cap, lane.out.count + lane.promised);
+          p.copy = lane.out.has_values ? std::min(p.n, cfg_.value_cap - used) : 0;
+          want += p.copy * width_of(p.type);
+        }
+        for (RunJob* k : comparers.idle()) {
+          if (held + growth(want) <= allowance) break;
+          held -= k->values.capacity() + 4 * uint64_t{k->kept.capacity()};
+          k->values.release();
+          k->kept.release();
+        }
+        if (held + growth(want) <= allowance || !add_next(true)) break;
+      }
+      if (held + growth(0) > allowance) {
+        held -= j->values.capacity();
+        j->values.release();
+      }
+      uint64_t left = j->values.capacity() + allowance - std::min(allowance, held + growth(0));
+      size_t values_at = 0;
+      for (Part& p : j->parts) {
+        const uint64_t w = width_of(p.type);
+        p.copy = std::min(p.copy, left / w);
+        left -= p.copy * w;
+        p.values_at = values_at;
+        values_at += static_cast<size_t>(p.copy * w);
+        lanes[p.lane].promised += p.copy;
+      }
+      held += growth(values_at);
+      if (kept_words > 0) j->kept.reserve(kept_words);
+      if (values_at > 0) j->values.reserve(values_at);
+      peak_narrow_held_bytes_ = std::max(peak_narrow_held_bytes_, held);
+
       const size_t n = runs[r].end - runs[r].first;
       j->arrived.clear();
       const size_t got = read_spans(mem_, base + runs[r].first, j->data.reserve(n), 0, n, j->arrived, &listing);

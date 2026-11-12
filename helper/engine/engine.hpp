@@ -96,7 +96,8 @@ class Engine {
   // calling thread in address order, compared on workers_used() threads, and added to the groups
   // in address order, so the result is the same for any worker count. A worker holds one run's
   // bytes at a time, and only a few more runs than workers are held at once, as a scan holds its
-  // blocks. After an applied narrow
+  // blocks; beyond those bytes the runs hold a bounded amount (see peak_narrow_held_bytes), and no
+  // group has more values copied than value_cap allows. After an applied narrow
   // a group with at most value_cap positions stores the values just read, unless values it did not
   // have before would take storage over budget_bytes.
   // Throws EngineError, with nothing changed: no_such_group (an unknown id, or an untracked
@@ -136,6 +137,12 @@ class Engine {
   uint64_t peak_walk_bytes() const { return peak_walk_bytes_; }
   // The most threads that were comparing runs at once during the last narrow; 0 if it threw.
   unsigned narrow_threads_used() const { return narrow_threads_used_; }
+  // The most bytes the last narrow's runs held at once beyond their own bytes, whether out with a
+  // worker or back for reuse: room for the positions kept in blocks split across runs, and for the
+  // values copied. It stays within (workers_used() + 4) * block_size unless one run's kept
+  // positions alone need more. The narrowed blocks the workers build, the groups' new positions,
+  // are not counted.
+  uint64_t peak_narrow_held_bytes() const { return peak_narrow_held_bytes_; }
 
  private:
   // Values in position order, each in as many bytes as its type is wide, packed one after
@@ -190,6 +197,7 @@ class Engine {
   uint64_t peak_raw_offsets_ = 0;
   uint64_t peak_walk_bytes_ = 0;
   unsigned narrow_threads_used_ = 0;
+  uint64_t peak_narrow_held_bytes_ = 0;
   std::vector<Group> groups_;
 };
 
