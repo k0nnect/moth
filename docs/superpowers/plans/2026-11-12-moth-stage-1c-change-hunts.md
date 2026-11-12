@@ -545,3 +545,32 @@ This task needs Chris at the keyboard. Do not mark stage 1c done without it. No 
 ```bash
 git add docs/verification/disco-elysium.md && git commit -m "verification: disco elysium, stage 1c"
 ```
+
+---
+
+## Amendments after the whole-branch review
+
+The whole-branch review (range `6b13726..078030a`) found no critical issue and five important ones, all in what the core tells the person. These rulings replace the text above where they differ. The code and tests follow the rulings.
+
+**Dead ends (replaces the single dead-end text of Task 6).** A step that kept nothing is not applied, and answers one of:
+- after a relation step: `nothing fits that, so that step was not applied. say how it moved again: moth next down, up, same or changed. or type the number it shows: moth next <number>`
+- after a number step, when some group can be compared by change: `nothing left that fits. that step was not applied, so you can try a different number, or say how it moved: moth next down, up, same or changed`
+- after a number step, when none can: `nothing left that fits. that step was not applied, so you can try a different number, or start over by how it moves: moth snapshot`
+
+**Kept values (replaces "the newest write made through `set_kept`").** A kept value's newest write is the newest write still on the undo list at its address and with its value type, however it was made: by row or by name, before or after the `keep`. Undoing it falls back to the next newest such write, or to none.
+
+**The kept suffix (replaces `you set it to <set_to>; the game put it back.`).** `you set it to <set_to>; it is back to what it was before.` The JSON field stays `put_back` and means "reads as it did before that write". moth cannot tell a recalculation from play returning the value, so it states the fact and not a cause.
+
+**The over-limit text (replaces the first `too_big` text).** `the game has <size> of memory to snapshot, more than moth's limit of <limit>. the limit is set when moth starts: moth stop, then run moth again with MOTH_SNAPSHOT_MB=<mb> (stopping forgets the hunt and the kept values). or hunt with a number: moth find <number>`
+
+**`status` on a snapshot hunt before any step.** Where the counts line would be: `snapshot taken, no step yet. change the value in the game, then tell moth how it moved: moth next down, up, same or changed.` The `hunt` object in `status --json` carries `"blind": true` then, and `"blind": false` in every other hunt.
+
+**No hunt.** `no hunt in progress. start one with: moth find <number>, or with no number: moth snapshot`
+
+**Protocol additions.** Helper error code `no_memory` (message `out of memory`) for an allocation that fails in any op; the core says `moth's helper ran out of memory doing that. close something large, then try again.` and keeps the hunt. For `no_values` the core says `moth lost what it remembered of the last step, so it can't compare by change now. type the number it shows (moth next <number>), or start again: moth snapshot` and keeps the hunt. The helper's error codes are now those of stage 1 plus `too_big` and `no_memory`.
+
+**Scenario 27 (extends its row).** After the timed `next same`: the `i32` group still has `has_values` true; set `stamina` to 40; `next down`; `results --near <stamina addr>` has `stamina`'s own address first.
+
+**Task 9, read against these.** Step 4's bar is that `moth kept` says Conceptualization is back to what it was before (the new suffix), whether the `set` was typed by row or by name. Before Task 9 the stage 1b daemon serving the default home is stopped, since the new client would talk to it and answer `unknown command: snapshot`.
+
+**Deferred until after Task 9.** Splitting `helper/engine/engine.cpp` (workers, reads, runs, values, a grown `snapshot.cpp`) as one behaviour-neutral commit; an older helper answering `unknown_op` to `snapshot`; the untracked note's wording on a snapshot hunt; which aliases of a written address survive the next relation step; a worker-count setting; a number step whose narrow applied and whose rescan then fails leaving the session and the helper out of step; the default snapshot limit (8192 MiB), to be looked at again with the memory reading from the real game.
