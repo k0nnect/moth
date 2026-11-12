@@ -1,9 +1,12 @@
 // Stand-in "game" for automated tests: holds known values in memory and lets the test harness
 // read or change them over a TCP control port, so scans can be checked against ground truth.
-//   moth-target.exe <port> [--filler-mb N] [--filler-small-mb N]
+//   moth-target.exe <port> [--filler-mb N] [--filler-small-mb N] [--filler-tiny-mb N]
+// Fillers, N MiB each: random bytes; int32 values 0 to 7 at random (small); int32 values cycling
+// 1 to 4096 (tiny), which read as floats are all too small to be anything.
 // Control lines: "get <name>", "set <name> <value>", "free <page>" (decommits that page of the
 // small filler, or of the large one when there is no small one, as a game freeing memory would),
 // "quit". Replies: the value, "ok" or "error".
+// A thread works total out from base + bonus every 20 ms, as a game recalculates a number.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -30,12 +33,24 @@ struct Vars {
   float health;
   int32_t health_copy;
   uint8_t ammo;
-  int16_t level;
-  int64_t xp;
+  int16_t level16;
+  int64_t xp64;
   double morale;
   int32_t money_cents;
   int32_t lives;
   Packed packed;
+  char gap[4096];  // keeps the values above out of reach of a near listing of the sheet
+  // a character sheet: five int32 side by side, the fourth unnamed
+  int32_t xp;
+  int32_t level;
+  int32_t points;
+  int32_t unnamed;
+  int32_t cents;
+  int32_t base;
+  int32_t bonus;
+  int32_t total;  // base + bonus, rewritten by the recalc thread
+  float charge;
+  float drift;
   char tail[4096];
 };
 
@@ -96,15 +111,20 @@ struct XorShift {
   }
 };
 
+enum Filler { kRandom, kSmall, kTiny, kFillers };
+
 // One committed read-write block of mb MiB; the pointer is kept so the block stays live.
-void* make_filler(size_t mb, bool small) {
+void* make_filler(size_t mb, Filler kind) {
   size_t bytes = mb << 20;
   void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (!p) return nullptr;
   XorShift g;
-  if (small) {
+  if (kind == kSmall) {
     auto* w = static_cast<uint32_t*>(p);
     for (size_t i = 0; i < bytes / 4; i++) w[i] = static_cast<uint32_t>(g.next() % 8);
+  } else if (kind == kTiny) {
+    auto* w = static_cast<uint32_t*>(p);
+    for (size_t i = 0; i < bytes / 4; i++) w[i] = static_cast<uint32_t>(i % 4096 + 1);
   } else {
     auto* w = static_cast<uint64_t*>(p);
     for (size_t i = 0; i < bytes / 8; i++) w[i] = g.next();
@@ -112,12 +132,24 @@ void* make_filler(size_t mb, bool small) {
   return p;
 }
 
-void* volatile g_fillers[2] = {nullptr, nullptr};  // keeps the filler blocks referenced
-size_t g_filler_bytes[2] = {0, 0};
+void* volatile g_fillers[kFillers] = {};  // keeps the filler blocks referenced
+size_t g_filler_bytes[kFillers] = {};
+
+// Rewrites total from base and bonus every 20 ms, for as long as the process runs.
+DWORD WINAPI recalc(void* p) {
+  auto* v = static_cast<Vars*>(p);
+  auto* base = static_cast<volatile int32_t*>(&v->base);
+  auto* bonus = static_cast<volatile int32_t*>(&v->bonus);
+  auto* total = static_cast<volatile int32_t*>(&v->total);
+  for (;;) {
+    *total = *base + *bonus;
+    Sleep(20);
+  }
+}
 
 // Decommits page number `text` of the small filler (the large one when there is no small one).
 bool free_page(const std::string& text) {
-  const int which = g_fillers[1] ? 1 : 0;
+  const int which = g_fillers[kSmall] ? kSmall : kRandom;
   SYSTEM_INFO si;
   GetSystemInfo(&si);
   const size_t page = si.dwPageSize;
@@ -141,22 +173,29 @@ bool send_all(SOCKET s, const std::string& data) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: moth-target <port> [--filler-mb N] [--filler-small-mb N]\n");
+    std::fprintf(stderr, "usage: moth-target <port> [--filler-mb N] [--filler-small-mb N] [--filler-tiny-mb N]\n");
     return 2;
   }
   int port = std::atoi(argv[1]);
   for (int i = 2; i + 1 < argc; i += 2) {
-    bool small = std::strcmp(argv[i], "--filler-small-mb") == 0;
-    if (!small && std::strcmp(argv[i], "--filler-mb") != 0) continue;
+    Filler kind;
+    if (std::strcmp(argv[i], "--filler-mb") == 0)
+      kind = kRandom;
+    else if (std::strcmp(argv[i], "--filler-small-mb") == 0)
+      kind = kSmall;
+    else if (std::strcmp(argv[i], "--filler-tiny-mb") == 0)
+      kind = kTiny;
+    else
+      continue;
     size_t mb = static_cast<size_t>(std::atoll(argv[i + 1]));
     if (mb == 0) continue;
-    void* p = make_filler(mb, small);
+    void* p = make_filler(mb, kind);
     if (!p) {
       std::fprintf(stderr, "moth-target: cannot allocate filler\n");
       return 2;
     }
-    g_fillers[small ? 1 : 0] = p;
-    g_filler_bytes[small ? 1 : 0] = mb << 20;
+    g_fillers[kind] = p;
+    g_filler_bytes[kind] = mb << 20;
   }
 
   Vars* vars = new Vars();
@@ -164,24 +203,50 @@ int main(int argc, char** argv) {
   vars->health = 100.0f;
   vars->health_copy = 100;
   vars->ammo = 30;
-  vars->level = 7;
-  vars->xp = 100000;
+  vars->level16 = 7;
+  vars->xp64 = 100000;
   vars->morale = 85.3;
   vars->money_cents = 13250;
   vars->packed.gems = 4242;
   vars->lives = 3;
+  vars->xp = 15;
+  vars->level = 2;
+  vars->points = 1;
+  vars->unnamed = 0;
+  vars->cents = 532;
+  vars->base = 5;
+  vars->bonus = 1;
+  vars->total = vars->base + vars->bonus;
+  vars->charge = 5.0f;
+  vars->drift = 5.5f;
 
   Var table[] = {
       {"health", Kind::F32, &vars->health},
       {"health_copy", Kind::I32, &vars->health_copy},
       {"ammo", Kind::U8, &vars->ammo},
-      {"level", Kind::I16, &vars->level},
-      {"xp", Kind::I64, &vars->xp},
+      {"level16", Kind::I16, &vars->level16},
+      {"xp64", Kind::I64, &vars->xp64},
       {"morale", Kind::F64, &vars->morale},
       {"money_cents", Kind::I32, &vars->money_cents},
       {"gems", Kind::I32, &vars->packed.gems},
       {"lives", Kind::I32, &vars->lives},
+      {"xp", Kind::I32, &vars->xp},
+      {"level", Kind::I32, &vars->level},
+      {"points", Kind::I32, &vars->points},
+      {"cents", Kind::I32, &vars->cents},
+      {"base", Kind::I32, &vars->base},
+      {"bonus", Kind::I32, &vars->bonus},
+      {"total", Kind::I32, &vars->total},
+      {"charge", Kind::F32, &vars->charge},
+      {"drift", Kind::F32, &vars->drift},
   };
+
+  HANDLE recalc_thread = CreateThread(nullptr, 0, recalc, vars, 0, nullptr);
+  if (!recalc_thread) {
+    std::fprintf(stderr, "moth-target: cannot start the recalc thread\n");
+    return 2;
+  }
+  CloseHandle(recalc_thread);  // it runs until the process ends
 
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 2;

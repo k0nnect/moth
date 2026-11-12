@@ -89,14 +89,33 @@ let next n = moth [ "next"; n ]
 let notes o = List.map to_string (to_list (member "notes" o))
 let show o = Yojson.Safe.to_string o
 
-type row = { n : int; addr : int64; tag : string; shown : string }
+type row = { n : int; addr : int64; tag : string; shown : string; away : int option }
+type page = { rows : row list; total : int }
 
-let results ?(all = false) () =
-  List.map
-    (fun r -> { n = to_int (member "n" r); addr = Int64.of_string (to_string (member "addr" r)); tag = to_string (member "tag" r); shown = to_string (member "shown" r) })
-    (to_list (moth ("results" :: (if all then [ "--all" ] else []))))
+let hex a = sprintf "0x%Lx" a
+let addr_of o = Int64.of_string (to_string (member "addr" o))
 
-let show_rows rows = if rows = [] then "no results" else String.concat "; " (List.map (fun r -> sprintf "#%d %s 0x%Lx %s" r.n r.shown r.addr r.tag) rows)
+(* one page of results: [n] rows from row [from] (moth's defaults when not given), the wide
+   tier too under [all], or the rows near [near] *)
+let page ?(all = false) ?n ?from ?near () =
+  let given flag = function Some v -> [ flag; v ] | None -> [] in
+  let o =
+    moth
+      (("results" :: (if all then [ "--all" ] else []))
+      @ given "-n" (Option.map string_of_int n)
+      @ given "--from" (Option.map string_of_int from)
+      @ given "--near" near)
+  in
+  let row r =
+    { n = to_int (member "n" r); addr = addr_of r; tag = to_string (member "tag" r); shown = to_string (member "shown" r); away = to_int_option (member "away" r) }
+  in
+  { rows = List.map row (to_list (member "rows" o)); total = to_int (member "total" o) }
+
+let results ?all () = (page ?all ()).rows
+
+let show_rows rows =
+  let away r = match r.away with Some d -> sprintf " away %d" d | None -> "" in
+  if rows = [] then "no results" else String.concat "; " (List.map (fun r -> sprintf "#%d %s 0x%Lx %s%s" r.n r.shown r.addr r.tag (away r)) rows)
 let row_at rows (v : Target_ctl.var) tag = List.find_opt (fun r -> r.addr = v.addr && r.tag = tag) rows
 
 let need_row rows (v : Target_ctl.var) tag =
@@ -108,6 +127,58 @@ let expect t name want =
   let got = Target_ctl.get t name in
   check (got = want) "the target has %s = %s, expected %s" name got want
 
+(* ---- the daemon's lifetime ---- *)
+
+(* the n in a core.log line "... serving <socket> (pid n)" *)
+let logged_pid line =
+  match after "(pid " line with
+  | None -> None
+  | Some i -> ( match String.index_from_opt line i ')' with Some j -> int_of_string_opt (String.sub line i (j - i)) | None -> None)
+
+(* every daemon that served this home *)
+let daemon_pids () =
+  match In_channel.with_open_bin (Filename.concat !home "core.log") In_channel.input_all with
+  | exception Sys_error _ -> []
+  | log -> List.filter_map logged_pid (String.split_on_char '\n' log)
+
+let alive pid = match Unix.kill pid 0 with () -> true | exception Unix.Unix_error _ -> false
+
+let wait_gone pid ~timeout =
+  let deadline = now () +. timeout in
+  let rec go () = if not (alive pid) then true else if now () > deadline then false else (Unix.sleepf 0.1; go ()) in
+  go ()
+
+(* stops the daemon (which closes the helper) and makes sure it has exited; false when it had
+   to be killed *)
+let stop_daemon () =
+  let stopped = match moth_raw ~timeout:60. [ "stop" ] with r -> r.code = 0 | exception Failure _ -> false in
+  List.fold_left
+    (fun clean pid ->
+      if wait_gone pid ~timeout:15. then clean
+      else (
+        (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
+        Printf.printf "moth daemon (pid %d) did not stop, so it was killed\n%!" pid;
+        false))
+    stopped (daemon_pids ())
+
+(* Runs [f] against a daemon of its own, started with [env] in its environment. The daemon reads
+   its environment once, when the moth command starts it, so the running one is stopped first;
+   the next moth command starts the new one. Afterwards [env] is put back as it was and that
+   daemon is stopped too, so the next scenario starts one without [env]. *)
+let with_daemon_env env f =
+  let saved = List.map (fun (k, _) -> (k, Option.value (Sys.getenv_opt k) ~default:"")) env in
+  let restore () = List.iter (fun (k, v) -> Unix.putenv k v) saved in
+  check (stop_daemon ()) "moth's daemon did not stop when asked";
+  List.iter (fun (k, v) -> Unix.putenv k v) env;
+  match f () with
+  | () ->
+      restore ();
+      check (stop_daemon ()) "moth's daemon did not stop when asked"
+  | exception e ->
+      restore ();
+      ignore (stop_daemon ());
+      raise e
+
 (* ---- one target per scenario ---- *)
 
 let target_log () = Filename.concat !home "target.log"
@@ -115,8 +186,8 @@ let target_log () = Filename.concat !home "target.log"
 (* what the latest attach said *)
 let attach_said = ref ""
 
-let with_target ?(name = "moth-target.exe") ?(filler_mb = 0) ?(filler_small_mb = 0) f =
-  let t = Target_ctl.start ~filler_small_mb ~log:(target_log ()) ~exe:(exe name) ~filler_mb () in
+let with_target ?(name = "moth-target.exe") ?(filler_mb = 0) ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) f =
+  let t = Target_ctl.start ~filler_small_mb ~filler_tiny_mb ~log:(target_log ()) ~exe:(exe name) ~filler_mb () in
   Fun.protect
     ~finally:(fun () -> Target_ctl.stop t)
     (fun () ->
@@ -285,20 +356,20 @@ let anticheat () = raise (Skipped "not run in a bottle; the daemon's unit tests 
 let two_byte () =
   with_target (fun t ->
       ignore (find "7");
-      Target_ctl.set t "level" "9";
+      Target_ctl.set t "level16" "9";
       ignore (next "9");
-      let r = need_row (results ()) (Target_ctl.var t "level") "whole number (2-byte)" in
+      let r = need_row (results ()) (Target_ctl.var t "level16") "whole number (2-byte)" in
       set_row r "12";
-      expect t "level" "12")
+      expect t "level16" "12")
 
 let eight_byte () =
   with_target (fun t ->
       ignore (find "100000");
-      Target_ctl.set t "xp" "100250";
+      Target_ctl.set t "xp64" "100250";
       ignore (next "100250");
-      let r = need_row (results ()) (Target_ctl.var t "xp") "whole number (8-byte)" in
+      let r = need_row (results ()) (Target_ctl.var t "xp64") "whole number (8-byte)" in
       set_row r "5000000000";
-      expect t "xp" "5000000000")
+      expect t "xp64" "5000000000")
 
 let eight_byte_decimal () =
   with_target (fun t ->
@@ -328,6 +399,161 @@ let freed_page () =
       check (unreadable = 0) "find 3 after the free couldn't read %d bytes, expected none: %s" unreadable (show again);
       check (bytes >= (64 lsl 20) - 4096) "find 3 after the free read only %d bytes, less than the filler around the page" bytes)
 
+(* the count of the group [id] in a find's or a next's reply *)
+let group_count o id =
+  match List.find_opt (fun g -> to_string (member "id" g) = id) (to_list (member "groups" o)) with
+  | Some g -> to_int (member "count" g)
+  | None -> failf "no %s group in %s" id (show o)
+
+(* the kept value called [name], from kept --json *)
+let kept_one name =
+  let ks = to_list (moth [ "kept" ]) in
+  match List.find_opt (fun k -> to_string (member "name" k) = name) ks with Some k -> k | None -> failf "nothing kept as %s: %s" name (show (`List ks))
+
+(* waits until the target reports [name] = [want], for a value the target works out by itself *)
+let await t name want =
+  let deadline = now () +. 5. in
+  let rec go () =
+    let got = Target_ctl.get t name in
+    if got = want then ()
+    else if now () > deadline then failf "the target still has %s = %s, expected it to become %s" name got want
+    else (Unix.sleepf 0.005; go ())
+  in
+  go ()
+
+(* 17: 1 among 256 MiB of small whole numbers, which read as floats are tiny (denormal) and are
+   left out, so the float groups stay small and the next number is quick *)
+let tiny_values () =
+  with_target ~filler_tiny_mb:256 (fun t ->
+      let points = Target_ctl.var t "points" in
+      let f = find "1" in
+      List.iter
+        (fun id ->
+          let c = group_count f id in
+          check (c < 1000) "find 1 found %d %s matches, expected under 1,000" c id)
+        [ "f32"; "f64" ];
+      Target_ctl.set t "points" "0";
+      let t0 = now () in
+      let o = next "0" in
+      let took = now () -. t0 in
+      if !verbose then Printf.eprintf "find 1: %.0f ms in the helper. next 0: %.0f ms in the helper, %.0f ms end to end\n%!" (to_number (member "ms" f)) (to_number (member "ms" o)) (took *. 1000.);
+      check (took < 3.) "next 0 took %.1f s end to end, expected under 3" took;
+      match (page ~near:(hex points.addr) ()).rows with
+      | first :: _ as rows -> check (first.addr = points.addr && first.away = Some 0) "the first row near points (0x%Lx) is not points' own, away 0. results: %s" points.addr (show_rows rows)
+      | [] -> failf "no rows near points")
+
+(* 18: two floats in range of both numbers; only the one the game changed stays *)
+let still_float () =
+  with_target (fun t ->
+      let charge = Target_ctl.var t "charge" and drift = Target_ctl.var t "drift" in
+      ignore (find "5");
+      Target_ctl.set t "charge" "6";
+      ignore (next "6");
+      let rows = (page ~all:true ~n:200 ()).rows in
+      let listed (v : Target_ctl.var) = List.exists (fun r -> r.addr = v.addr) rows in
+      check (listed charge) "charge (0x%Lx) is not listed. results: %s" charge.addr (show_rows rows);
+      check (not (listed drift)) "drift (0x%Lx), which did not move, is listed. results: %s" drift.addr (show_rows rows))
+
+(* 19: the game works total out from base + bonus every 20 ms, so a write to it does not stick,
+   and moth says so *)
+let recalculated () =
+  with_target (fun t ->
+      ignore (find "6");
+      Target_ctl.set t "bonus" "0";
+      await t "total" "5";
+      ignore (next "5");
+      Target_ctl.set t "bonus" "1";
+      await t "total" "6";
+      ignore (next "6");
+      let r = need_row (results ()) (Target_ctl.var t "total") "whole number" in
+      let o = moth [ "set"; string_of_int r.n; "9" ] in
+      let said = to_string (member "message" o) in
+      check (not (to_bool (member "held" o))) "set #%d 9 says it held: %s" r.n (show o);
+      let second = match String.split_on_char '\n' said with _ :: l :: _ -> l | _ -> "" in
+      check (String.starts_with ~prefix:"the game put it straight back to 6" second) "set #%d 9 said %S" r.n said;
+      expect t "total" "6")
+
+(* 20: a value kept by name, the rows near it in a later hunt, and a set by name, undone *)
+let keep_near () =
+  with_target (fun t ->
+      let xp = Target_ctl.var t "xp" and cents = Target_ctl.var t "cents" in
+      ignore (find "15");
+      Target_ctl.set t "xp" "20";
+      ignore (next "20");
+      (match results () with
+      | first :: _ as rows -> check (first.n = 1 && first.addr = xp.addr) "result #1 is not at xp's address 0x%Lx. results: %s" xp.addr (show_rows rows)
+      | [] -> failf "no results after next 20");
+      ignore (moth [ "keep"; "#1"; "xp" ]);
+      ignore (find "5.32");
+      (match (page ~near:"xp" ()).rows with
+      | first :: _ as rows ->
+          check (first.addr = cents.addr && first.away = Some 16) "the first row near xp is not cents (0x%Lx) away 16. results: %s" cents.addr (show_rows rows)
+      | [] -> failf "no rows near xp");
+      ignore (moth [ "set"; "#1"; "99.99" ]);
+      expect t "cents" "9999";
+      ignore (moth [ "set"; "xp"; "95" ]);
+      expect t "xp" "95";
+      let k = kept_one "xp" in
+      check (addr_of k = xp.addr && to_string (member "shown" k) = "95") "kept shows xp as %s, expected 95 at 0x%Lx" (show k) xp.addr;
+      ignore (moth [ "undo" ]);
+      expect t "xp" "20";
+      ignore (moth [ "undo" ]);
+      expect t "cents" "532";
+      expect t "xp" "20")
+
+(* 21: an address kept by the number it shows, and one that shows another number *)
+let keep_address () =
+  with_target (fun t ->
+      let level = Target_ctl.var t "level" in
+      let at = hex level.addr in
+      ignore (moth [ "keep"; at; "2"; "lvl" ]);
+      let k = kept_one "lvl" in
+      check (addr_of k = level.addr && to_string (member "tag" k) = "whole number") "kept shows lvl as %s, expected a whole number at %s" (show k) at;
+      let r = moth_raw [ "keep"; at; "7" ] in
+      let said = String.trim r.err and want = sprintf "nothing at %s reads as 7." at in
+      check (r.code = 1 && said = want) "keep %s 7 gave exit %d and \"%s\", expected exit 1 and \"%s\"" at r.code said want)
+
+(* 22: results a page at a time; a row of the page shown last can be set *)
+let pages () =
+  with_target ~filler_small_mb:1 (fun _ ->
+      ignore (find "3");
+      let first = page ~n:5 () in
+      check (List.length first.rows = 5 && first.total > 5) "results -n 5 gave %d rows of %d: %s" (List.length first.rows) first.total (show_rows first.rows);
+      let second = page ~from:6 ~n:5 () in
+      check (List.map (fun r -> r.n) second.rows = [ 6; 7; 8; 9; 10 ]) "results --from 6 -n 5 gave %s" (show_rows second.rows);
+      let shared = List.filter (fun r -> List.exists (fun q -> q.addr = r.addr) first.rows) second.rows in
+      check (shared = []) "results --from 6 -n 5 repeats addresses of the first page: %s" (show_rows shared);
+      let said = to_string (member "message" (moth [ "set"; "#7"; "4" ])) in
+      check (String.starts_with ~prefix:"set #7 to 4 " said) "set #7 4 said %S" said;
+      (* row 7 is wherever the fewest-first order puts it, often a float of wine's own: put it back *)
+      ignore (moth [ "undo" ]))
+
+(* 23: a budget far too small for the hunt (about 15 MiB of candidates): groups go untracked, and
+   the value is still found. 3 MiB, not 1: the first group (i32, 2 million matches in the 64 MiB
+   filler) alone takes 2 MiB as a bitmap, and the helper untracks from the end of the list up to
+   and including the first group, so under 1 MiB nothing stays tracked and, 2 being as common as
+   3 there, no later number can narrow the hunt. 3 MiB keeps i32 and f32 and untracks the rest. *)
+let over_budget () =
+  with_daemon_env
+    [ ("MOTH_BUDGET_MB", "3") ]
+    (fun () ->
+      with_target ~filler_small_mb:64 (fun t ->
+          let f = find "3" in
+          check (List.mem "untracked" (notes f)) "find 3 has no untracked note: %s" (show f);
+          Target_ctl.set t "lives" "2";
+          ignore (next "2");
+          let lives = Target_ctl.var t "lives" and rows = results () in
+          check (List.exists (fun r -> r.addr = lives.addr) rows) "no result at lives' address 0x%Lx. results: %s" lives.addr (show_rows rows)))
+
+(* 24: status notices the game has gone and says which *)
+let closed_status () =
+  with_target (fun t ->
+      let attached = member "attached" (moth [ "status" ]) in
+      let name = match attached with `Null -> failf "status shows nothing attached" | a -> to_string (member "name" a) in
+      Target_ctl.quit t;
+      let s = moth [ "status" ] in
+      check (member "attached" s = `Null && member "closed" s = `String name) "status after %s closed: %s" name (show s))
+
 let scenarios =
   [
     (1, "decimal found from a whole number", decimal_from_whole);
@@ -346,41 +572,15 @@ let scenarios =
     (14, "eight-byte value", eight_byte);
     (15, "eight-byte decimal typed whole", eight_byte_decimal);
     (16, "a freed page", freed_page);
+    (17, "tiny values", tiny_values);
+    (18, "a float that did not move", still_float);
+    (19, "a recalculated number", recalculated);
+    (20, "keep, near, set by name", keep_near);
+    (21, "keep by address", keep_address);
+    (22, "pages", pages);
+    (23, "over budget", over_budget);
+    (24, "status after the game closes", closed_status);
   ]
-
-(* ---- the daemon's lifetime ---- *)
-
-(* the n in a core.log line "... serving <socket> (pid n)" *)
-let logged_pid line =
-  match after "(pid " line with
-  | None -> None
-  | Some i -> ( match String.index_from_opt line i ')' with Some j -> int_of_string_opt (String.sub line i (j - i)) | None -> None)
-
-(* every daemon that served this home *)
-let daemon_pids () =
-  match In_channel.with_open_bin (Filename.concat !home "core.log") In_channel.input_all with
-  | exception Sys_error _ -> []
-  | log -> List.filter_map logged_pid (String.split_on_char '\n' log)
-
-let alive pid = match Unix.kill pid 0 with () -> true | exception Unix.Unix_error _ -> false
-
-let wait_gone pid ~timeout =
-  let deadline = now () +. timeout in
-  let rec go () = if not (alive pid) then true else if now () > deadline then false else (Unix.sleepf 0.1; go ()) in
-  go ()
-
-(* stops the daemon (which closes the helper) and makes sure it has exited; false when it had
-   to be killed *)
-let stop_daemon () =
-  let stopped = match moth_raw ~timeout:60. [ "stop" ] with r -> r.code = 0 | exception Failure _ -> false in
-  List.fold_left
-    (fun clean pid ->
-      if wait_gone pid ~timeout:15. then clean
-      else (
-        (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
-        Printf.printf "moth daemon (pid %d) did not stop, so it was killed\n%!" pid;
-        false))
-    stopped (daemon_pids ())
 
 let rec rm p =
   match Unix.lstat p with
