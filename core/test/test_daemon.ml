@@ -40,6 +40,8 @@ type fake = {
   mutable alive : bool; (* whether that process is still running *)
   mutable statuses : int; (* status calls *)
   mutable status_lost : bool; (* status answers helper_lost *)
+  mutable detaches : int; (* detach calls *)
+  mutable detach_fails : bool; (* detach answers an error *)
   script : Fake_helper.script;
 }
 
@@ -57,6 +59,8 @@ let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
       alive = true;
       statuses = 0;
       status_lost = false;
+      detaches = 0;
+      detach_fails = false;
       script;
     }
   in
@@ -75,7 +79,8 @@ let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
           fk.attached_to <- Some a;
           fk.alive <- true;
           Ok a);
-      (* a set's read-back answers read_failed unless a test queues one: the stage 1 single line *)
+      (* a set's read-back answers read_failed unless a test queues one: held null, and a second
+         line that moth couldn't read it back *)
       read =
         (fun ~addr ~vtype ->
           if Queue.is_empty script.reads then Fake_helper.queue_error script "read" { code = "read_failed"; message = "" };
@@ -86,6 +91,10 @@ let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
           fk.statuses <- fk.statuses + 1;
           if fk.status_lost then Error { code = "helper_lost"; message = "" }
           else match fk.attached_to with Some a when fk.alive -> Ok (Some a) | _ -> Ok None);
+      detach =
+        (fun () ->
+          fk.detaches <- fk.detaches + 1;
+          if fk.detach_fails then Error { code = "not_attached"; message = "no process attached" } else Ok ());
       close = (fun () -> fk.closed <- fk.closed + 1);
     }
   in
@@ -274,6 +283,7 @@ let hunt () =
       check_bool "set accepts #" true (Result.is_ok (call d "set" [ "#1"; "999" ]));
       check_bool "wrote" true (Fake_helper.last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
       Fake_helper.queue_write f ~prev:(Vint 999L);
+      Fake_helper.queue_read f (Vint 5L);
       check_json "set without #" (`Assoc [ ("message", `String "set #2 to 5 (was 999)"); ("held", `Bool true) ]) (json (call d "set" [ "2"; "5" ]));
       Fake_helper.queue_write f ~prev:(Vint 5L);
       check_str "undo" "restored #2 to 999" (text (call d "undo" []));
@@ -734,6 +744,74 @@ let set_put_back () =
       check_str "two lines" two (text r);
       check_json "held false" (`Assoc [ ("message", `String two); ("held", `Bool false) ]) (json r))
 
+(* R15: the read-back lost the game or the helper. The write landed, so the reply is the set's,
+   with held null and a second line; its event keeps the write; and the next command says not
+   attached *)
+let a_write_that_could_not_be_checked () =
+  List.iter
+    (fun (code, why) ->
+      let fk, sh = fake () in
+      let f = fk.script in
+      with_daemon sh (fun d ->
+          ignore (text (attach d));
+          Fake_helper.queue_scan f [ gi "i32" 1 ];
+          ignore (text (call d "find" [ "61" ]));
+          Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 61L) } ];
+          ignore (text (call d "results" []));
+          Fake_helper.queue_write f ~prev:(Vint 61L) ~prev_bits:0x3dL;
+          Fake_helper.queue_error f "read" { code; message = "" };
+          let r = call d "set" [ "#1"; "999" ] in
+          let two = "set #1 to 999 (was 61)\n" ^ why in
+          check_str (code ^ ": two lines") two (text r);
+          check_json (code ^ ": held null") (`Assoc [ ("message", `String two); ("held", `Null) ]) (json r);
+          check_err (code ^ ": the next command") not_attached (call d "undo" []);
+          check_str (code ^ ": status") "not attached" (text (call d "status" []));
+          let open Yojson.Safe.Util in
+          let set = index 2 (json (call d "log" [] ~opts:[ ("n", "3") ])) in
+          check_str (code ^ ": the set's event") "set" (member "cmd" set |> to_string);
+          check_json (code ^ ": its write")
+            (`Assoc [ ("addr", `String "0x10008"); ("type", `String "i32"); ("prev_bits", `String "0x0000003d"); ("new_bits", `String "0x000003e7") ])
+            (member "write" set);
+          check_bool (code ^ ": its held, null") true (List.mem_assoc "held" (to_assoc set) && member "held" set = `Null)))
+    [ ("target_gone", "the game closed right after, so moth couldn't check it."); ("helper_lost", "moth lost contact with its helper right after, so it couldn't check it.") ]
+
+(* a set's event says whether the write held; every event lists the options it was given *)
+let events_say_more () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 1 ];
+      ignore (text (call d "find" [ "6" ]));
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 6L) } ];
+      ignore (text (call d "results" [] ~opts:[ ("n", "5"); ("from", "1") ]));
+      let set prev read =
+        Fake_helper.queue_write f ~prev:(Vint prev) ~prev_bits:prev;
+        Option.iter (fun v -> Fake_helper.queue_read f (Vint v)) read;
+        ignore (text (call d "set" [ "1"; "9" ]))
+      in
+      (* put straight back; already reads 8; held; not read back (the fake's read_failed) *)
+      set 6L (Some 6L);
+      set 6L (Some 8L);
+      set 8L (Some 9L);
+      set 9L None;
+      check_err "usage, with an option" "results -n needs a number from 1 to 200" (call d "results" [] ~opts:[ ("n", "0") ]);
+      let open Yojson.Safe.Util in
+      let ev = json (call d "log" [] ~opts:[ ("n", "7") ]) in
+      (* newest first: results -n 0, the four sets, results -n 5 --from 1, find *)
+      let held i = member "held" (index i ev) in
+      check_json "not read back: null" `Null (held 1);
+      check_bool "null, not left out" true (List.mem "held" (keys (index 1 ev)));
+      check_json "held" (`Bool true) (held 2);
+      check_json "already reads 8" (`Bool false) (held 3);
+      check_json "put straight back" (`Bool false) (held 4);
+      check_strs "a set's fields" [ "seq"; "ts"; "actor"; "cmd"; "args"; "ok"; "summary"; "held"; "write" ] (keys (index 4 ev));
+      check_json "the options" (`Assoc [ ("n", `String "5"); ("from", `String "1") ]) (member "opts" (index 5 ev));
+      check_strs "where they go" [ "seq"; "ts"; "actor"; "cmd"; "args"; "opts"; "ok"; "summary" ] (keys (index 5 ev));
+      check_json "an error's options too" (`Assoc [ ("n", `String "0") ]) (member "opts" (index 0 ev));
+      check_bool "none given, none listed" false (List.mem "opts" (keys (index 6 ev)));
+      check_bool "nor held, for another command" false (List.mem "held" (keys (index 5 ev))))
+
 let closed_game () =
   let fk, sh = fake () in
   let f = fk.script in
@@ -750,6 +828,7 @@ let closed_game () =
       let r = call d "status" [] in
       check_str "closed" "not attached. disco.exe closed." (text r);
       check_json "closed json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String "disco.exe") ]) (json r);
+      check_int "the helper let go of the game" 1 fk.detaches;
       check_err "kept" not_attached (call d "kept" []);
       check_err "results" not_attached (call d "results" []);
       check_str "said once" "not attached" (text (call d "status" []));
@@ -758,14 +837,20 @@ let closed_game () =
       (* attached again, nothing of the old game's is left *)
       ignore (text (attach d));
       check_str "no hunt" attached (text (call d "status" []));
-      check_str "nothing kept" nothing_kept (text (call d "kept" [])))
+      check_str "nothing kept" nothing_kept (text (call d "kept" []));
+      (* a detach that fails changes nothing *)
+      fk.alive <- false;
+      fk.detach_fails <- true;
+      check_str "closed, the detach failing" "not attached. disco.exe closed." (text (call d "status" []));
+      check_int "asked to let go" 2 fk.detaches;
+      check_int "the helper still kept" 0 fk.closed)
 
 let status_helper_lost () =
   let fk, sh = fake () in
   with_daemon sh (fun d ->
       ignore (text (attach d));
       fk.status_lost <- true;
-      check_err "lost" "lost contact with moth's helper. try again." (call d "status" []);
+      check_err "lost" "lost contact with moth's helper. attach again." (call d "status" []);
       check_int "helper closed" 1 fk.closed;
       check_str "status" "not attached" (text (call d "status" []));
       fk.status_lost <- false;
@@ -852,6 +937,8 @@ let () =
           t "keep by address" keep_by_address;
           t "keep refused" keep_refused;
           t "a set the game put back" set_put_back;
+          t "a write that could not be checked" a_write_that_could_not_be_checked;
+          t "events say held, and the options" events_say_more;
           t "status notices a closed game" closed_game;
           t "status, helper lost" status_helper_lost;
           t "memory budget" budget;

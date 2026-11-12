@@ -37,9 +37,10 @@ type listing = { rows : row list; total : int; from : int }
     there (see [Wire.bits_of_value]) *)
 type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
 
-(** what to tell the user, the write, and whether the address still held it a moment later
-    ([true] when it could not be read back) *)
-type set_done = { text : string; w : written; held : bool }
+(** what to tell the user, the write, and whether the address still held it a moment later:
+    [Some true] it read back as written, [Some false] it did not, [None] it could not be read
+    back (the text's second line says why) *)
+type set_done = { text : string; w : written; held : bool option }
 
 (** [budget_mb]: sent on a find's scan, none by default. [settle]: the wait between a write and
     reading it back, a quarter of a second by default. *)
@@ -74,8 +75,11 @@ val reach : int
 val results : t -> all:bool -> from:int -> limit:int -> near:string option -> (listing, string) result
 
 (** writes the number, waits ([settle]), then reads the address back: the game putting back the
-    bytes the write replaced, or anything else there, is a second line and [held = false]. The
-    write can be undone either way. *)
+    bytes the write replaced, or anything else there, is a second line and [held = Some false]. A
+    read-back that can't happen is [held = None] and a second line saying why; when it lost the
+    game or the helper, the hunt, the kept values and the undo list end there, as they would in
+    any step. The write landed, so it is the result in every case, and it can be undone unless
+    the undo list ended. *)
 val set : t -> row:int -> string -> (set_done, string) result
 
 (** writes back the exact bytes the newest write replaced *)

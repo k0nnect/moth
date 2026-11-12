@@ -48,7 +48,8 @@
 **Client protocol**
 
 - `results` result: `{"rows":[{"n","addr","interp_id","tag","shown","away":int|null}],"total":int,"from":int}`. It was a bare list. A row whose value cannot be read has `"shown":"?"`.
-- `set` result: `{"message":"<text>","held":bool}`.
+- `set` result: `{"message":"<text>","held":true|false|null}`. `null` (ruling R15, from the final review): the read-back could not happen, and the text's second line says why.
+- Each line of `events.jsonl` gains `"opts"`, an object of the options given (when at least one was; `--json` is not one), and a `set`'s line gains `"held"` as in its result.
 - `kept` result: `[{"name","addr","tag","shown"}]`.
 - `status` result gains `"closed":"<name>"` when it found that the attached game had exited.
 
@@ -278,13 +279,13 @@ git add core && git commit -m "core: ranges carry a floor and a moved flag, scan
   - `val set : t -> row:int -> string -> (set_done, string) result`
 - Behaviour:
   - `find` sends `budget_mb` on its scan. Scans with `keep:true` send `None`.
-  - `next_number`, exact step: when the typed number differs from the last number that applied, a range sent to a group with stored values has `moved = true`. Same number again, no baseline, or a group without values: `moved = false`.
+  - `next_number`, exact step: when the typed number differs from the last number that applied, a range sent to a group with stored values has `moved = true`. Same number again, no baseline, or a group without values: `moved = false`. (Replaced by ruling R13, from the final review: `moved` is sent only when there is a baseline, the group has stored values, the new number's and the baseline number's predicates for the group are both ranges, and neither range contains the other. So 5 then 6 sends it; 5 then 5.3, and 5.3 then 5, do not. Ruling R12: a fallback step clears the baseline as a relation step does.)
   - A successful `set` or `undo` clears the fallback baseline, as a relation step does.
   - After a successful write, `set` calls `settle ()`, reads the address back and compares raw bytes with what it wrote:
     - same: `held = true`, text unchanged from stage 1.
     - the bytes it replaced: `held = false`, a second line `the game put it straight back to <prev>. it's worked out from something else, so writing here won't stick.`
     - anything else: `held = false`, a second line `it already reads <value>: the game keeps changing it.`
-    - the read fails: `held = true` and no second line.
+    - the read fails: `held = true` and no second line. (Replaced by ruling R15, from the final review: `held` is `bool option`, and a read-back that could not happen is `None` with a second line saying why: `the game closed right after, so moth couldn't check it.` (`target_gone`), `moth lost contact with its helper right after, so it couldn't check it.` (`helper_lost`), or `moth couldn't read it back to check.`. Losing the game or the helper there clears the hunt, kept values and undo list. The write is reported and logged in every case.)
   - The write stays on the undo list in every case.
 
 - [ ] **Step 1: Write the failing tests**

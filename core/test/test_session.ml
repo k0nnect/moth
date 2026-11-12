@@ -8,6 +8,7 @@ let check_int n w g = Alcotest.(check int) n w g
 let check_bool n w g = Alcotest.(check bool) n w g
 let check_str n w g = Alcotest.(check string) n w g
 let check_ids n w g = Alcotest.(check (list string)) n w g
+let check_held n w g = Alcotest.(check (option bool)) n w g
 
 let show_pred = function
   | Eq n -> Printf.sprintf "eq %Ld" n
@@ -605,7 +606,7 @@ let a_write_the_game_puts_back () =
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_read f (Vint 6L);
   let d = ok (Session.set s ~row:1 "9") in
-  check_bool "held" false d.held;
+  check_held "held" (Some false) d.held;
   check_str "text"
     "set #1 to 9 (was 6)\nthe game put it straight back to 6. it's worked out from something else, so writing here won't stick."
     d.text;
@@ -621,7 +622,7 @@ let a_write_that_holds () =
   queue_write f ~prev:(Vfloat 100.) ~prev_bits:0x42c80000L;
   queue_read f (Vfloat (Int32.float_of_bits (Int32.bits_of_float 0.1)));
   let d = ok (Session.set s ~row:1 "0.1") in
-  check_bool "held" true d.held;
+  check_held "held" (Some true) d.held;
   check_str "the stage 1 line" "set #1 to 0.1 (was 100)" d.text;
   check_bool "read back where it wrote, as its type" true
     (List.exists (function Read { addr = 0x7000L; vtype = "f32" } -> true | _ -> false) (calls f))
@@ -635,7 +636,7 @@ let a_write_the_game_keeps_changing () =
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_read f (Vint 7L);
   let d = ok (Session.set s ~row:1 "9") in
-  check_bool "held" false d.held;
+  check_held "held" (Some false) d.held;
   check_str "text" "set #1 to 9 (was 6)\nit already reads 7: the game keeps changing it." d.text;
   check_bool "still undoable" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ])
 
@@ -648,9 +649,60 @@ let a_write_that_cannot_be_read_back () =
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_error f "read" { code = "read_failed"; message = "couldn't read 0x10" };
   let d = ok (Session.set s ~row:1 "9") in
-  check_bool "held" true d.held;
-  check_str "one line" "set #1 to 9 (was 6)" d.text;
+  check_held "not known" None d.held;
+  check_str "a second line says why" "set #1 to 9 (was 6)\nmoth couldn't read it back to check." d.text;
   check_bool "still undoable" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ])
+
+(* R15: a read-back that could not happen is neither held nor not held, and a second line says
+   why. Losing the game or the helper there ends the hunt, the kept values and the undo list, as
+   any step's would; the write is reported either way. *)
+let a_write_that_could_not_be_checked () =
+  List.iter
+    (fun ((e : err), why, ends) ->
+      let n what = e.code ^ ": " ^ what in
+      (* a row *)
+      let s, f = fresh () in
+      queue_read f (Vint 15L);
+      ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+      queue_scan f [ gi "i32" 1 ];
+      ignore (ok (Session.find s "6"));
+      queue_peek f "i32" [ it 0x10L (Vint 6L) ];
+      ignore (ok (first_page s));
+      queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
+      queue_error f "read" e;
+      let d = ok (Session.set s ~row:1 "9") in
+      check_held (n "held") None d.held;
+      check_str (n "text") ("set #1 to 9 (was 6)\n" ^ why) d.text;
+      check_bool (n "the write") true (d.w = { where = 0x10L; wtype = "i32"; bits_before = 6L; bits_after = 9L });
+      if ends then (
+        check_bool (n "hunt cleared") true (Session.current s = None);
+        check_bool (n "undo cleared") true (Session.writes s = []);
+        check_bool (n "kept values cleared") true (ok (Session.kept s) = []))
+      else (
+        check_bool (n "hunt kept") true (Session.current s <> None);
+        check_bool (n "still undoable") true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ]);
+        queue_read f (Vint 15L);
+        check_ids (n "still kept") [ "xp" ] (List.map (fun (k : Session.kept) -> k.name) (ok (Session.kept s))));
+      (* a kept value *)
+      let s, f = fresh () in
+      queue_read f (Vint 15L);
+      ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+      queue_write f ~prev:(Vint 15L) ~prev_bits:15L;
+      queue_error f "read" e;
+      let d = ok (Session.set_kept s ~name:"xp" "95") in
+      check_held (n "held, by name") None d.held;
+      check_str (n "text, by name") ("set xp to 95 (was 15)\n" ^ why) d.text;
+      check_bool (n "the write, by name") true (d.w = { where = 0x6c551068L; wtype = "i32"; bits_before = 15L; bits_after = 95L });
+      if ends then (
+        check_bool (n "undo cleared, by name") true (Session.writes s = []);
+        check_bool (n "kept values cleared, by name") true (ok (Session.kept s) = []))
+      else check_bool (n "still undoable, by name") true (Session.writes s = [ (0x6c551068L, "i32", Vint 15L, Vint 95L) ]))
+    [
+      (gone, "the game closed right after, so moth couldn't check it.", true);
+      ({ code = "helper_lost"; message = "" }, "moth lost contact with its helper right after, so it couldn't check it.", true);
+      ({ code = "read_failed"; message = "cannot read 0x10" }, "moth couldn't read it back to check.", false);
+      ({ code = "bad_reply"; message = "x" }, "moth couldn't read it back to check.", false);
+    ]
 
 (* the stored values hold the written number now, not the last number typed *)
 let a_set_or_undo_clears_the_baseline () =
@@ -692,7 +744,8 @@ let scans_carry_the_budget () =
   check_bool "keeps no budget" true (last_scan_budget f = None)
 
 (* the wait comes between the write and the read; a failed write waits for nothing. A write that
-   landed stays recorded even when the game closes before the read-back; the next command says so. *)
+   landed is reported even when the game closes before the read-back, which ends the hunt, the
+   kept values and the undo list there. *)
 let a_write_check_when_things_fail () =
   let h, f = Fake_helper.create () in
   let settles = ref [] in
@@ -709,14 +762,13 @@ let a_write_check_when_things_fail () =
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_error f "read" gone;
   let d = ok (Session.set s ~row:1 "9") in
-  check_bool "held, as far as anyone can tell" true d.held;
-  check_str "one line" "set #1 to 9 (was 6)" d.text;
+  check_held "not known" None d.held;
+  check_str "a second line says why" "set #1 to 9 (was 6)\nthe game closed right after, so moth couldn't check it." d.text;
+  check_bool "the write is reported" true (d.w = { where = 0x10L; wtype = "i32"; bits_before = 6L; bits_after = 9L });
   check_bool "waited once, after the write" true (!settles = [ "after the write" ]);
-  check_bool "recorded" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ]);
-  queue_error f "narrow" gone;
-  check_err "the next command finds the game closed" closed (Session.next_number s "5");
   check_err "hunt cleared" no_hunt (Session.next_number s "5");
-  check_err "undo cleared" "nothing to undo" (Session.undo s)
+  check_err "undo cleared" "nothing to undo" (Session.undo s);
+  check_bool "no write call since" true (write_calls f = 2)
 
 (* ---- pages, nearness and kept values ---- *)
 
@@ -999,7 +1051,7 @@ let set_a_kept_value () =
   queue_read f (Vint 95L);
   let d = ok (Session.set_kept s ~name:"xp" "95") in
   check_str "set" "set xp to 95 (was 15)" d.text;
-  check_bool "held" true d.held;
+  check_held "held" (Some true) d.held;
   check_bool "the write" true (d.w = { where = 0x6c551068L; wtype = "i32"; bits_before = 15L; bits_after = 95L });
   check_bool "wrote as its type" true (last_write f = (0x6c551068L, "i32", Put_value (Vint 95L)));
   check_bool "recorded" true (Session.writes s = [ (0x6c551068L, "i32", Vint 15L, Vint 95L) ]);
@@ -1087,6 +1139,7 @@ let () =
           t "a write the game keeps changing" a_write_the_game_keeps_changing;
           t "a write that cannot be read back" a_write_that_cannot_be_read_back;
           t "a write check when things fail" a_write_check_when_things_fail;
+          t "a write that could not be checked" a_write_that_could_not_be_checked;
         ] );
       ("errors", [ t "out of order" out_of_order; t "game closes" game_closes; t "failed find, lost groups" failed_find_and_lost_groups ]);
       ( "pages, near, kept",

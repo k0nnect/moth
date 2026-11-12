@@ -73,6 +73,7 @@ type state = {
   mutable gone : bool; (* the helper said target_gone during this request *)
   mutable seq : int; (* the newest event's number *)
   mutable wrote : Yojson.Safe.t option; (* the write this request made, for its event *)
+  mutable held : Yojson.Safe.t option; (* whether this request's set held, for its event *)
   mutable owned : (Unix.file_descr * Unix.file_descr) option; (* listener and lock, while serving *)
 }
 
@@ -283,20 +284,26 @@ let written_json (w : Session.written) =
       ("new_bits", Wire.bits_to_json ~vtype:w.wtype w.bits_after);
     ]
 
-(* a set: what to say and whether the value held; the write goes in the request's event *)
+(* a set: what to say and whether the value held (null: it couldn't be read back); both go in
+   the request's event *)
 let set_done st (d : Session.set_done) =
+  let held = match d.held with Some b -> `Bool b | None -> `Null in
   st.wrote <- Some (written_json d.w);
-  (`Assoc [ ("message", `String d.text); ("held", `Bool d.held) ], d.text)
+  st.held <- Some held;
+  (`Assoc [ ("message", `String d.text); ("held", held) ], d.text)
 
 (* Asks the helper whether the game is still there. When it has exited, the target goes, and its
-   hunt, kept values and writes with it; the helper stays. *)
+   hunt, kept values and writes with it; the helper stays, and lets go of the game's candidates
+   now rather than at the next attach (if it can't, the answer is the same). *)
 let status st =
   match (st.target, st.conn) with
   | Some t, Some (_, h) -> (
       match h.status () with
       | Ok None ->
           st.target <- None;
+          ignore (h.detach ());
           Ok (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String t.proc.name) ], sprintf "not attached. %s closed." t.proc.name)
+      | Error { code = "helper_lost"; _ } -> Error "lost contact with moth's helper. attach again."
       | Error e -> Error (message e)
       | Ok (Some _) -> (
           let attached = `Assoc [ ("pid", `Int t.proc.pid); ("name", `String t.proc.name); ("bits", `Int t.proc.bits); ("bottle", `String t.bottle) ] in
@@ -352,20 +359,23 @@ let read_events home =
 let last_seq home = match read_events home with ev :: _ -> Yojson.Safe.Util.(to_int (member "seq" ev)) | [] -> 0
 let first_line s = match String.index_opt s '\n' with Some i -> String.sub s 0 i | None -> s
 
-let record st ~actor ~cmd ~args result =
+(* one line of events.jsonl: the command, its arguments and its options (when any were given),
+   how it went, and for a write, whether it held and what it wrote *)
+let record st ~actor ~cmd ~args ~opts result =
   st.seq <- st.seq + 1;
   let ok, summary = match result with Ok (_, text) -> (true, first_line text) | Error e -> (false, first_line e) in
   let ev =
     `Assoc
       ([
-        ("seq", `Int st.seq);
-        ("ts", `Float (Float.round (Unix.gettimeofday () *. 1000.) /. 1000.));
-        ("actor", `String actor);
-        ("cmd", `String cmd);
-        ("args", `List (List.map (fun a -> `String a) args));
-        ("ok", `Bool ok);
-        ("summary", `String summary);
-      ]
+         ("seq", `Int st.seq);
+         ("ts", `Float (Float.round (Unix.gettimeofday () *. 1000.) /. 1000.));
+         ("actor", `String actor);
+         ("cmd", `String cmd);
+         ("args", `List (List.map (fun a -> `String a) args));
+       ]
+      @ (if opts = [] then [] else [ ("opts", `Assoc (List.map (fun (k, v) -> (k, `String v)) opts)) ])
+      @ [ ("ok", `Bool ok); ("summary", `String summary) ]
+      @ (match st.held with Some h -> [ ("held", h) ] | None -> [])
       @ match st.wrote with Some w -> [ ("write", w) ] | None -> [])
   in
   try
@@ -520,8 +530,9 @@ let answer st line =
           Error (sprintf "moth hit an internal error: %s. see %s" e (in_home st.home "core.log"))
       in
       settle st;
-      record st ~actor:r.actor ~cmd:r.cmd ~args:r.args result;
+      record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
       st.wrote <- None;
+      st.held <- None;
       reply r.rid result
 
 let max_request = 1 lsl 20
@@ -603,6 +614,7 @@ let run ~home ~start_helper =
       gone = false;
       seq = last_seq home;
       wrote = None;
+      held = None;
       owned = Some (listener, lock);
     }
   in

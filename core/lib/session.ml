@@ -37,7 +37,7 @@ type keeping = { kname : string; kat : int64; ki : Interp.t }
 type write = { wlabel : string; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
 
 type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
-type set_done = { text : string; w : written; held : bool }
+type set_done = { text : string; w : written; held : bool option }
 
 type t = {
   h : helper;
@@ -63,29 +63,30 @@ exception Helper_failed of err
 
 let call = function Ok x -> x | Error e -> raise (Helper_failed e)
 
-(* Runs one step. A helper error ends it; losing the game or the helper also ends the hunt, the
-   writes and the kept values, whose addresses mean nothing once attached again. A group the
-   helper no longer has ends the hunt, which can't go on without it; the writes and the kept
-   values stay. *)
+let drop_hunt t =
+  t.hunt <- None;
+  t.listing <- []
+
+(* losing the game or the helper ends the hunt, the writes and the kept values, whose addresses
+   mean nothing once attached again *)
+let clear t =
+  drop_hunt t;
+  t.undo <- [];
+  t.named <- []
+
+(* Runs one step. A helper error ends it; losing the game or the helper also clears the session.
+   A group the helper no longer has ends the hunt, which can't go on without it; the writes and
+   the kept values stay. *)
 let guard t f =
-  let drop_hunt () =
-    t.hunt <- None;
-    t.listing <- []
-  in
-  let clear () =
-    drop_hunt ();
-    t.undo <- [];
-    t.named <- []
-  in
   try f () with
   | Helper_failed { code = "target_gone"; _ } ->
-      clear ();
+      clear t;
       Error game_closed
   | Helper_failed { code = "helper_lost"; _ } ->
-      clear ();
+      clear t;
       Error helper_lost
   | Helper_failed { code = "no_such_group"; _ } ->
-      drop_hunt ();
+      drop_hunt t;
       Error hunt_lost
   | Helper_failed e -> Error (if e.message = "" then e.code else e.message)
 
@@ -408,22 +409,30 @@ let write_checked t ~label (i : Interp.t) addr text =
           forget_last t;
           let w = { where = addr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
           let text = Printf.sprintf "set %s to %s (was %s)" label (Interp.decode i next) (Interp.decode i r.prev) in
-          (* a read that fails says nothing: the write landed and stays recorded, and the next
-             command reports a closed game or a lost helper *)
           t.settle ();
-          let why =
+          (* held: read back as written, or not; None when it couldn't be read back. The write
+             landed either way, so it is reported; a read-back that lost the game or the helper
+             clears the session there, as any step's would. *)
+          let held, why =
             match t.h.read ~addr ~vtype with
-            | Error _ -> None
+            | Error { code = "target_gone"; _ } ->
+                clear t;
+                (None, Some "the game closed right after, so moth couldn't check it.")
+            | Error { code = "helper_lost"; _ } ->
+                clear t;
+                (None, Some "moth lost contact with its helper right after, so it couldn't check it.")
+            | Error _ -> (None, Some "moth couldn't read it back to check.")
             | Ok v ->
                 let bits = Wire.bits_of_value ~vtype v in
-                if bits = w.bits_after then None
+                if bits = w.bits_after then (Some true, None)
                 else if bits = r.prev_bits then
-                  Some
-                    (Printf.sprintf "the game put it straight back to %s. it's worked out from something else, so writing here won't stick."
-                       (Interp.decode i r.prev))
-                else Some (Printf.sprintf "it already reads %s: the game keeps changing it." (Interp.decode i v))
+                  ( Some false,
+                    Some
+                      (Printf.sprintf "the game put it straight back to %s. it's worked out from something else, so writing here won't stick."
+                         (Interp.decode i r.prev)) )
+                else (Some false, Some (Printf.sprintf "it already reads %s: the game keeps changing it." (Interp.decode i v)))
           in
-          match why with None -> Ok { text; w; held = true } | Some why -> Ok { text = text ^ "\n" ^ why; w; held = false })
+          Ok { text = (match why with Some why -> text ^ "\n" ^ why | None -> text); w; held })
 
 let set t ~row text =
   match t.hunt with
