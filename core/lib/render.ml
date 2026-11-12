@@ -10,7 +10,16 @@ let commas n =
     digits;
   Buffer.contents b
 
-let dead_end = "nothing left that fits. that step was not applied, so you can try a different number, or hunt by how it moves: moth snapshot"
+(* a step that kept nothing: after a relation step; after a number, when the hunt can be compared
+   by change; after a number, when it can't *)
+let dead_end (o : Session.outcome) =
+  if o.by_relation then
+    "nothing fits that, so that step was not applied. say how it moved again: moth next down, up, same or changed. or type the number it shows: moth next <number>"
+  else if Session.can_compare o then
+    "nothing left that fits. that step was not applied, so you can try a different number, or say how it moved: moth next down, up, same or changed"
+  else "nothing left that fits. that step was not applied, so you can try a different number, or start over by how it moves: moth snapshot"
+
+let no_step_yet = "snapshot taken, no step yet. change the value in the game, then tell moth how it moved: moth next down, up, same or changed."
 
 let counts (o : Session.outcome) =
   let total = if List.mem Session.Showing_wide o.notes then o.wide else o.main in
@@ -40,7 +49,7 @@ let snapshot_line bytes =
   Printf.sprintf "snapshot of %s taken. change the value in the game, then tell moth how it moved: moth next down, up, same or changed." (size bytes)
 
 let outcome (o : Session.outcome) =
-  if o.dead_end then dead_end
+  if o.dead_end then dead_end o
   else
     let head = if List.mem Session.Snapshot_taken o.notes then snapshot_line o.bytes else counts o in
     let notes = List.stable_sort (fun a b -> compare (rank a) (rank b)) o.notes in

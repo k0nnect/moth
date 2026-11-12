@@ -14,15 +14,18 @@ type note = Fell_back of relation | Showing_wide | Untracked | Lost of int | Sna
 
 (** [main] and [wide]: matches in the tracked groups of each tier. [by_tag]: the tracked groups
     being shown (wide ones only under [Showing_wide]) summed per [Interp.describe] tag, in plan
-    order, zero counts left out. A dead end reports the hunt as it stands, unchanged. [ms],
-    [bytes] and [unreadable]: the helper's time, bytes read and bytes it could not read (scans
-    only), summed over the calls the step made. [groups]: the hunt's groups in plan order. *)
+    order, zero counts left out. A dead end reports the hunt as it stands, unchanged.
+    [by_relation]: the step was by how the value moved ([next_relation]); a number's fallback is
+    not one. [ms], [bytes] and [unreadable]: the helper's time, bytes read and bytes it could not
+    read (scans only), summed over the calls the step made. [groups]: the hunt's groups in plan
+    order. *)
 type outcome = {
   main : int;
   wide : int;
   by_tag : (string * int) list;
   notes : note list;
   dead_end : bool;
+  by_relation : bool;
   ms : float;
   bytes : int;
   unreadable : int;
@@ -75,6 +78,15 @@ val size : int -> string
 val next_number : t -> string -> (outcome, string) result
 
 val next_relation : t -> relation -> (outcome, string) result
+
+(** a relation step can be applied to the outcome's hunt: one of its groups is tracked, has
+    matches, and has stored values (its own or the snapshot's) to compare with, which
+    [next_relation] asks before it sends anything *)
+val can_compare : outcome -> bool
+
+(** the hunt is from a snapshot and no step has narrowed it yet: every aligned place is still a
+    candidate, and there is nothing to list *)
+val blind : t -> bool
 
 (** 4096: how far a listing near a value looks, in bytes, each way *)
 val reach : int

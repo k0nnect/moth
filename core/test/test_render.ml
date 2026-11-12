@@ -6,12 +6,33 @@ let last_line s = List.nth (String.split_on_char '\n' s) (List.length (String.sp
 
 let outcome () =
   check_str "counts" "259,560 matches (241,178 whole number, 18,382 decimal)"
-    (Render.outcome { main = 259560; wide = 0; by_tag = [ ("whole number", 241178); ("decimal", 18382) ]; notes = []; dead_end = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
-  check_str "dead end" "nothing left that fits. that step was not applied, so you can try a different number, or hunt by how it moves: moth snapshot"
-    (Render.outcome { main = 4; wide = 0; by_tag = []; notes = []; dead_end = true; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
+    (Render.outcome { main = 259560; wide = 0; by_tag = [ ("whole number", 241178); ("decimal", 18382) ]; notes = []; dead_end = false; by_relation = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
+  check_str "dead end" "nothing left that fits. that step was not applied, so you can try a different number, or start over by how it moves: moth snapshot"
+    (Render.outcome { main = 4; wide = 0; by_tag = []; notes = []; dead_end = true; by_relation = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
+  (* R12: what a dead end says follows the step and whether the hunt can be compared by change *)
+  let comparable : Helper_api.group_info = { id = "i32"; count = 4; tracked = true; has_values = true } in
+  let dead ~by_relation groups : Session.outcome =
+    { main = 4; wide = 0; by_tag = [ ("whole number", 4) ]; notes = []; dead_end = true; by_relation; ms = 0.; bytes = 0; unreadable = 0; groups }
+  in
+  check_str "dead end after a relation step"
+    "nothing fits that, so that step was not applied. say how it moved again: moth next down, up, same or changed. or type the number it shows: moth next <number>"
+    (Render.outcome (dead ~by_relation:true [ (comparable, Interp.Main) ]));
+  check_str "dead end after a number, comparable by change"
+    "nothing left that fits. that step was not applied, so you can try a different number, or say how it moved: moth next down, up, same or changed"
+    (Render.outcome (dead ~by_relation:false [ (comparable, Interp.Main) ]));
+  List.iter
+    (fun (why, (g : Helper_api.group_info)) ->
+      check_str ("dead end after a number: " ^ why)
+        "nothing left that fits. that step was not applied, so you can try a different number, or start over by how it moves: moth snapshot"
+        (Render.outcome (dead ~by_relation:false [ (g, Interp.Main) ])))
+    [
+      ("no values", { comparable with has_values = false });
+      ("untracked", { comparable with tracked = false });
+      ("no matches", { comparable with count = 0 });
+    ];
   check_str "fallback" "4 matches (4 whole number)\nno exact match for that number. kept the ones that went down instead."
-    (Render.outcome { main = 4; wide = 0; by_tag = [ ("whole number", 4) ]; notes = [ Fell_back Down ]; dead_end = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
-  let plain ?(main = 0) ?(wide = 0) ?(dead_end = false) ?(unreadable = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end; ms = 0.; bytes = 0; unreadable; groups = [] } in
+    (Render.outcome { main = 4; wide = 0; by_tag = [ ("whole number", 4) ]; notes = [ Fell_back Down ]; dead_end = false; by_relation = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] });
+  let plain ?(main = 0) ?(wide = 0) ?(dead_end = false) ?(unreadable = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end; by_relation = false; ms = 0.; bytes = 0; unreadable; groups = [] } in
   check_str "one match" "1 match (1 whole number)" (Render.outcome (plain ~main:1 [ ("whole number", 1) ] []));
   check_str "went up" "2 matches (2 decimal)\nno exact match for that number. kept the ones that went up instead."
     (Render.outcome (plain ~main:2 [ ("decimal", 2) ] [ Fell_back Up ]));
@@ -34,7 +55,7 @@ let outcome () =
     (Render.outcome (plain ~wide:2 [ ("whole number ×100", 2) ] [ Lost 5; Untracked; Showing_wide; Fell_back Up ]));
   check_str "zero tags left out" "4 matches (4 whole number)" (Render.outcome (plain ~main:4 [ ("whole number", 4); ("decimal", 0) ] []));
   check_str "no matches" "0 matches" (Render.outcome (plain [] []));
-  check_str "dead end alone" "nothing left that fits. that step was not applied, so you can try a different number, or hunt by how it moves: moth snapshot"
+  check_str "dead end alone" "nothing left that fits. that step was not applied, so you can try a different number, or start over by how it moves: moth snapshot"
     (Render.outcome (plain ~main:4 ~dead_end:true [ ("whole number", 4) ] [ Untracked; Lost 3 ]));
   check_str "unreadable"
     "3 matches (3 whole number)\ncouldn't read 4 kb of the game's memory, so matches there are missing."
@@ -63,7 +84,7 @@ let sizes () =
     ]
 
 let counts () =
-  let o ?(main = 0) ?(wide = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] } in
+  let o ?(main = 0) ?(wide = 0) by_tag notes : Session.outcome = { main; wide; by_tag; notes; dead_end = false; by_relation = false; ms = 0.; bytes = 0; unreadable = 0; groups = [] } in
   check_str "counts line" "4 matches (4 whole number)" (Render.counts (o ~main:4 [ ("whole number", 4) ] [ Fell_back Down; Untracked ]));
   check_str "wide when showing wide" "3 matches (3 whole number (1-byte))" (Render.counts (o ~wide:3 [ ("whole number (1-byte)", 3) ] [ Showing_wide ]));
   check_str "none" "0 matches" (Render.counts (o [] []))
@@ -126,7 +147,7 @@ let kept_put_back () =
 (* a snapshot's line takes the counts line's place; the unreadable line and the notes follow *)
 let snapshot_taken () =
   let o ?(unreadable = 0) notes : Session.outcome =
-    { main = 5000; wide = 4000; by_tag = [ ("whole number", 1000); ("decimal", 1000) ]; notes; dead_end = false; ms = 0.; bytes = 12 * 1048576; unreadable; groups = [] }
+    { main = 5000; wide = 4000; by_tag = [ ("whole number", 1000); ("decimal", 1000) ]; notes; dead_end = false; by_relation = false; ms = 0.; bytes = 12 * 1048576; unreadable; groups = [] }
   in
   let line = "snapshot of 12 mb taken. change the value in the game, then tell moth how it moved: moth next down, up, same or changed." in
   check_str "one line" line (Render.outcome (o [ Snapshot_taken ]));

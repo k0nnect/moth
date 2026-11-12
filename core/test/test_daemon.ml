@@ -243,7 +243,7 @@ let hunt () =
         (text (call d "find" [ "100" ]));
       check_str "status with a hunt" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
       check_json "status json hunt"
-        (`Assoc [ ("main", `Int 3); ("wide", `Int 7); ("groups", `List [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ]) ])
+        (`Assoc [ ("main", `Int 3); ("wide", `Int 7); ("groups", `List [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ]); ("blind", `Bool false) ])
         Yojson.Safe.Util.(member "hunt" (json (call d "status" [])));
       check_err "usage" "next needs a number, or one of: down, up, same, changed" (call d "next" []);
       check_err "bad number" "'abc' isn't a number" (call d "next" [ "abc" ]);
@@ -898,6 +898,7 @@ let budget () =
 
 let blind = [ gi "i32" 1000; gi "f32" 1000; gi "i16" 2000; gi "i64" 500; gi "f64" 500; gi "u8" 4000 ]
 let snapshot_text = "snapshot of 4 kb taken. change the value in the game, then tell moth how it moved: moth next down, up, same or changed."
+let no_step_yet = "snapshot taken, no step yet. change the value in the game, then tell moth how it moved: moth next down, up, same or changed."
 
 let a_snapshot_hunt () =
   let fk, sh = fake () in
@@ -914,14 +915,17 @@ let a_snapshot_hunt () =
       check_bool "the blind plan" true
         (Fake_helper.last_snapshot_groups f = [ ("i32", "i32", 4); ("f32", "f32", 4); ("i16", "i16", 2); ("i64", "i64", 8); ("f64", "f64", 8); ("u8", "u8", 1) ]);
       check_int "one call" 1 (Fake_helper.snapshot_calls f);
-      (* status reads plainly: the counts, no number to be blank *)
-      check_str "status" (attached ^ "\n5,000 matches (1,000 whole number, 1,000 decimal, 2,000 whole number (2-byte), 500 whole number (8-byte), 500 decimal (8-byte))")
-        (text (call d "status" []));
-      check_int "status json" 5000 (member "hunt" (json (call d "status" [])) |> member "main" |> to_int);
+      (* R17: before a step, status says so in the counts line's place, and its json says blind *)
+      check_str "status" (attached ^ "\n" ^ no_step_yet) (text (call d "status" []));
+      let hunt = member "hunt" (json (call d "status" [])) in
+      check_int "status json" 5000 (member "main" hunt |> to_int);
+      check_bool "status json: blind" true (member "blind" hunt |> to_bool);
       check_err "nothing to list yet" "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed." (call d "results" []);
       Fake_helper.queue_narrow f ~applied:true [ gi "i32" 3; gi "f32" 2; gi "i16" 0; gi "i64" 0; gi "f64" 0; gi "u8" 0 ];
       check_str "next down" "5 matches (3 whole number, 2 decimal)" (text (call d "next" [ "down" ]));
-      check_str "status after a step" (attached ^ "\n5 matches (3 whole number, 2 decimal)") (text (call d "status" []));
+      let r = call d "status" [] in
+      check_str "status after a step" (attached ^ "\n5 matches (3 whole number, 2 decimal)") (text r);
+      check_bool "status json after a step: not blind" false (member "hunt" (json r) |> member "blind" |> to_bool);
       Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 5L) } ];
       Fake_helper.queue_peek f "f32" [ { addr = 0x10010L; v = Some (Vfloat 5.) } ];
       check_bool "results lists" true (String.length (text (call d "results" [])) > 0);
@@ -929,6 +933,30 @@ let a_snapshot_hunt () =
       check_strs "one event per command"
         [ "snapshot"; "attach"; "snapshot"; "status"; "status"; "results"; "next"; "status"; "results" ]
         (List.rev_map (fun e -> member "cmd" e |> to_string) (to_list log)))
+
+(* R17: a step that keeps nothing is no step, so status still says none was taken; a find that
+   replaces the snapshot hunt is not blind *)
+let status_of_a_snapshot_hunt () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      let status () =
+        let r = call d "status" [] in
+        (text r, Yojson.Safe.Util.(member "hunt" (json r) |> member "blind" |> to_bool))
+      in
+      Fake_helper.queue_snapshot f blind;
+      ignore (text (call d "snapshot" []));
+      Fake_helper.queue_narrow f ~applied:false [];
+      ignore (text (call d "next" [ "up" ]));
+      let said, blind_now = status () in
+      check_str "after a dead end" (attached ^ "\n" ^ no_step_yet) said;
+      check_bool "after a dead end: blind" true blind_now;
+      Fake_helper.queue_scan f [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "100" ]));
+      let said, blind_now = status () in
+      check_str "a find replaces it" (attached ^ "\n3 matches (3 whole number)") said;
+      check_bool "a find replaces it: not blind" false blind_now)
 
 let snapshot_usage () =
   let fk, sh = fake () in
@@ -1074,6 +1102,7 @@ let () =
           t "status, helper lost" status_helper_lost;
           t "memory budget" budget;
           t "snapshot hunt" a_snapshot_hunt;
+          t "status of a snapshot hunt" status_of_a_snapshot_hunt;
           t "snapshot usage" snapshot_usage;
           t "snapshot too big" snapshot_too_big;
           t "kept shows a put back" kept_put_back;

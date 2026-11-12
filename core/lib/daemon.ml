@@ -323,8 +323,12 @@ let status st =
           match Session.current t.session with
           | None -> Ok (`Assoc [ ("attached", attached); ("hunt", `Null) ], attached_line t)
           | Some o ->
-              let hunt = `Assoc [ ("main", `Int o.main); ("wide", `Int o.wide); ("groups", `List (List.map group_json o.groups)) ] in
-              Ok (`Assoc [ ("attached", attached); ("hunt", hunt) ], attached_line t ^ "\n" ^ Render.counts o)))
+              (* a snapshot no step has narrowed: every aligned place counts, and nothing lists yet *)
+              let blind = Session.blind t.session in
+              let hunt =
+                `Assoc [ ("main", `Int o.main); ("wide", `Int o.wide); ("groups", `List (List.map group_json o.groups)); ("blind", `Bool blind) ]
+              in
+              Ok (`Assoc [ ("attached", attached); ("hunt", hunt) ], attached_line t ^ "\n" ^ if blind then Render.no_step_yet else Render.counts o)))
   | _ -> Ok (`Assoc [ ("attached", `Null); ("hunt", `Null) ], "not attached")
 
 let bottles () =

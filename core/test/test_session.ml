@@ -1155,7 +1155,8 @@ let a_snapshot_hunt_step_by_step () =
   check_int "no fallback narrow" 1 (narrow_calls f);
   check_ids "every group that can hold it, together" blind_ids (last_narrow_ids f);
   check_str "says how else to hunt"
-    "nothing left that fits. that step was not applied, so you can try a different number, or hunt by how it moves: moth snapshot" (Render.outcome o);
+    "nothing left that fits. that step was not applied, so you can try a different number, or say how it moved: moth next down, up, same or changed"
+    (Render.outcome o);
   check_err "still nothing to list" nothing_yet (first_page s);
   check_err "nor near a value" nothing_yet (near s "0x1000");
   queue_narrow f ~applied:false [];
@@ -1293,6 +1294,86 @@ let hunts_replace_each_other () =
   queue_read f (Vint 16L);
   check_ids "kept values outlast both" [ "xp" ] (kept_names s);
   check_bool "and so do the writes" true (Session.writes s = [ (0x6c551068L, "i32", Vint 15L, Vint 16L) ])
+
+(* ---- what a step that kept nothing says ---- *)
+
+let by_relation_text =
+  "nothing fits that, so that step was not applied. say how it moved again: moth next down, up, same or changed. or type the number it shows: moth next <number>"
+
+let by_number_text = "nothing left that fits. that step was not applied, so you can try a different number, or say how it moved: moth next down, up, same or changed"
+let start_over_text = "nothing left that fits. that step was not applied, so you can try a different number, or start over by how it moves: moth snapshot"
+
+(* R12: a relation step that keeps nothing says to say again how it moved, or to type the number;
+   on a snapshot hunt a step has narrowed, and on a number hunt. The hunt is as it was. *)
+let a_relation_that_keeps_nothing () =
+  let s, f = fresh () in
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  queue_narrow f ~applied:true [ gi "i32" 3; gi "f32" 2; gi "i16" 0; gi "i64" 0; gi "f64" 0; gi "u8" 0 ];
+  ignore (ok (Session.next_relation s Down));
+  let before = Session.current s in
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_relation s Up) in
+  check_bool "dead end" true o.dead_end;
+  check_str "a snapshot hunt" by_relation_text (Render.outcome o);
+  check_bool "the hunt as it was" true (before <> None && Session.current s = before);
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 500 ];
+  ignore (ok (Session.find s "13"));
+  let before = Session.current s in
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_relation s Same) in
+  check_bool "dead end, a number hunt" true o.dead_end;
+  check_str "a number hunt" by_relation_text (Render.outcome o);
+  check_bool "the number hunt as it was" true (before <> None && Session.current s = before)
+
+(* a number that keeps nothing, when the hunt as it stands can be compared by change, says so:
+   after a relation step, after a number whose fallback kept nothing too, and on a snapshot no
+   step has narrowed, whose groups compare with the snapshot *)
+let a_number_that_keeps_nothing () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 559 ];
+  ignore (ok (Session.find s "13"));
+  queue_narrow f ~applied:true [ gi "i32" 559 ];
+  ignore (ok (Session.next_relation s Same));
+  let before = Session.current s in
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "99") in
+  check_bool "dead end" true o.dead_end;
+  check_str "after a relation step" by_number_text (Render.outcome o);
+  check_bool "the hunt as it was" true (before <> None && Session.current s = before);
+  queue_narrow f ~applied:true [ gi "i32" 40 ];
+  ignore (ok (Session.next_number s "12"));
+  let before = Session.current s in
+  queue_narrow f ~applied:false [];
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "99") in
+  check_pred "the fallback was tried" Gt_prev (last_narrow_pred f "i32");
+  check_int "exact, then the fallback" 5 (narrow_calls f);
+  check_str "after a fallback that kept nothing" by_number_text (Render.outcome o);
+  check_bool "the hunt as it was, again" true (Session.current s = before);
+  let s, f = fresh () in
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  let before = Session.current s in
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "97") in
+  check_str "a snapshot no step has narrowed" by_number_text (Render.outcome o);
+  check_bool "the snapshot hunt as it was" true (before <> None && Session.current s = before)
+
+(* a number that keeps nothing in a hunt whose groups have no stored values says to start over by
+   how it moves *)
+let a_number_that_keeps_nothing_with_no_values () =
+  let s, f = fresh () in
+  queue_scan f [ gi ~values:false "i32" 3_000_000; gi ~values:false "f32" 2_500_000 ];
+  ignore (ok (Session.find s "1"));
+  let before = Session.current s in
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "5") in
+  check_bool "dead end" true o.dead_end;
+  check_int "no fallback to send" 1 (narrow_calls f);
+  check_str "start over" start_over_text (Render.outcome o);
+  check_bool "the hunt as it was" true (before <> None && Session.current s = before)
 
 (* ---- kept values: what they read now, and the game putting a write back ---- *)
 
@@ -1497,5 +1578,11 @@ let () =
           t "a snapshot that fails" a_snapshot_that_fails;
           t "snapshots carry the limit" snapshots_carry_the_limit;
           t "hunts replace each other" hunts_replace_each_other;
+        ] );
+      ( "dead ends",
+        [
+          t "a relation that keeps nothing" a_relation_that_keeps_nothing;
+          t "a number that keeps nothing" a_number_that_keeps_nothing;
+          t "a number that keeps nothing, with no values" a_number_that_keeps_nothing_with_no_values;
         ] );
     ]

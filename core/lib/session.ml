@@ -9,6 +9,7 @@ type outcome = {
   by_tag : (string * int) list;
   notes : note list;
   dead_end : bool;
+  by_relation : bool;
   ms : float;
   bytes : int;
   unreadable : int;
@@ -112,7 +113,7 @@ let total tier gs = List.fold_left (fun a g -> if g.info.tracked && g.interp.tie
 
 let showing_wide gs = total Interp.Main gs = 0 && total Interp.Wide gs > 0
 
-let outcome_of ?fell_back ?(dead_end = false) tl gs =
+let outcome_of ?fell_back ?(dead_end = false) ?(by_relation = false) tl gs =
   let wide_shown = showing_wide gs in
   let shown = if wide_shown then Interp.Wide else Interp.Main in
   let by_tag =
@@ -137,6 +138,7 @@ let outcome_of ?fell_back ?(dead_end = false) tl gs =
     by_tag;
     notes;
     dead_end;
+    by_relation;
     ms = tl.spent_ms;
     bytes = tl.read_bytes;
     unreadable = tl.unread_bytes;
@@ -147,7 +149,9 @@ let spec_of (i : Interp.t) pred : group_spec = { id = i.id; vtype = i.vtype; ali
 let updated infos g = match List.find_opt (fun (i : group_info) -> i.id = g.info.id) infos with Some info -> { g with info } | None -> g
 
 (* a group a previous-value predicate can narrow *)
-let comparable g = g.info.tracked && g.info.has_values && g.info.count > 0
+let comparable_info (i : group_info) = i.tracked && i.has_values && i.count > 0
+let comparable g = comparable_info g.info
+let can_compare (o : outcome) = List.exists (fun (i, _) -> comparable_info i) o.groups
 let pred_of_relation = function Down -> Lt_prev | Up -> Gt_prev | Same -> Eq_prev | Changed -> Ne_prev
 
 let relation_between (m : Value.t) (last : Value.t) =
@@ -319,7 +323,7 @@ let next_relation t r =
   | Some hunt -> (
       match List.filter comparable hunt.current with
       | [] when List.exists (fun g -> g.info.count > 0) hunt.current -> Error too_many
-      | [] -> Ok (outcome_of ~dead_end:true (tally ()) hunt.current)
+      | [] -> Ok (outcome_of ~dead_end:true ~by_relation:true (tally ()) hunt.current)
       | gs ->
           guard t (fun () ->
               let tl = tally () in
@@ -328,8 +332,10 @@ let next_relation t r =
                 let current = List.map (updated narrowed) hunt.current in
                 (* the stored values now hold what this step read, not the last number typed *)
                 commit t current None;
-                Ok (outcome_of tl current))
-              else Ok (outcome_of ~dead_end:true tl hunt.current)))
+                Ok (outcome_of ~by_relation:true tl current))
+              else Ok (outcome_of ~dead_end:true ~by_relation:true tl hunt.current)))
+
+let blind t = match t.hunt with Some h -> h.blind | None -> false
 
 (* ---- results: pages, and nearness to a value ---- *)
 
