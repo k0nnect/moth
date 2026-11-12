@@ -108,3 +108,89 @@ Found from the screen numbers alone.
 6. A 0 or 1 value does not converge: each change cut the whole-number list by only 5 to 65 times.
 7. A number the game recalculates is found but cannot be changed, and moth does not say why the write did not stick.
 8. `moth status` does not notice that the game closed until the next step.
+
+---
+
+# disco elysium, stage 1b
+
+Date: 2026-11-11 into 2026-11-12. Done with Chris at the keyboard, in the same game session as stage 1's second run (so addresses match that run).
+
+## setup
+
+- Game and machine as above. moth: branch `stage-1b-disco-gaps` at `efffb86`, default `MOTH_HOME`.
+- Every read and write of the game in this section went through `moth` commands. No script outside moth touched the game's memory. The game's save files were read from disk three times to learn how a value is stored (see "thought cabinet").
+
+## result
+
+| check | bar | measured | verdict |
+| --- | --- | --- | --- |
+| first scan speed | 3.0 s/GiB or better | 0.75 to 1.30 s/GiB over five scans with recorded sizes | met |
+| each step of the skill-point hunt | 8 seconds or less | `find 1` 5.4 s, `next 0` 10.6 s (stage 1: 4.9 s and 30.0 s) | `find 1` met, `next 0` missed |
+| experience, money and skill points found, changed and confirmed with moth commands only | all three | all three | met |
+| a write to a recalculated number reported as not held | said in plain words | moth said it held; the game put it back later | missed |
+
+## first scans
+
+| command | bytes scanned | time | s/GiB | matches (main) | lost | unreadable |
+| --- | --- | --- | --- | --- | --- | --- |
+| `find 55` | 4,499,763,200 | 4,547 ms | 1.09 | 1,650,763 | 0 | 0 |
+| `find 55` | 4,516,605,952 | 4,139 ms | 0.98 | 1,702,709 | 0 | 0 |
+| `find 106.98` | 4,516,605,952 | 3,145 ms | 0.75 | 201 | 0 | 0 |
+| `find 1` | 4,524,994,560 | 5,426 ms | 1.29 | 108,976,905 | 0 | 0 |
+| `find 13` | 4,559,269,888 | 5,505 ms | 1.30 | 2,115,579 | 0 | 0 |
+
+## the values
+
+### experience (numbers only)
+
+| step | time | whole number | decimal | all main | lost | unreadable |
+| --- | --- | --- | --- | --- | --- | --- |
+| `find 55` | 4,139 ms | 58,523 | 25,474 | 1,702,709 | 0 | 0 |
+| +5 XP in game, `next 60` | 2,734 ms | 1 | 1 | 63 | 2 | 0 |
+
+- One whole-number match after one change (`0x6c551068`); stage 1 needed two changes and had 55 decimals left after the first.
+- `keep 1 xp`, `set xp 95` (held). The next +5 XP levelled Chris up.
+
+### money (through its neighbour)
+
+- `find 106.98`: 3,145 ms, 201 matches (99 decimal, 5 eight-byte decimal, 81 whole number ×100, 16 ×100 eight-byte).
+- `results --near xp`: 4 rows; the first is `0x6c551078`, 16 bytes after experience, tagged `whole number ×100`.
+- `set 1 200.00` (held), `keep 1 money`. The game showed 200.60 a few minutes later (200.00 plus 0.60 earned).
+
+### skill points (0 and 1)
+
+| step | time | whole number | decimal | all main | lost | unreadable |
+| --- | --- | --- | --- | --- | --- | --- |
+| `find 1` | 5,426 ms | 28,392,975 | 31,429,682 | 108,976,905 | 0 | 0 |
+| point spent, `next 0` | 10,619 ms | 156,231 | 25,374,211 | 32,632,295 | 0 | 0 |
+
+- Stage 1's `find 1` had 635,702,555 main matches, 355 million of them decimals.
+- `results --near xp`: 50 rows; rows 1 to 3 are `0x6c551070`, 8 bytes after experience.
+- `set 1 5` (held), `keep 1 points`. Chris saw five skill points and spent them.
+
+### conceptualization (a recalculated number)
+
+| step | time | whole number | all main | lost | unreadable |
+| --- | --- | --- | --- | --- | --- |
+| `find 13` | 5,505 ms | 226,468 | 2,115,579 | 0 | 0 |
+| shirt off, `next 12` | 3,263 ms | 604 | 1,312 | 0 | 0 |
+| shirt on, `next 13` | 17 ms | 3 | 37 | 0 | 0 |
+
+- `set 3 20` answered `set #3 to 20 (was 13)` with `held` true: a quarter of a second later the value still read 20.
+- Kept as `conc` and set to 20 again. Chris reopened the character sheet: it showed 13, and `moth kept` then read 13.
+- The game recalculates this number when the sheet is opened or clothing changes, not continuously, so a check a moment after the write cannot see it.
+
+## thought cabinet (asked for by Chris during the session)
+
+- The save file shows each thought has a `timeLeft` in minutes. Two were being researched: Advanced Race Theory (100) and Mazovian Socio-Economics (174 at the save).
+- Advanced Race Theory: `find 100` 4,141 ms, main 3,195,734; two game minutes later `next 98` 2,938 ms: 5 whole number; one more minute, `next 97` 29 ms: 1 whole number. `keep 1 art`, `set art 1` (held). The thought completed on the next game minute.
+- Mazovian Socio-Economics: `find 171` 4,578 ms, main 501,429; `results --near art`: nothing within 4 kb; one minute later `next 170` 2,286 ms: 5 whole number. The one in the same region of memory as `art` was kept as `maz` and set to 1 (held). The thought completed on the next game minute.
+- An attempt to work out the addresses from evenly spaced neighbours (an anchor found with `find 1200` and `results --near`) held for two neighbours and no further.
+
+## problems found
+
+1. `next 0` after `find 1` takes 10.6 seconds. The decimal groups are too large to keep their values, so the rule that a value must have moved cannot apply to them, and about 25 million unchanged decimals between 0 and 1 stay in the hunt.
+2. A number the game recalculates only on an event is reported as held. Only a later `moth kept` shows the game put it back; `kept` does not say so.
+3. A value whose number is not on screen (minutes left on a thought, shown only as a percentage) needed the save file for its starting number. Hunting by change alone would cover it.
+4. `results --near` reaches 4 kb. Records of the same kind that the game allocates further apart are not found by it.
+5. `keep` right after a `set` on the same row reports the value from the listing, not the one just written (`kept #1 as money (106.98, ...)` after setting 200.00).
