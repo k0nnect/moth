@@ -972,7 +972,9 @@ let snapshot_too_big () =
   with_daemon sh (fun d ->
       hunt_for_three d f 3;
       Fake_helper.queue_error f "snapshot" { code = "too_big"; message = "4516605952 to snapshot, limit 1073741824" };
-      let msg = "the game has 4.2 gb of memory to snapshot, more than moth's limit of 1.0 gb. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>" in
+      let msg =
+        "the game has 4.2 gb of memory to snapshot, more than moth's limit of 1.0 gb. the limit is set when moth starts: moth stop, then run moth again with MOTH_SNAPSHOT_MB=<mb> (stopping forgets the hunt and the kept values). or hunt with a number: moth find <number>"
+      in
       check_err "too big" msg (call d "snapshot" []);
       check_str "the hunt there was" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
       let log = json (call d "log" [] ~opts:[ ("n", "3") ]) in
@@ -1011,7 +1013,7 @@ let kept_put_back () =
                [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `String "20"); ("put_back", `Bool true) ];
            ])
         (json (call d "kept" []));
-      check_bool "the text line" true (String.ends_with ~suffix:"you set it to 20; the game put it back." (text (call d "kept" []))))
+      check_bool "the text line" true (String.ends_with ~suffix:"you set it to 20; it is back to what it was before." (text (call d "kept" []))))
 
 (* MOTH_SNAPSHOT_MB is read when the daemon starts *)
 let snapshot_cap () =

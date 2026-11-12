@@ -272,7 +272,7 @@ let listing ?near ~all (l : Session.listing) =
   (`Assoc [ ("rows", `List (List.map row l.rows)); ("total", `Int l.total); ("from", `Int l.from) ], Render.listing ?near ~all l)
 
 let kept ks =
-  ( `List (List.map (fun (k : Session.kept) -> 
+  ( `List (List.map (fun (k : Session.kept) ->
          `Assoc
            [
              ("name", `String k.name);

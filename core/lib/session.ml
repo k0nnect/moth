@@ -56,7 +56,7 @@ type t = {
 let create ?budget_mb ?snapshot_mb ?(settle = fun () -> Unix.sleepf 0.25) h =
   { h; budget_mb; snapshot_mb; settle; hunt = None; listing = []; undo = []; named = [] }
 
-let no_hunt = "no hunt in progress. start one with: moth find <number>"
+let no_hunt = "no hunt in progress. start one with: moth find <number>, or with no number: moth snapshot"
 let too_many = "too many matches to compare by change yet. type the new number instead, or start again by change alone: moth snapshot"
 let game_closed = "the game closed. attach again once it's running."
 let helper_lost = "lost contact with moth's helper. attach again."
@@ -217,8 +217,10 @@ let refused_sizes message =
   | [ need; "to"; "snapshot,"; "limit"; limit ] -> ( match (count need, count limit) with Some n, Some l -> Some (n, l) | _ -> None)
   | _ -> None
 
+(* the daemon reads MOTH_SNAPSHOT_MB once, when it starts *)
 let over_limit need limit =
-  Printf.sprintf "the game has %s of memory to snapshot, more than moth's limit of %s. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>"
+  Printf.sprintf
+    "the game has %s of memory to snapshot, more than moth's limit of %s. the limit is set when moth starts: moth stop, then run moth again with MOTH_SNAPSHOT_MB=<mb> (stopping forgets the hunt and the kept values). or hunt with a number: moth find <number>"
     (size need) (size limit)
 
 let no_memory = "moth couldn't get the memory for a snapshot. close something large, or hunt with a number: moth find <number>"

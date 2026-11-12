@@ -28,9 +28,9 @@ val rows : Session.row list -> string
     repeats [--all] and [--near <target>] when given *)
 val listing : ?near:string -> all:bool -> Session.listing -> string
 
-(** one line per kept value: name, value, address, tag; a value the game put back after a write
-    by name ([Session.kept]'s [put_back]) then says what it was set to and that the game put it
-    back *)
+(** one line per kept value: name, value, address, tag; a value that reads as it did before its
+    newest write ([Session.kept]'s [put_back]) then says what it was set to and that it is back
+    to what it was before *)
 val kept : Session.kept list -> string
 
 (** [1234567] is ["1,234,567"] *)

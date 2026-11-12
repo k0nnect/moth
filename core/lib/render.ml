@@ -91,6 +91,7 @@ let kept = function
   | [] -> "nothing kept yet. keep a result with: moth keep <#n> [name]"
   | ks ->
       let cells (k : Session.kept) = [ k.name; k.kshown; Printf.sprintf "0x%Lx" k.kaddr; k.ktag ] in
-      (* a value the game put back after a set by name says so after its tag *)
-      let put_back (k : Session.kept) = match k.set_to with Some v when k.put_back -> Printf.sprintf "  you set it to %s; the game put it back." v | _ -> "" in
+      (* a value that reads as it did before its newest write says so after its tag: a fact, not
+         a cause, since play can bring a value back as well as the game working it out again *)
+      let put_back (k : Session.kept) = match k.set_to with Some v when k.put_back -> Printf.sprintf "  you set it to %s; it is back to what it was before." v | _ -> "" in
       String.concat "\n" (List.map2 (fun line k -> line ^ put_back k) (table_lines (List.map cells ks)) ks)

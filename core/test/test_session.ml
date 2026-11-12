@@ -38,7 +38,7 @@ let stats ?(bytes = 0) ?(lost = 0) ?(unreadable = 0) ms = { zero_stats with byte
 let ids_of (o : Session.outcome) = List.map (fun ((g : group_info), _) -> g.id) o.groups
 let fell_back (o : Session.outcome) = List.exists (function Session.Fell_back _ -> true | _ -> false) o.notes
 let closed = "the game closed. attach again once it's running."
-let no_hunt = "no hunt in progress. start one with: moth find <number>"
+let no_hunt = "no hunt in progress. start one with: moth find <number>, or with no number: moth snapshot"
 let gone : err = { code = "target_gone"; message = "" }
 
 let find_sends_plan () =
@@ -1199,7 +1199,7 @@ let a_snapshot_too_big () =
   let before = Session.current s in
   queue_error f "snapshot" { code = "too_big"; message = "4516605952 to snapshot, limit 1073741824" };
   check_err "the two sizes"
-    "the game has 4.2 gb of memory to snapshot, more than moth's limit of 1.0 gb. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>"
+    "the game has 4.2 gb of memory to snapshot, more than moth's limit of 1.0 gb. the limit is set when moth starts: moth stop, then run moth again with MOTH_SNAPSHOT_MB=<mb> (stopping forgets the hunt and the kept values). or hunt with a number: moth find <number>"
     (Session.snapshot s);
   check_bool "the hunt is still there" true (before <> None && Session.current s = before);
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
@@ -1210,7 +1210,8 @@ let a_snapshot_too_big () =
   (* no hunt before: none after *)
   let s, f = fresh () in
   queue_error f "snapshot" { code = "too_big"; message = "20000000 to snapshot, limit 16777216" };
-  check_err "small sizes" "the game has 19 mb of memory to snapshot, more than moth's limit of 16 mb. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>"
+  check_err "small sizes"
+    "the game has 19 mb of memory to snapshot, more than moth's limit of 16 mb. the limit is set when moth starts: moth stop, then run moth again with MOTH_SNAPSHOT_MB=<mb> (stopping forgets the hunt and the kept values). or hunt with a number: moth find <number>"
     (Session.snapshot s);
   check_bool "no hunt" true (Session.current s = None)
 
@@ -1419,7 +1420,7 @@ let a_kept_value_the_game_put_back () =
   let k = List.hd (ok (Session.kept s)) in
   check_bool "put back" true k.put_back;
   let line = Render.kept [ k ] in
-  check_bool "line says so" true (String.ends_with ~suffix:"you set it to 20; the game put it back." line);
+  check_bool "line says so" true (String.ends_with ~suffix:"you set it to 20; it is back to what it was before." line);
   check_bool "and still starts with the name" true (String.starts_with ~prefix:"conc" line)
 
 (* the game moved on from the value written: not put back. Undoing the write forgets it. *)

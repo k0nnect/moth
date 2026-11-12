@@ -137,11 +137,12 @@ let kept () =
        ]);
   check_str "none" "nothing kept yet. keep a result with: moth keep <#n> [name]" (Render.kept [])
 
-(* a value the game put back after a set by name says so after its tag; other lines are as before *)
+(* R14: a value that reads as it did before its newest write says so after its tag; other lines are
+   as before *)
 let kept_put_back () =
   let k ?set_to ?(put_back = false) name kshown : Session.kept = { name; kaddr = 0x10L; ktag = "whole number"; kshown; set_to; put_back } in
   check_str "put back"
-    "xp    95  0x10  whole number\nconc  13  0x10  whole number  you set it to 20; the game put it back.\nhp    30  0x10  whole number"
+    "xp    95  0x10  whole number\nconc  13  0x10  whole number  you set it to 20; it is back to what it was before.\nhp    30  0x10  whole number"
     (Render.kept [ k "xp" "95"; k ~set_to:"20" ~put_back:true "conc" "13"; k ~set_to:"30" "hp" "30" ])
 
 (* a snapshot's line takes the counts line's place; the unreadable line and the notes follow *)
