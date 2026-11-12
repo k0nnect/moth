@@ -35,7 +35,7 @@ struct ScanStats {
 
 struct EngineConfig {
   uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed once a scan ends
-  uint64_t value_cap = 2'000'000;         // a group keeps values only while it has at most this many positions
+  uint64_t value_cap = 64'000'000;        // a group keeps values only while it has at most this many positions
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
   unsigned workers = 1;                   // threads searching a scan's blocks; 0: hardware threads - 1, from 1 to 8
 };
@@ -116,14 +116,36 @@ class Engine {
   uint64_t peak_raw_offsets() const { return peak_raw_offsets_; }
 
  private:
+  // Values in position order, each in as many bytes as its type is wide, packed one after
+  // another, little-endian (the host's order), so none needs aligning. A moved-from one is empty.
+  class Values {
+   public:
+    explicit Values(size_t width) : width_(width) {}
+    Values(Values&& o) noexcept : width_(o.width_) { *this = std::move(o); }
+    Values& operator=(Values&& o) noexcept;
+    uint64_t get(uint64_t i) const;       // value i in the low bytes, the rest 0
+    void set(uint64_t i, uint64_t bits);  // stores bits' low bytes as value i
+    void append(const uint8_t* p);        // appends the value whose bytes start at p
+    void clear();                         // removes every value and frees their memory
+    void shrink_to_fit();                 // gives back the room beyond the values
+    uint64_t bytes() const { return bytes_.capacity(); }  // heap held
+
+   private:
+    void grow();  // doubles the room
+
+    size_t width_;
+    size_t used_ = 0;              // the values are bytes_[0, used_); the rest is room to append
+    std::vector<uint8_t> bytes_;
+  };
+
   struct Group {
     GroupSpec spec;
     PositionSet positions;
-    std::vector<uint64_t> values;  // last-seen values in position order, while has_values
+    Values values;  // last-seen values in position order, while has_values
     uint64_t count = 0;
     bool tracked = true;
     bool has_values = true;
-    explicit Group(GroupSpec s) : spec(std::move(s)), positions(spec.align) {}
+    explicit Group(GroupSpec s) : spec(std::move(s)), positions(spec.align), values(width_of(spec.type)) {}
   };
 
   static GroupInfo info(const Group& g);

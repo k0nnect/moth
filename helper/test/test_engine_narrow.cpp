@@ -1,3 +1,4 @@
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,56 @@ TEST_CASE("moved needs stored values and cannot start a scan") {
   CHECK_THROWS_WITH_AS(e.scan({G("a", I32, 4, 0, p)}, false, s), doctest::Contains("bad_request"), EngineError);
   e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
   CHECK_THROWS_WITH_AS(e.narrow({{"a", p}}, true, g, s), doctest::Contains("no_values"), EngineError);
+}
+
+namespace {
+
+// One type's stored values through a scan, a moved narrow, relation narrows and a write. Three
+// places hold start; then the first goes up and the second down. Needs written < down < start < up.
+template <class T> void stored_values_hold(ValueType t, T start, T up, T down, T written) {
+  FakeMemory m; m.add_region(0x10000, 4096); for (int i = 0; i < 3; i++) m.poke<T>(0x10000 + i * 16, start);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g; uint64_t prev = 0;
+  auto sc = e.scan({G("v", t, sizeof(T), 0, eq(bits(start)))}, false, s);
+  REQUIRE(sc[0].count == 3); REQUIRE(sc[0].has_values);
+  m.poke<T>(0x10000, up); m.poke<T>(0x10010, down);
+  Pred moved = range(-1e9, 1e9); moved.moved = true;
+  CHECK(e.narrow({{"v", moved}}, true, g, s)); CHECK(g[0].count == 2);             // the third still holds start
+  CHECK(e.narrow({{"v", {Pred::EqPrev}}}, true, g, s)); CHECK(g[0].count == 2);   // up and down were stored
+  REQUIRE(e.write_value(0x10010, t, bits(written), prev)); CHECK(prev == bits(down));
+  CHECK(m.peek<T>(0x10010) == written);
+  m.poke<T>(0x10000, down);                                             // down from up; the second holds what was written
+  CHECK(e.narrow({{"v", {Pred::LtPrev}}}, true, g, s)); CHECK(g[0].count == 1);
+  CHECK(e.peek("v", 0, 9)[0].addr == 0x10000);
+}
+
+}  // namespace
+
+TEST_CASE("stored values of every width hold through a scan, a narrow and a write") {
+  SUBCASE("u8") { stored_values_hold<uint8_t>(U8, 200, 250, 7, 3); }
+  SUBCASE("i16") { stored_values_hold<int16_t>(I16, -300, -2, -30000, -30001); }
+  SUBCASE("f32") { stored_values_hold<float>(F32, 100.0f, std::nextafter(100.0f, 200.0f), -0.5f, -1e30f); }
+  SUBCASE("f64") { stored_values_hold<double>(F64, 100.0, std::nextafter(100.0, 200.0), -0.5, -1e300); }
+}
+TEST_CASE("a group over value_cap has no values at any width until a narrow brings it under") {
+  // each place in its own block: values are stored for the first two and dropped at the third
+  FakeMemory m; three(m); ScanStats s; std::vector<GroupInfo> g;
+  const std::vector<GroupSpec> gs = {G("b", U8, 1, 0, eq(100)), G("h", I16, 2, 0, eq(100)),
+                                     G("a", I32, 4, 0, eq(100)), G("q", I64, 8, 0, eq(100))};
+  Engine e(m, {.value_cap = 2, .block_size = 16}), none(m, {.value_cap = 0, .block_size = 16});
+  for (const GroupInfo& i : e.scan(gs, false, s)) { CHECK(i.count == 3); CHECK(i.tracked); CHECK_FALSE(i.has_values); }
+  none.scan(gs, false, s); CHECK(e.storage_bytes() == none.storage_bytes());   // the dropped values are freed
+  Pred moved = range(99, 101); moved.moved = true;
+  for (const GroupSpec& sp : gs) {
+    CHECK_THROWS_WITH_AS(e.narrow({{sp.id, {Pred::LtPrev}}}, true, g, s), doctest::Contains("no_values"), EngineError);
+    CHECK_THROWS_WITH_AS(e.narrow({{sp.id, moved}}, true, g, s), doctest::Contains("no_values"), EngineError);
+  }
+  m.poke<int32_t>(0x10000, 85);
+  CHECK(e.narrow({{"b", eq(100)}, {"h", eq(100)}, {"a", eq(100)}, {"q", eq(100)}}, true, g, s));
+  for (const GroupInfo& i : g) { CHECK(i.count == 2); CHECK(i.has_values); }
+  m.poke<int32_t>(0x10010, 60);
+  CHECK(e.narrow({{"b", {Pred::LtPrev}}, {"h", {Pred::LtPrev}}, {"a", {Pred::LtPrev}}, {"q", {Pred::LtPrev}}}, true, g, s));
+  for (const GroupInfo& i : g) CHECK(i.count == 1);
+  for (const GroupSpec& sp : gs) CHECK(e.peek(sp.id, 0, 9)[0].addr == 0x10010);
 }
 TEST_CASE("freed memory loses candidates instead of failing") {
   FakeMemory m; three(m); m.add_region(0x50000, 4096); m.poke<int32_t>(0x50000, 100);
@@ -232,7 +283,7 @@ TEST_CASE("gained values that would pass the budget are not kept") {
   auto sc = e.scan({G("a", I32, 4, 0, eq(0))}, false, s);
   REQUIRE(sc[0].tracked); REQUIRE_FALSE(sc[0].has_values);
   for (int i = 500; i < 1024; i++) m.poke<int32_t>(0x10000 + i * 4, 1);
-  CHECK(e.narrow({{"a", eq(0)}}, true, g, s));                          // 500 left: 4000 bytes of values
+  CHECK(e.narrow({{"a", eq(0)}}, true, g, s));                          // 500 left: 2000 bytes of values
   CHECK(g[0].count == 500); CHECK(g[0].tracked); CHECK_FALSE(g[0].has_values); CHECK(e.storage_bytes() <= 1000);
   CHECK_THROWS_WITH_AS(e.narrow({{"a", {Pred::LtPrev}}}, true, g, s), doctest::Contains("no_values"), EngineError);
 }

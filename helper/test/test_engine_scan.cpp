@@ -109,6 +109,19 @@ TEST_CASE("values are kept only up to value_cap") {
   Engine e(m, {.value_cap = 4}); ScanStats s; auto g = e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
   CHECK(g[0].count == 5); CHECK(g[0].tracked); CHECK_FALSE(g[0].has_values);
 }
+TEST_CASE("a group of two million floats keeps its values, four bytes each") {
+  const uint64_t base = 0x100000, size = 8u << 20;
+  FakeMemory m; m.add_region(base, size);
+  for (uint64_t a = base; a < base + size; a += 4) m.poke<float>(a, 0.5f);   // 2,097,152 floats
+  m.poke<float>(base, 1.0f);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g;
+  auto info = e.scan({G("f", F32, 4, 0, range_floor(0, 2, 1e-6))}, false, s);
+  CHECK(info[0].count == 2097152); CHECK(info[0].has_values);      // over the old cap of 2,000,000
+  CHECK(e.storage_bytes() < (12u << 20));                           // four bytes a value, not eight
+  m.poke<float>(base, 0.25f);
+  Pred p = range_floor(-1, 1, 1e-6); p.moved = true;
+  CHECK(e.narrow({{"f", p}}, true, g, s)); CHECK(g[0].count == 1); CHECK(e.peek("f", 0, 9)[0].addr == base);
+}
 TEST_CASE("dense group is stored as a bitmap") {
   FakeMemory m; m.add_region(0x100000, 1 << 20);                       // 1 MiB of zeros
   Engine e(m, {.value_cap = 0}); ScanStats s; auto g = e.scan({G("z", U8, 1, 0, eq(0))}, false, s);
@@ -227,7 +240,7 @@ TEST_CASE("stats split readable and unreadable bytes") {
 TEST_CASE("stored values count toward the budget") {
   FakeMemory m; m.add_region(0x10000, 4096);                            // 1024 aligned i32 zeros
   ScanStats s;
-  Engine with(m, {.budget_bytes = 4096});                               // values alone are 8 KiB
+  Engine with(m, {.budget_bytes = 4096});                               // values alone take all 4 KiB
   auto g = with.scan({G("a", I32, 4, 0, eq(0))}, false, s);
   CHECK_FALSE(g[0].tracked); CHECK_FALSE(g[0].has_values); CHECK(g[0].count == 1024);
   CHECK(with.storage_bytes() == 0); CHECK(with.peek("a", 0, 10).empty());
@@ -235,12 +248,12 @@ TEST_CASE("stored values count toward the budget") {
   CHECK(without.scan({G("a", I32, 4, 0, eq(0))}, false, s)[0].tracked);
 }
 TEST_CASE("values dropped later in the scan do not untrack a group early") {
-  // block one: 800 zeros, enough values to pass the budget; block two takes the count past
-  // value_cap, the values go, and the group fits again
+  // block one: 800 zeros, enough values (3200 bytes) to pass the budget; block two takes the
+  // count past value_cap, the values go, and the group fits again
   FakeMemory m; m.add_region(0x10000, 8192);
   for (int i = 800; i < 1024; i++) m.poke<int32_t>(0x10000 + i * 4, 1);
   for (int i = 300; i < 1024; i++) m.poke<int32_t>(0x11000 + i * 4, 1);
-  Engine e(m, {.budget_bytes = 5000, .value_cap = 1000, .block_size = 4096}); ScanStats s;
+  Engine e(m, {.budget_bytes = 3000, .value_cap = 1000, .block_size = 4096}); ScanStats s;
   auto g = e.scan({G("a", I32, 4, 0, eq(0))}, false, s);
   CHECK(g[0].count == 1100); CHECK(g[0].tracked); CHECK_FALSE(g[0].has_values);
 }

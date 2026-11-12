@@ -336,7 +336,56 @@ class Searchers {
   std::vector<std::thread> threads_;
 };
 
+// Copies one value of w bytes (1, 2, 4 or 8). Each width is a copy of a fixed size, which is a
+// plain load and store; a copy of a variable size would be a call.
+void copy_value(void* to, const void* from, size_t w) {
+  switch (w) {
+    case 1: std::memcpy(to, from, 1); return;
+    case 2: std::memcpy(to, from, 2); return;
+    case 4: std::memcpy(to, from, 4); return;
+    default: std::memcpy(to, from, 8); return;
+  }
+}
+
 }  // namespace
+
+Engine::Values& Engine::Values::operator=(Values&& o) noexcept {
+  if (this == &o) return *this;
+  width_ = o.width_;
+  used_ = std::exchange(o.used_, 0);
+  bytes_ = std::move(o.bytes_);
+  o.bytes_.clear();
+  return *this;
+}
+
+uint64_t Engine::Values::get(uint64_t i) const {
+  uint64_t bits = 0;
+  copy_value(&bits, bytes_.data() + static_cast<size_t>(i) * width_, width_);  // little-endian host
+  return bits;
+}
+
+void Engine::Values::set(uint64_t i, uint64_t bits) {
+  copy_value(bytes_.data() + static_cast<size_t>(i) * width_, &bits, width_);  // little-endian host
+}
+
+// Growing is rare (the room doubles), and kept out of line so an append stays a few instructions.
+void Engine::Values::append(const uint8_t* p) {
+  if (bytes_.size() - used_ < width_) [[unlikely]] grow();
+  copy_value(bytes_.data() + used_, p, width_);
+  used_ += width_;
+}
+
+void Engine::Values::grow() { bytes_.resize(std::max(2 * bytes_.size(), used_ + width_)); }
+
+void Engine::Values::clear() {
+  std::vector<uint8_t>().swap(bytes_);
+  used_ = 0;
+}
+
+void Engine::Values::shrink_to_fit() {
+  bytes_.resize(used_);
+  bytes_.shrink_to_fit();
+}
 
 Engine::Engine(ProcessMemory& mem, EngineConfig cfg) : mem_(mem), cfg_(cfg), workers_(resolve_workers(cfg.workers)) {
   if (cfg_.block_size == 0 || cfg_.block_size > (size_t{1} << 30))
@@ -422,17 +471,10 @@ void Engine::add_found(Group& g, PositionSet::Block b, const uint8_t* data) {
   g.count += b.count;
   if (!g.tracked) return;
   if (g.has_values && g.count > cfg_.value_cap) {
-    std::vector<uint64_t>().swap(g.values);
+    g.values.clear();
     g.has_values = false;
   }
-  if (g.has_values) {
-    const size_t w = width_of(g.spec.type);
-    g.positions.for_each_in(b, [&](uint32_t o) {
-      uint64_t v = 0;
-      std::memcpy(&v, data + o, w);  // little-endian host
-      g.values.push_back(v);
-    });
-  }
+  if (g.has_values) g.positions.for_each_in(b, [&](uint32_t o) { g.values.append(data + o); });
   g.positions.append(std::move(b));
 }
 
@@ -618,7 +660,7 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
       size_t r = 0, k = 0;
       g.positions.for_each_in(b, [&](uint32_t o) {
         while (runs[r].last < o) r++;  // every position is in a run; other lanes' runs are skipped
-        const uint64_t prev = g.has_values ? g.values[static_cast<size_t>(lane.index)] : 0;
+        const uint64_t prev = g.has_values ? g.values.get(lane.index) : 0;
         lane.index++;
         const size_t x = runs[r].at + (o - runs[r].first);  // the value's bytes in the buffer
         if (!runs[r].whole) {
@@ -635,11 +677,11 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
         out.count++;
         if (!out.has_values) return;
         if (out.count > cfg_.value_cap) {
-          std::vector<uint64_t>().swap(out.values);
+          out.values.clear();
           out.has_values = false;
           return;
         }
-        out.values.push_back(cur);
+        out.values.append(data + x);
       });
       out.positions.append(keep.finish());
     }
@@ -662,12 +704,12 @@ void Engine::fit_gained_values(std::vector<Group>& fresh, const std::vector<size
     total = total - bytes_of(groups_[at[i]]) + (gains(i) ? fresh[i].positions.bytes() : bytes_of(fresh[i]));
   for (size_t i = 0; i < fresh.size(); i++) {
     if (!gains(i)) continue;
-    const uint64_t v = fresh[i].values.capacity() * sizeof(uint64_t);
+    const uint64_t v = fresh[i].values.bytes();
     if (total + v <= cfg_.budget_bytes) {
       total += v;
       continue;
     }
-    std::vector<uint64_t>().swap(fresh[i].values);
+    fresh[i].values.clear();
     fresh[i].has_values = false;
   }
 }
@@ -693,10 +735,9 @@ bool Engine::write_value(uint64_t addr, ValueType type, uint64_t bits, uint64_t&
   if (!mem_.write(addr, &bits, w)) return false;  // the low bytes, little-endian host
   prev_bits = prev;
   // what was written is now the last value seen there, for every group that reads those bytes
-  const uint64_t seen = w == 8 ? bits : bits & ((uint64_t{1} << (8 * w)) - 1);
   for (Group& g : groups_) {
     uint64_t i = 0;
-    if (g.has_values && width_of(g.spec.type) == w && g.positions.index_of(addr, i)) g.values[static_cast<size_t>(i)] = seen;
+    if (g.has_values && width_of(g.spec.type) == w && g.positions.index_of(addr, i)) g.values.set(i, bits);
   }
   return true;
 }
@@ -716,11 +757,11 @@ uint64_t Engine::storage_bytes() const {
 
 GroupInfo Engine::info(const Group& g) { return {g.spec.id, g.count, g.tracked, g.has_values}; }
 
-uint64_t Engine::bytes_of(const Group& g) { return g.positions.bytes() + g.values.capacity() * sizeof(uint64_t); }
+uint64_t Engine::bytes_of(const Group& g) { return g.positions.bytes() + g.values.bytes(); }
 
 void Engine::untrack(Group& g) {
   g.positions = PositionSet(g.spec.align);
-  std::vector<uint64_t>().swap(g.values);
+  g.values.clear();
   g.tracked = false;
   g.has_values = false;
 }
