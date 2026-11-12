@@ -23,7 +23,7 @@ type kept = { name : string; kaddr : int64; ktag : string; kshown : string }
 type group = { interp : Interp.t; info : group_info }
 
 (* current: the hunt's groups in plan order. last: the last number typed that applied, which the
-   helper's stored values hold; None after a relation step moved them on. *)
+   helper's stored values hold; None after a relation step (a fallback is one) moved them on. *)
 type hunt = { current : group list; last : Value.t option }
 
 (* a row of the latest listing, which set and keep_row take by its number *)
@@ -146,6 +146,9 @@ let relation_between (m : Value.t) (last : Value.t) =
   let c = match (m, last) with Int a, Int b -> Int64.compare a b | _ -> Float.compare (Value.to_float m) (Value.to_float last) in
   if c < 0 then Down else if c > 0 then Up else Same
 
+(* range [a] lies within range [b] *)
+let within (a : range) (b : range) = b.lo <= a.lo && a.hi <= b.hi
+
 let narrow t tl items =
   if items = [] then (false, [])
   else
@@ -197,12 +200,19 @@ let next_number t text =
               let tl = tally () in
               let pred g = Interp.pred_for g.interp m in
               let fits g = pred g <> None in
-              (* when the number changed, a float reading must have moved too, or a decimal lying
-                 between the two numbers stays; only a group with stored values can tell *)
-              let moved = match hunt.last with Some last -> relation_between m last <> Same | None -> false in
-              let exact g =
-                match pred g with Some (Range r) when moved && g.info.has_values -> Some (Range { r with moved = true }) | p -> p
+              (* when the ranges the two numbers give a float reading overlap only in part, or not
+                 at all, the value must have moved too, or a decimal lying between the two numbers
+                 stays. A range that holds the other is a more (or less) exact number for the same
+                 value, which need not have moved. Only a group with stored values can tell. *)
+              let moved g =
+                match hunt.last with
+                | Some last when g.info.has_values -> (
+                    match (pred g, Interp.pred_for g.interp last) with
+                    | Some (Range a), Some (Range b) -> not (within a b || within b a)
+                    | _ -> false)
+                | _ -> false
               in
+              let exact g = match pred g with Some (Range r) when moved g -> Some (Range { r with moved = true }) | p -> p in
               (* the exact number in the tracked groups, all or nothing *)
               let applied, narrowed =
                 narrow t tl
@@ -217,19 +227,20 @@ let next_number t text =
                   add tl st;
                   infos
               in
-              (* keep the groups [keep] picks, with their new counts; the rest leave the helper *)
-              let finish ?fell_back keep infos =
+              (* keep the groups [keep] picks, with their new counts; the rest leave the helper.
+                 [last]: the number the stored values now hold, if any *)
+              let finish ?fell_back ~last keep infos =
                 let current = List.map (updated infos) (List.filter keep hunt.current) in
-                commit t current (Some m);
+                commit t current last;
                 let gone = List.filter_map (fun g -> if keep g then None else Some g.info.id) hunt.current in
                 if gone <> [] then call (t.h.drop gone);
                 Ok (outcome_of ?fell_back tl current)
               in
-              if applied then finish fits (narrowed @ rescanned)
+              if applied then finish ~last:(Some m) fits (narrowed @ rescanned)
               else if List.exists (fun (i : group_info) -> i.tracked && i.count > 0) rescanned then
                 (* only the rescan matched: the old tracked groups are out. A rescan that came back
                    untracked again holds only a count of how common the number is, not a match. *)
-                finish (fun g -> fits g && not g.info.tracked) rescanned
+                finish ~last:(Some m) (fun g -> fits g && not g.info.tracked) rescanned
               else
                 match hunt.last with
                 | None ->
@@ -240,7 +251,9 @@ let next_number t text =
                     let applied, narrowed =
                       narrow t tl (List.filter_map (fun g -> if fits g && comparable g then Some (g.info.id, pred_of_relation r) else None) hunt.current)
                     in
-                    if applied then finish ~fell_back:r fits (narrowed @ rescanned) else Ok (outcome_of ~dead_end:true tl hunt.current)))
+                    (* a fallback is a relation step: the stored values hold what it read, not the
+                       number typed, so it clears the baseline as next_relation does *)
+                    if applied then finish ~fell_back:r ~last:None fits (narrowed @ rescanned) else Ok (outcome_of ~dead_end:true tl hunt.current)))
 
 let next_relation t r =
   match t.hunt with

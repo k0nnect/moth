@@ -47,10 +47,12 @@ val create : ?budget_mb:int -> ?settle:(unit -> unit) -> Helper_api.helper -> t
 (** starts a new hunt. A scan that fails ends the hunt there was. *)
 val find : t -> string -> (outcome, string) result
 
-(** narrows to the number typed. When it differs from the last number typed, a float reading in
-    a group with stored values must also have moved. With no exact match it falls back on the
-    direction the number moved from the last number typed, unless a relation step, a set or an
-    undo came since; then it is a dead end. *)
+(** narrows to the number typed. A float reading in a group with stored values must also have
+    moved when the ranges this number and the last number typed give it overlap only in part, or
+    not at all; when one range holds the other (5 and 5.3), it need not. With no exact match it
+    falls back on the direction the number moved from the last number typed, unless a relation
+    step, a fallback, a set or an undo came since; then it is a dead end. A fallback is a relation
+    step: after it there is no last number typed. *)
 val next_number : t -> string -> (outcome, string) result
 
 val next_relation : t -> relation -> (outcome, string) result

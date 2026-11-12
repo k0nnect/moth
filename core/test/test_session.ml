@@ -84,12 +84,21 @@ let fallback_and_dead_end () =
   check_bool "atomic" true (last_narrow_atomic f);
   check_int "main" 4 o.main;
   check_int "exact, then relation" 2 (narrow_calls f);
-  (* dead end leaves the hunt as it was *)
-  queue_narrow f ~applied:false [];
+  (* a fallback is a relation step, so no number is the baseline after it: no exact match is a
+     dead end, which leaves the hunt as it was *)
   queue_narrow f ~applied:false [];
   let o = ok (Session.next_number s "12345") in
   check_bool "dead end" true o.dead_end;
   check_int "unchanged" 4 o.main;
+  check_int "no fallback after a fallback" 3 (narrow_calls f);
+  (* a number that applies is the baseline again; a dead end leaves it as it was *)
+  queue_narrow f ~applied:true [ gi "i32" 3; gi "f32" 0 ];
+  ignore (ok (Session.next_number s "60"));
+  queue_narrow f ~applied:false [];
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "12345") in
+  check_bool "dead end" true o.dead_end;
+  check_int "unchanged" 3 o.main;
   check_ids "empty groups are not compared" [ "i32" ] (last_narrow_ids f);
   (* the fallback compares with 60, the last number that applied *)
   queue_narrow f ~applied:false [];
@@ -98,6 +107,8 @@ let fallback_and_dead_end () =
   check_bool "went up" true (List.mem (Session.Fell_back Up) o.notes);
   check_pred "compared with 60" Gt_prev (last_narrow_pred f "i32");
   check_int "main" 2 o.main;
+  queue_narrow f ~applied:true [ gi "i32" 2 ];
+  ignore (ok (Session.next_number s "70"));
   queue_narrow f ~applied:false [];
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   let o = ok (Session.next_number s "70") in
@@ -372,18 +383,14 @@ let relation_clears_the_baseline () =
   (* a number that applies is the baseline again *)
   queue_narrow f ~applied:true [ gi "i32" 5 ];
   ignore (ok (Session.next_number s "90"));
-  queue_narrow f ~applied:false [];
-  queue_narrow f ~applied:true [ gi "i32" 2 ];
-  let o = ok (Session.next_number s "85") in
-  check_bool "fell back" true (List.mem (Session.Fell_back Down) o.notes);
-  check_pred "compared with 90" Lt_prev (last_narrow_pred f "i32");
   (* a relation step that is a dead end changes nothing, so the baseline stays *)
   queue_narrow f ~applied:false [];
   check_bool "relation dead end" true (ok (Session.next_relation s Up)).dead_end;
   queue_narrow f ~applied:false [];
-  queue_narrow f ~applied:true [ gi "i32" 1 ];
-  let o = ok (Session.next_number s "99") in
-  check_bool "fell back up from 85" true (List.mem (Session.Fell_back Up) o.notes)
+  queue_narrow f ~applied:true [ gi "i32" 2 ];
+  let o = ok (Session.next_number s "85") in
+  check_bool "fell back" true (List.mem (Session.Fell_back Down) o.notes);
+  check_pred "compared with 90" Lt_prev (last_narrow_pred f "i32")
 
 let hunt_lost = "the hunt was lost. start again with: moth find <number>"
 
@@ -527,6 +534,65 @@ let no_baseline_nothing_moved () =
   queue_narrow f ~applied:true [ gi "f32" 1 ];
   ignore (ok (Session.next_number s "7"));
   check_pred "after a set" (Range { lo = 6.; hi = 8.; floor = 1e-6; moved = false }) (last_narrow_pred f "f32")
+
+(* R12: a fallback is a relation step. The stored values hold what it read, not the number typed,
+   so the right number after a mistyped one is not asked to have moved *)
+let past_a_fallback () =
+  let s, f = fresh () in
+  queue_scan f [ gi "f32" 1 ];
+  ignore (ok (Session.find s "5"));
+  queue_narrow f ~applied:false [];
+  queue_narrow f ~applied:true [ gi "f32" 1 ];
+  check_bool "fell back up" true (List.mem (Session.Fell_back Up) (ok (Session.next_number s "7")).notes);
+  queue_narrow f ~applied:true [ gi "f32" 1 ];
+  let o = ok (Session.next_number s "6") in
+  check_pred "the right number, not asked to have moved" (Range { lo = 5.; hi = 7.; floor = 1e-6; moved = false }) (last_narrow_pred f "f32");
+  check_int "it applies" 1 o.main;
+  check_bool "no fallback" false (fell_back o);
+  check_int "one narrow for it" 3 (narrow_calls f)
+
+(* and with no baseline, a number with no exact match after a fallback is a dead end, not a
+   second guess *)
+let no_second_guess_after_a_fallback () =
+  let s, f = fresh () in
+  queue_scan f [ gi "f32" 1; gi "i32" 2 ];
+  ignore (ok (Session.find s "5"));
+  queue_narrow f ~applied:false [];
+  queue_narrow f ~applied:true [ gi "f32" 1; gi "i32" 1 ];
+  ignore (ok (Session.next_number s "7"));
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "9") in
+  check_bool "dead end" true o.dead_end;
+  check_int "exactly one narrow for it" 3 (narrow_calls f);
+  check_pred "only the exact number" (Eq 9L) (last_narrow_pred f "i32");
+  check_int "unchanged" 2 o.main
+
+(* R13: moved is asked for only when the ranges the two numbers give a group overlap in part or
+   not at all; a range that holds the other is a more (or less) exact number for the same value *)
+let a_more_exact_number_is_not_a_move () =
+  let moved f id = match last_narrow_pred f id with Range r -> r.moved | p -> Alcotest.failf "%s is not a range: %s" id (show_pred p) in
+  let s, f = fresh () in
+  queue_scan f [ gi "f32" 2; gi "f32pct" 2 ];
+  ignore (ok (Session.find s "5"));
+  queue_narrow f ~applied:true [ gi "f32" 1; gi "f32pct" 1 ];
+  ignore (ok (Session.next_number s "5.3"));
+  check_bool "5 then 5.3" false (moved f "f32");
+  check_bool "5 then 5.3, the ÷100 reading" false (moved f "f32pct");
+  queue_narrow f ~applied:true [ gi "f32" 1; gi "f32pct" 1 ];
+  ignore (ok (Session.next_number s "5"));
+  check_bool "5.3 then 5" false (moved f "f32");
+  check_bool "5.3 then 5, the ÷100 reading" false (moved f "f32pct");
+  queue_narrow f ~applied:true [ gi "f32" 1; gi "f32pct" 1 ];
+  ignore (ok (Session.next_number s "6"));
+  check_pred "5 then 6" (Range { lo = 5.; hi = 7.; floor = 1e-6; moved = true }) (last_narrow_pred f "f32");
+  check_bool "5 then 6, the ÷100 reading" true (moved f "f32pct");
+  (* a find for 5.3, then 5 *)
+  let s, f = fresh () in
+  queue_scan f [ gi "f32" 2 ];
+  ignore (ok (Session.find s "5.3"));
+  queue_narrow f ~applied:true [ gi "f32" 1 ];
+  ignore (ok (Session.next_number s "5"));
+  check_pred "found as 5.3, then 5" (Range { lo = 4.; hi = 6.; floor = 1e-6; moved = false }) (last_narrow_pred f "f32")
 
 let a_write_the_game_puts_back () =
   let h, f = Fake_helper.create () in
@@ -939,6 +1005,9 @@ let () =
           t "current" current;
           t "a new number asks floats to have moved" new_number_asks_floats_to_have_moved;
           t "no baseline, nothing moved" no_baseline_nothing_moved;
+          t "past a fallback" past_a_fallback;
+          t "no second guess after a fallback" no_second_guess_after_a_fallback;
+          t "a more exact number is not a move" a_more_exact_number_is_not_a_move;
           t "a set or undo clears the baseline" a_set_or_undo_clears_the_baseline;
           t "scans carry the budget" scans_carry_the_budget;
         ] );
