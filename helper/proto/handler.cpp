@@ -248,8 +248,9 @@ struct Handler::Impl {
   std::unique_ptr<ProcessMemory> mem;  // declared before engine: the engine refers to it
   std::unique_ptr<Engine> eng;
   std::map<std::string, ValueType> types;  // type of every group the engine holds
+  uint64_t snap_cap_bytes;                 // the engine's snapshot limit now
 
-  Impl(Platform& p, EngineConfig c) : plat(p), cfg(c) {}
+  Impl(Platform& p, EngineConfig c) : plat(p), cfg(c), snap_cap_bytes(c.snapshot_cap_bytes) {}
 
   void detach() {
     eng.reset();
@@ -291,6 +292,7 @@ struct Handler::Impl {
       auto m = plat.open(pid, info);
       mem = std::move(m);
       eng = std::make_unique<Engine>(*mem, cfg);
+      snap_cap_bytes = cfg.snapshot_cap_bytes;
       proc = info;
       attached = true;
       r["pid"] = proc.pid;
@@ -306,6 +308,8 @@ struct Handler::Impl {
       r["groups"] = live ? infos_json(eng->groups()) : json::array();
     } else if (op == "scan") {
       scan(req, r);
+    } else if (op == "snapshot") {
+      snapshot(req, r);
     } else if (op == "narrow") {
       narrow(req, r);
     } else if (op == "drop") {
@@ -393,6 +397,56 @@ struct Handler::Impl {
       throw;
     }
     if (!keep) types.clear();
+    for (const auto& s : specs) types[s.id] = s.type;
+    sync_types();
+    r["groups"] = infos_json(out);
+    r["stats"] = stats_json(st);
+  }
+
+  // Starts a hunt like a keep:false scan: replaces every group, and follows the same budget_mb rule.
+  // cap_mb sets the snapshot limit for this and later snapshots. Everything is checked before
+  // anything is changed.
+  void snapshot(const json& req, json& r) {
+    need_attached();
+    const json& gs = get_arr(req, "groups");
+    if (gs.empty()) bad("\"groups\" must list at least one group");
+    std::vector<SnapSpec> specs;
+    for (const json& g : gs) {
+      if (!g.is_object()) bad("each group must be an object");
+      if (g.contains("pred")) bad("a snapshot group has no \"pred\"");
+      const ValueType t = get_type(g);
+      const uint64_t align = get_uint(g, "align");
+      if (align > std::numeric_limits<uint32_t>::max()) bad("align out of range");
+      specs.push_back(SnapSpec{get_str(g, "id"), t, static_cast<uint32_t>(align)});
+    }
+    uint64_t budget = cfg.budget_bytes;
+    if (auto bud = req.find("budget_mb"); bud != req.end()) {
+      const uint64_t mb = uint_of(*bud, "budget_mb");
+      if (mb == 0 || mb > kMaxBudgetMb) bad("\"budget_mb\" out of range");
+      budget = mb << 20;
+    }
+    uint64_t cap = snap_cap_bytes;
+    if (auto c = req.find("cap_mb"); c != req.end()) {
+      const uint64_t mb = uint_of(*c, "cap_mb");
+      if (mb == 0 || mb > kMaxBudgetMb) bad("\"cap_mb\" out of range");
+      cap = mb << 20;
+    }
+    const uint64_t before_budget = eng->budget_bytes(), before_cap = snap_cap_bytes;
+    eng->set_budget_bytes(budget);
+    eng->set_snapshot_cap_bytes(cap);
+    snap_cap_bytes = cap;
+    ScanStats st;
+    std::vector<GroupInfo> out;
+    try {
+      out = eng->snapshot(specs, st);
+    } catch (...) {
+      eng->set_budget_bytes(before_budget);
+      eng->set_snapshot_cap_bytes(before_cap);
+      snap_cap_bytes = before_cap;
+      sync_types();  // the engine's group list is the truth: it may or may not have cleared it
+      throw;
+    }
+    types.clear();
     for (const auto& s : specs) types[s.id] = s.type;
     sync_types();
     r["groups"] = infos_json(out);

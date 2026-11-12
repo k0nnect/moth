@@ -293,3 +293,66 @@ TEST_CASE("budget_mb lasts for the hunt and resets on the next keep:false scan")
   CHECK(tracked(R"({"op":"scan","keep":false,"groups":[)" + grp("c") + "]}", 0));            // reset
   CHECK(tracked(R"({"op":"scan","keep":true,"groups":[)" + grp("d") + "]}", 0));
 }
+
+TEST_CASE("snapshot, then narrow by change, over the wire") {
+  FakePlatform p; p.add(208, "disco.exe", 64); p.mem(208).add_region(0x10000, 4096); p.mem(208).poke<int32_t>(0x10010, 100);
+  Handler h(p); h.handle_line(R"({"id":1,"op":"attach","pid":208})");
+  auto sn = J(h.handle_line(R"({"id":2,"op":"snapshot","groups":[{"id":"i32","type":"i32","align":4},{"id":"f32","type":"f32","align":4}]})"));
+  CHECK(sn["ok"] == true); CHECK(sn["groups"][0]["count"] == 1024); CHECK(sn["groups"][0]["has_values"] == true); CHECK(sn["stats"]["bytes"] == 4096);
+  p.mem(208).poke<int32_t>(0x10010, 90);
+  auto nr = J(h.handle_line(R"({"id":3,"op":"narrow","atomic":true,"groups":[{"id":"i32","pred":{"op":"lt_prev"}},{"id":"f32","pred":{"op":"lt_prev"}}]})"));
+  CHECK(nr["applied"] == true); CHECK(nr["groups"][0]["count"] == 1);
+  auto pk = J(h.handle_line(R"({"id":4,"op":"peek","group":"i32","offset":0,"limit":5})"));
+  CHECK(pk["items"][0]["addr"] == "0x10010"); CHECK(pk["items"][0]["v"] == "90");
+}
+
+TEST_CASE("snapshot requests are checked") {
+  FakePlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x10000, 4096);
+  Handler h(p);
+  CHECK(code(h, R"({"op":"snapshot","groups":[{"id":"a","type":"i32","align":4}]})") == "not_attached");
+  h.handle_line(R"({"op":"attach","pid":1})");
+  auto snap = [&](const std::string& groups, const std::string& extra = "") {
+    return code(h, R"({"op":"snapshot","groups":)" + groups + extra + "}");
+  };
+  const std::string ok = R"([{"id":"a","type":"i32","align":4}])";
+  CHECK(code(h, R"({"op":"snapshot"})") == "bad_request");
+  CHECK(snap("{}") == "bad_request");
+  CHECK(snap("[]") == "bad_request");
+  CHECK(snap(R"([{"type":"i32","align":4}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","align":4}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","type":"i32"}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","type":"i32","align":4,"pred":{"op":"eq","v":"1"}}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","type":"nope","align":4}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","type":"i32","align":4},{"id":"a","type":"f32","align":4}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","type":"i32","align":0}])") == "bad_request");
+  CHECK(snap(R"([{"id":"a","type":"i32","align":2}])") == "bad_request");
+  for (const char* cap : {"0", "-1", R"("8")", "1.5", "1048577"}) CHECK(snap(ok, std::string(R"(,"cap_mb":)") + cap) == "bad_request");
+  CHECK(snap(ok, R"(,"budget_mb":0)") == "bad_request");
+  CHECK(snap(ok, R"(,"cap_mb":1048576)") == "ok");
+  CHECK(snap(ok, R"(,"cap_mb":1)") == "ok");
+}
+
+TEST_CASE("a snapshot over cap_mb is too_big and leaves the hunt alone") {
+  FakePlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x10000, 4096); p.mem(1).poke<int32_t>(0x10008, 7);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  h.handle_line(R"({"op":"scan","keep":false,"groups":[{"id":"old","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"7"}}]})");
+  p.mem(1).add_region(0x100000, size_t{2} << 20);
+  auto r = J(h.handle_line(R"({"op":"snapshot","cap_mb":1,"groups":[{"id":"n","type":"u8","align":1}]})"));
+  CHECK(r["ok"] == false); CHECK(r["error"]["code"] == "too_big");
+  CHECK(r["error"]["message"] == "2101248 to snapshot, limit 1048576");
+  auto st = J(h.handle_line(R"({"op":"status"})"));
+  REQUIRE(st["groups"].size() == 1); CHECK(st["groups"][0]["id"] == "old");
+  auto pk = J(h.handle_line(R"({"op":"peek","group":"old","offset":0,"limit":5})"));
+  CHECK(pk["ok"] == true); CHECK(pk["items"][0]["v"] == "7");
+}
+
+TEST_CASE("snapshot groups are peeked by type, and a keep:false scan replaces them") {
+  FakePlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x10000, 4096); p.mem(1).poke<float>(0x10010, 1.5f);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  CHECK(code(h, R"({"op":"snapshot","budget_mb":64,"groups":[{"id":"f","type":"f32","align":4}]})") == "ok");
+  auto pk = J(h.handle_line(R"({"op":"peek","group":"f","offset":4,"limit":1})"));
+  CHECK(pk["items"][0]["addr"] == "0x10010"); CHECK(pk["items"][0]["v"] == 1.5);
+  CHECK(code(h, R"({"op":"scan","keep":false,"groups":[{"id":"u","type":"u8","align":1,"exclude_align":0,"pred":{"op":"eq","v":"0"}}]})") == "ok");
+  CHECK(code(h, R"({"op":"peek","group":"f","offset":0,"limit":1})") == "no_such_group");
+  CHECK(code(h, R"({"op":"peek","group":"u","offset":0,"limit":1})") == "ok");
+}
