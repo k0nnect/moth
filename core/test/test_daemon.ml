@@ -249,10 +249,10 @@ let hunt () =
       Fake_helper.queue_narrow f ~applied:true [ gi "i32" 1; gi "u8" 1 ];
       check_str "next by relation" "1 match (1 whole number)" (text (call d "next" [ "SAME" ]));
       check_bool "same" true (Fake_helper.last_narrow_pred f "i32" = Eq_prev);
-      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 60L) } ];
       check_str "results" "#1  60  0x10008  whole number" (text (call d "results" []));
-      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
-      Fake_helper.queue_peek f "u8" [ { addr = 0x2000L; v = Vint 60L } ];
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 60L) } ];
+      Fake_helper.queue_peek f "u8" [ { addr = 0x2000L; v = Some (Vint 60L) } ];
       check_json "results json, all"
         (`Assoc
           [
@@ -392,8 +392,8 @@ let write_record () =
       ignore (text (attach d));
       Fake_helper.queue_scan f [ gi "i32" 1; gi "f32" 1 ];
       ignore (text (call d "find" [ "60" ]));
-      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
-      Fake_helper.queue_peek f "f32" [ { addr = 0x2000L; v = Vfloat 60. } ];
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 60L) } ];
+      Fake_helper.queue_peek f "f32" [ { addr = 0x2000L; v = Some (Vfloat 60.) } ];
       ignore (text (call d "results" []));
       Fake_helper.queue_write f ~prev:(Vint 60L) ~prev_bits:0x3cL;
       ignore (text (call d "set" [ "1"; "999" ]));
@@ -547,7 +547,7 @@ let unexpected () =
 (* ---- stage 1b: pages, near, kept values, checked writes, a closed game, the budget ---- *)
 
 (* [k] items of 3 from [base], 4 bytes apart *)
-let threes ?(base = 0x1000) k = List.init k (fun i -> { addr = Int64.of_int (base + (4 * i)); v = Vint 3L })
+let threes ?(base = 0x1000) k = List.init k (fun i -> { addr = Int64.of_int (base + (4 * i)); v = Some (Vint 3L) })
 
 let lines s = String.split_on_char '\n' s
 let last_line s = List.nth (lines s) (List.length (lines s) - 1)
@@ -597,7 +597,7 @@ let near_pages () =
   let f = fk.script in
   with_daemon sh (fun d ->
       hunt_for_three d f 3;
-      let near = [ { addr = 0x6c551060L; v = Vint 3L }; { addr = 0x6c551068L; v = Vint 3L }; { addr = 0x6c551078L; v = Vint 3L } ] in
+      let near = [ { addr = 0x6c551060L; v = Some (Vint 3L) }; { addr = 0x6c551068L; v = Some (Vint 3L) }; { addr = 0x6c551078L; v = Some (Vint 3L) } ] in
       Fake_helper.queue_peek_from f "i32" near;
       let r = call d "results" [] ~opts:[ ("near", "0x6c551068"); ("n", "2") ] in
       check_str "nearest first, a page"
@@ -642,7 +642,7 @@ let keep_by_name () =
       ignore (text (attach d));
       Fake_helper.queue_scan f [ gi "i32" 1 ];
       ignore (text (call d "find" [ "60" ]));
-      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 60L) } ];
       ignore (text (call d "results" []));
       let r = call d "keep" [ "#1"; "xp" ] in
       check_str "keep" "kept #1 as xp (60, whole number)" (text r);
@@ -725,7 +725,7 @@ let set_put_back () =
       ignore (text (attach d));
       Fake_helper.queue_scan f [ gi "i32" 1 ];
       ignore (text (call d "find" [ "6" ]));
-      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 6L } ];
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 6L) } ];
       ignore (text (call d "results" []));
       Fake_helper.queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
       Fake_helper.queue_read f (Vint 6L);

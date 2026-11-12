@@ -203,6 +203,22 @@ TEST_CASE("peek leaves out positions that can no longer be read") {
   m.remove_region(0x10000);
   auto p = e.peek("a", 0, 10); REQUIRE(p.size() == 1); CHECK(p[0].addr == 0x30000);
 }
+TEST_CASE("peek with holes gives the positions it cannot read in their place") {
+  FakeMemory m; m.add_region(0x10000, 4096); m.add_region(0x30000, 4096);
+  m.poke<int32_t>(0x10000, 100); m.poke<int32_t>(0x10010, 100); m.poke<int32_t>(0x30000, 100);
+  Engine e(m); ScanStats s; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  m.remove_region(0x10000);
+  auto p = e.peek("a", 0, 10, true); REQUIRE(p.size() == 3);
+  CHECK(p[0].addr == 0x10000); CHECK_FALSE(p[0].readable); CHECK(p[1].addr == 0x10010); CHECK_FALSE(p[1].readable);
+  CHECK(p[2].addr == 0x30000); CHECK(p[2].readable); CHECK(p[2].bits == 100);
+  p = e.peek("a", 1, 1, true); REQUIRE(p.size() == 1); CHECK(p[0].addr == 0x10010);           // a page of holes is full
+  p = e.peek_from("a", 0x10004, 9, true); REQUIRE(p.size() == 2);
+  CHECK(p[0].addr == 0x10010); CHECK_FALSE(p[0].readable); CHECK(p[1].addr == 0x30000); CHECK(p[1].readable);
+  CHECK(e.peek("a", 0, 10).size() == 1); CHECK(e.peek_from("a", 0x10004, 9).size() == 1);   // without: as before
+  m.set_alive(false);
+  CHECK(error_code([&] { e.peek("a", 0, 10, true); }) == "target_gone");
+  CHECK(error_code([&] { e.peek_from("a", 0, 10, true); }) == "target_gone");
+}
 TEST_CASE("stats split readable and unreadable bytes") {
   FakeMemory m; m.add_region(0x10000, 4096); m.add_region(0x30000, 8192); m.set_unreadable(0x30000, true);
   Engine e(m); ScanStats s; e.scan({G("a", I32, 4, 0, eq(0))}, false, s);

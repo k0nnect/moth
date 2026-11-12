@@ -53,9 +53,13 @@ let replies () =
 
 let decoders () =
   let j = Yojson.Safe.from_string in
-  check_bool "items" true (Wire.items ~vtype:"i32" (`List [ `Assoc [ "addr", `String "0x10008"; "v", `String "100" ] ]) = [ { addr = 0x10008L; v = Vint 100L } ]);
+  check_bool "items" true (Wire.items ~vtype:"i32" (`List [ `Assoc [ "addr", `String "0x10008"; "v", `String "100" ] ]) = [ { addr = 0x10008L; v = Some (Vint 100L) } ]);
   check_bool "high address" true
-    (Wire.items ~vtype:"f32" (j {|[{"addr":"0xffffffffffff0010","v":85.5}]|}) = [ { addr = 0xffffffffffff0010L; v = Vfloat 85.5 } ]);
+    (Wire.items ~vtype:"f32" (j {|[{"addr":"0xffffffffffff0010","v":85.5}]|}) = [ { addr = 0xffffffffffff0010L; v = Some (Vfloat 85.5) } ]);
+  check_bool "a position that can't be read" true
+    (Wire.items ~vtype:"i32" (j {|[{"addr":"0x10","v":null},{"addr":"0x14","v":"7"}]|}) = [ { addr = 0x10L; v = None }; { addr = 0x14L; v = Some (Vint 7L) } ]);
+  check_bool "a float that can't be read" true (Wire.items ~vtype:"f32" (j {|[{"addr":"0x10","v":null}]|}) = [ { addr = 0x10L; v = None } ]);
+  check_bool "v is still needed" true (raises_failure (fun () -> Wire.items ~vtype:"i32" (j {|[{"addr":"0x10"}]|})));
   check_bool "groups" true
     (Wire.group_infos (j {|[{"count":2,"has_values":true,"id":"i32","tracked":true},{"count":9000000,"has_values":false,"id":"u8","tracked":false}]|})
     = [ { id = "i32"; count = 2; tracked = true; has_values = true }; { id = "u8"; count = 9000000; tracked = false; has_values = false } ]);
@@ -82,7 +86,7 @@ let decoders () =
   check_bool "other strings" true (raises_failure (fun () -> Wire.value_of_json ~vtype:"f32" (`String "Infinity")));
   check_bool "not for whole numbers" true (raises_failure (fun () -> Wire.value_of_json ~vtype:"i32" (`String "nan")));
   check_bool "items by type" true
-    (match Wire.items ~vtype:"f64" (j {|[{"addr":"0x10","v":"inf"}]|}) with [ { v = Vfloat f; _ } ] -> f = Float.infinity | _ -> false)
+    (match Wire.items ~vtype:"f64" (j {|[{"addr":"0x10","v":"inf"}]|}) with [ { v = Some (Vfloat f); _ } ] -> f = Float.infinity | _ -> false)
 
 let bits () =
   check_str "i32" {|"0x00000064"|} (js (Wire.bits_to_json ~vtype:"i32" 100L));

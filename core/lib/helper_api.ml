@@ -4,7 +4,7 @@ type pred = Eq of int64 | Range of range | Lt_prev | Gt_prev | Eq_prev | Ne_prev
 type group_spec = { id : string; vtype : string; align : int; exclude_align : int; pred : pred }
 type group_info = { id : string; count : int; tracked : bool; has_values : bool }
 type stats = { regions : int; bytes : int; unreadable_bytes : int; lost : int; ms : float }
-type item = { addr : int64; v : value }
+type item = { addr : int64; v : value option (* None: a position whose value could not be read *) }
 type attached = { pid : int; name : string; bits : int }
 type err = { code : string; message : string }
 

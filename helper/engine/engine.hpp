@@ -42,7 +42,8 @@ struct EngineConfig {
 
 struct Item {
   uint64_t addr;
-  uint64_t bits;  // value bytes, little-endian in the low bits
+  uint64_t bits;          // value bytes, little-endian in the low bits
+  bool readable = true;   // false: a hole, a position whose value could not be read (bits 0)
 };
 
 struct NarrowItem {
@@ -66,11 +67,13 @@ class Engine {
   std::vector<GroupInfo> scan(const std::vector<GroupSpec>& specs, bool keep, ScanStats& stats);
 
   // Positions [offset, offset + limit) of a group in address order, with their values read now.
-  // Positions that cannot be read are left out, so a page may be short. An untracked group
-  // gives none. Throws EngineError no_such_group, or target_gone when the process is not alive.
-  std::vector<Item> peek(const std::string& id, uint64_t offset, uint64_t limit);
+  // Positions that cannot be read are left out, so a page may be short; with holes, each is given
+  // in its place as a hole (readable false), so a page holds limit positions unless the group
+  // ends. An untracked group gives none. Throws EngineError no_such_group, or target_gone when the
+  // process is not alive.
+  std::vector<Item> peek(const std::string& id, uint64_t offset, uint64_t limit, bool holes = false);
   // As peek, from the group's first position at or above addr.
-  std::vector<Item> peek_from(const std::string& id, uint64_t addr, uint64_t limit);
+  std::vector<Item> peek_from(const std::string& id, uint64_t addr, uint64_t limit, bool holes = false);
 
   // Keeps, in each listed group, the positions whose value now matches its predicate. A
   // previous-value predicate compares with the values stored at the group's last applied step.

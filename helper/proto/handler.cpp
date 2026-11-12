@@ -324,10 +324,17 @@ struct Handler::Impl {
       const uint64_t start = from != req.end() ? parse_addr(str_of(*from, "from")) : get_uint(req, "offset");
       uint64_t limit = get_uint(req, "limit");
       if (limit > kPeekCap) limit = kPeekCap;
+      // optional: holes, a position that cannot be read given in its place with "v":null
+      bool holes = false;
+      if (auto hl = req.find("holes"); hl != req.end()) {
+        if (!hl->is_boolean()) bad("\"holes\" must be true or false");
+        holes = hl->get<bool>();
+      }
       const ValueType t = type_of(id);
       json items = json::array();
-      const std::vector<Item> got = from != req.end() ? eng->peek_from(id, start, limit) : eng->peek(id, start, limit);
-      for (const Item& it : got) items.push_back(json{{"addr", hex_addr(it.addr)}, {"v", format_value(t, it.bits)}});
+      const std::vector<Item> got = from != req.end() ? eng->peek_from(id, start, limit, holes) : eng->peek(id, start, limit, holes);
+      for (const Item& it : got)
+        items.push_back(json{{"addr", hex_addr(it.addr)}, {"v", it.readable ? format_value(t, it.bits) : json(nullptr)}});
       r["items"] = items;
     } else if (op == "read") {
       need_attached();

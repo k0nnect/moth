@@ -115,8 +115,10 @@ let stats j =
   let ms = match field "ms" j with `Float f -> f | `Int n -> float_of_int n | _ -> fail "\"ms\" must be a number" in
   { regions = int_field "regions" j; bytes = int_field "bytes" j; unreadable_bytes = int_field "unreadable_bytes" j; lost = int_field "lost" j; ms }
 
+(* a position whose value could not be read has "v":null *)
 let items ~vtype j =
-  List.map (fun i -> { addr = addr_of_string (string_field "addr" i); v = value_of_json ~vtype (field "v" i) }) (list_of "items" j)
+  let v i = match field "v" i with `Null -> None | x -> Some (value_of_json ~vtype x) in
+  List.map (fun i -> { addr = addr_of_string (string_field "addr" i); v = v i }) (list_of "items" j)
 
 let parse_reply line =
   let bad message = Error { code = "bad_reply"; message } in

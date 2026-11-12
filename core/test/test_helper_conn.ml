@@ -37,6 +37,8 @@ let serve ?(on_ps = `Answer) (ic, oc) =
             | `Lose -> raise Exit
             | `Error_wrong_id -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"x"}}|} (id + 5)))
         | "scan" -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"attach first"}}|} id)
+        | "peek" when field "group" j = `String "h" ->
+            send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":null},{"addr":"0x14","v":"7"}]}|} id)
         | "peek" when field "group" j = `String "f" ->
             send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"nan"},{"addr":"0x14","v":85},{"addr":"0x18","v":"-inf"}]}|} id)
         | "peek" -> send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":"7"}]}|} id)
@@ -72,17 +74,28 @@ let scan_budget_and_peek_from () =
   check_bool "budget sent" true (field "budget_mb" (sent ()) = `Int 64);
   ignore (h.scan ~keep:false ~budget_mb:None []);
   check_bool "no budget" true (match sent () with `Assoc l -> not (List.mem_assoc "budget_mb" l) | _ -> false);
-  check_bool "peek_from" true (h.peek_from ~id:"i32" ~vtype:"i32" ~addr:0x6c551000L ~limit:64 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
+  check_bool "peek_from" true (h.peek_from ~id:"i32" ~vtype:"i32" ~addr:0x6c551000L ~limit:64 = Ok [ { addr = 0x10L; v = Some (Vint 7L) } ]);
   check_bool "from, no offset" true
     (match sent () with
     | `Assoc l -> List.assoc_opt "from" l = Some (`String "0x6c551000") && not (List.mem_assoc "offset" l)
     | _ -> false);
   h.close ()
 
+(* the core always asks for holes, and a position that can't be read comes back as None *)
+let peek_asks_for_holes () =
+  let h = ok (start ()) in
+  let sent () = Yojson.Safe.from_string !last_request in
+  let holes () = match sent () with `Assoc l -> List.assoc_opt "holes" l = Some (`Bool true) | _ -> false in
+  check_bool "a hole" true (h.peek ~id:"h" ~vtype:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = None }; { addr = 0x14L; v = Some (Vint 7L) } ]);
+  check_bool "peek asks for holes" true (holes ());
+  ignore (h.peek_from ~id:"i32" ~vtype:"i32" ~addr:0x10L ~limit:5);
+  check_bool "peek from asks for holes" true (holes ());
+  h.close ()
+
 let basics () =
   let h = ok (start ()) in
   check_bool "ps" true (h.ps () = Ok [ (208, "disco.exe") ]);
-  check_bool "peek" true (h.peek ~id:"i32" ~vtype:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
+  check_bool "peek" true (h.peek ~id:"i32" ~vtype:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Some (Vint 7L) } ]);
   check_bool "error mapped" true (match h.scan ~keep:false ~budget_mb:None [] with Error { code = "not_attached"; _ } -> true | _ -> false);
   check_bool "status" true (h.status () = Ok (Some { pid = 208; name = "disco.exe"; bits = 64 }));
   check_bool "detach" true (h.detach () = Ok ());
@@ -91,12 +104,12 @@ let basics () =
 let typed_values () =
   let h = ok (start ()) in
   (match h.peek ~id:"f" ~vtype:"f32" ~offset:0 ~limit:5 with
-  | Ok [ { addr = 0x10L; v = Vfloat a }; { addr = 0x14L; v = Vfloat b }; { addr = 0x18L; v = Vfloat c } ] ->
+  | Ok [ { addr = 0x10L; v = Some (Vfloat a) }; { addr = 0x14L; v = Some (Vfloat b) }; { addr = 0x18L; v = Some (Vfloat c) } ] ->
       check_bool "nan" true (Float.is_nan a);
       check_bool "number" true (b = 85.);
       check_bool "-inf" true (c = Float.neg_infinity)
   | _ -> Alcotest.fail "peek of a float group");
-  check_bool "a whole number as its type" true (h.peek ~id:"u" ~vtype:"u64" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
+  check_bool "a whole number as its type" true (h.peek ~id:"u" ~vtype:"u64" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Some (Vint 7L) } ]);
   check_bool "write a value" true (h.write ~addr:0x10L ~vtype:"f32" (Put_value (Vfloat 2.5)) = Ok { prev = Vfloat Float.infinity; prev_bits = 0x7f800000L });
   check_bool "sends v" true (Yojson.Safe.from_string !last_request = Yojson.Safe.from_string {|{"id":3,"op":"write","addr":"0x10","type":"f32","v":2.5}|});
   ignore (h.write ~addr:0x10L ~vtype:"f32" (Put_bits 0x7fc00001L));
@@ -170,6 +183,7 @@ let () =
         [
           Alcotest.test_case "requests" `Quick basics;
           Alcotest.test_case "scan budget, peek from" `Quick scan_budget_and_peek_from;
+          Alcotest.test_case "peek asks for holes" `Quick peek_asks_for_holes;
           Alcotest.test_case "values by type, writes by value or bytes" `Quick typed_values;
           Alcotest.test_case "wrong token" `Quick wrong_token;
           Alcotest.test_case "never connects" `Quick never_connects;

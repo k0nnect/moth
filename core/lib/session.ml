@@ -287,7 +287,8 @@ let shown_groups hunt ~all =
   List.filter (fun g -> g.info.tracked && g.info.count > 0 && (g.interp.tier = Interp.Main || wide_too)) hunt.current
 
 (* [want] of the group's positions from index [offset], in address order, in as many peeks as
-   the helper needs for them; a short reply means the group has no more *)
+   the helper needs for them. A position that can't be read comes as a hole in its place, so a
+   short reply means the group has no more. *)
 let peek_span t g ~offset ~want =
   let rec go offset want =
     let limit = min want peek_cap in
@@ -366,10 +367,13 @@ let nearby t gs ~target ~addr ~from ~limit =
   else if from > total then Error (past_end from total)
   else Ok (List.filter (fun (n, _, _, _) -> n >= from && n < from + limit) numbered, total)
 
+(* how a value reads as [i]; "?" when it couldn't be read *)
+let shown_as i = function Some x -> Interp.decode i x | None -> "?"
+
 (* the page as rows; they become the rows set and keep_row take *)
 let listing_of t ~from ~total found =
-  t.listing <- List.map (fun (n, li, (it : item), _) -> { at = n; li; laddr = it.addr; lshown = Interp.decode li it.v }) found;
-  let row (n, (i : Interp.t), (it : item), away) = { n; addr = it.addr; interp_id = i.id; tag = Interp.describe i; shown = Interp.decode i it.v; away } in
+  t.listing <- List.map (fun (n, li, (it : item), _) -> { at = n; li; laddr = it.addr; lshown = shown_as li it.v }) found;
+  let row (n, (i : Interp.t), (it : item), away) = { n; addr = it.addr; interp_id = i.id; tag = Interp.describe i; shown = shown_as i it.v; away } in
   { rows = List.map row found; total; from }
 
 (* where a near target is: a 0x address, else a kept value's *)
@@ -507,7 +511,7 @@ let kept t =
       Ok
         (List.map
            (fun k ->
-             let kshown = match read_as t k.ki k.kat with Some x -> Interp.decode k.ki x | None -> "?" in
+             let kshown = shown_as k.ki (read_as t k.ki k.kat) in
              { name = k.kname; kaddr = k.kat; ktag = Interp.describe k.ki; kshown })
            t.named))
 

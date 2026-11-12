@@ -25,8 +25,9 @@ type outcome = {
   groups : (Helper_api.group_info * Interp.tier) list;
 }
 
-(** one result: its number in the listing, where it is, the interpretation and how it reads;
-    [away], in a listing near a value, is its signed distance from that value in bytes *)
+(** one result: its number in the listing, where it is, the interpretation and how it reads
+    (["?"] when it can't be read); [away], in a listing near a value, is its signed distance from
+    that value in bytes *)
 type row = { n : int; addr : int64; interp_id : string; tag : string; shown : string; away : int option }
 
 (** a page of a listing: its rows, how many rows the whole listing has, and the first row asked for *)
@@ -66,9 +67,10 @@ val reach : int
     Without [near], the groups go fewest matches first, ties in plan order, each in address
     order, numbered from 1 across that order; [total] is their counts summed. With [near] (a kept
     value's name, or a [0x] address), the rows are every position within [reach] bytes of that
-    address, its own included, nearest first, ties in plan order. Either way a [from] past
-    [total] (when there are any) is an error. The page's rows are the ones [set] and [keep_row]
-    take, until the hunt changes or another listing replaces them. *)
+    address, its own included, nearest first, ties in plan order. Either way rows are numbered by
+    position: a position whose value can't be read is a row in its place, shown as ["?"]. A
+    [from] past [total] (when there are any) is an error. The page's rows are the ones [set] and
+    [keep_row] take, as any rows, until the hunt changes or another listing replaces them. *)
 val results : t -> all:bool -> from:int -> limit:int -> near:string option -> (listing, string) result
 
 (** writes the number, waits ([settle]), then reads the address back: the game putting back the

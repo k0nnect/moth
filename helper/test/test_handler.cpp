@@ -149,6 +149,27 @@ TEST_CASE("peek from an address") {
   CHECK(pk["items"].size() == 1000); CHECK(pk["items"][0]["addr"] == "0x10004");
 }
 
+TEST_CASE("peek with holes: a position that cannot be read is null in its place") {
+  FakePlatform p; p.add(1, "t.exe", 64); auto& m = p.mem(1); m.add_region(0x10000, 4096); m.add_region(0x30000, 4096);
+  m.poke<int32_t>(0x10000, 100); m.poke<int32_t>(0x30000, 100);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  h.handle_line(R"({"op":"scan","keep":false,"groups":[{"id":"i32","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"100"}}]})");
+  m.remove_region(0x10000);
+  auto pk = J(h.handle_line(R"({"op":"peek","group":"i32","offset":0,"limit":5,"holes":true})"));
+  REQUIRE(pk["items"].size() == 2);
+  CHECK(pk["items"][0] == json{{"addr", "0x10000"}, {"v", nullptr}}); CHECK(pk["items"][1]["v"] == "100");
+  pk = J(h.handle_line(R"({"op":"peek","group":"i32","from":"0x10000","limit":5,"holes":true})"));
+  REQUIRE(pk["items"].size() == 2); CHECK(pk["items"][0]["v"].is_null()); CHECK(pk["items"][1]["addr"] == "0x30000");
+  for (const char* without : {R"({"op":"peek","group":"i32","offset":0,"limit":5})", R"({"op":"peek","group":"i32","offset":0,"limit":5,"holes":false})",
+                              R"({"op":"peek","group":"i32","from":"0x10000","limit":5})"}) {
+    pk = J(h.handle_line(without));                                     // as before: left out
+    REQUIRE(pk["items"].size() == 1); CHECK(pk["items"][0]["addr"] == "0x30000");
+  }
+  CHECK(code(h, R"({"op":"peek","group":"i32","offset":0,"limit":5,"holes":1})") == "bad_request");
+  m.set_alive(false);
+  CHECK(code(h, R"({"op":"peek","group":"i32","offset":0,"limit":5,"holes":true})") == "target_gone");
+}
+
 TEST_CASE("attach, detach, status and target_gone") {
   FakePlatform p;
   p.add(1, "a.exe", 64); p.mem(1).add_region(0x10000, 4096);

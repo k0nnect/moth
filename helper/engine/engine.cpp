@@ -449,24 +449,30 @@ void Engine::fit_budget(std::vector<Group>& fresh, uint64_t kept, bool with_valu
   }
 }
 
-std::vector<Item> Engine::peek(const std::string& id, uint64_t offset, uint64_t limit) {
+std::vector<Item> Engine::peek(const std::string& id, uint64_t offset, uint64_t limit, bool holes) {
   const Group& g = find(id);
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
   std::vector<Item> items;
   if (!g.tracked) return items;
   const size_t w = width_of(g.spec.type);
   const std::vector<uint64_t> addrs = g.positions.addresses(offset, limit);
+  bool missed = false;
   for (uint64_t addr : addrs) {
     uint64_t bits = 0;
-    if (mem_.read(addr, &bits, w) == w) items.push_back({addr, bits});  // little-endian host
+    if (mem_.read(addr, &bits, w) == w) {
+      items.push_back({addr, bits});  // little-endian host
+    } else {
+      missed = true;
+      if (holes) items.push_back({addr, 0, false});
+    }
   }
   // reads also fail once the game closes; that is reported, not taken as freed memory
-  if (items.size() < addrs.size() && !mem_.alive()) throw EngineError("target_gone", "the game has closed");
+  if (missed && !mem_.alive()) throw EngineError("target_gone", "the game has closed");
   return items;
 }
 
-std::vector<Item> Engine::peek_from(const std::string& id, uint64_t addr, uint64_t limit) {
-  return peek(id, find(id).positions.lower_bound(addr), limit);
+std::vector<Item> Engine::peek_from(const std::string& id, uint64_t addr, uint64_t limit, bool holes) {
+  return peek(id, find(id).positions.lower_bound(addr), limit, holes);
 }
 
 bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vector<GroupInfo>& out,

@@ -42,11 +42,12 @@
   - `floor` (a number above 0): the value matches only if it is exactly zero or its magnitude is at least `floor`.
   - `moved` (`true`): narrow only. The value must also differ from the group's stored previous value. A group without stored values answers `no_values`; in a `scan` it is `bad_request`.
 - `peek` takes `offset` or `from`, not both: `{"op":"peek","group":"i32","from":"0x6c551000","limit":64}` returns the items at the group's positions with address at or above `from`, in address order.
+- `peek` (with `offset` or with `from`) takes an optional `"holes":true` (ruling R14, from the final review). With it, a position whose value cannot be read is returned in its place as `{"addr":"0x...","v":null}` instead of being left out, so a page holds exactly `limit` positions unless the group ends. Without the field the reply is exactly as before. `target_gone` is unchanged. The core always sends it; its rows are numbered by position, and a row whose value cannot be read shows `?`.
 - `scan`'s existing `budget_mb` is now sent by the core when one is configured.
 
 **Client protocol**
 
-- `results` result: `{"rows":[{"n","addr","interp_id","tag","shown","away":int|null}],"total":int,"from":int}`. It was a bare list.
+- `results` result: `{"rows":[{"n","addr","interp_id","tag","shown","away":int|null}],"total":int,"from":int}`. It was a bare list. A row whose value cannot be read has `"shown":"?"`.
 - `set` result: `{"message":"<text>","held":bool}`.
 - `kept` result: `[{"name","addr","tag","shown"}]`.
 - `status` result gains `"closed":"<name>"` when it found that the attached game had exited.

@@ -20,7 +20,10 @@ val parse_reply : string -> (int * Yojson.Safe.t, Helper_api.err) result
 
 val group_infos : Yojson.Safe.t -> Helper_api.group_info list
 val stats : Yojson.Safe.t -> Helper_api.stats
+
+(** a peek's items; a position whose value could not be read ("v":null) has [v = None] *)
 val items : vtype:string -> Yojson.Safe.t -> Helper_api.item list
+
 val value_to_json : Helper_api.value -> Yojson.Safe.t
 val value_of_json : vtype:string -> Yojson.Safe.t -> Helper_api.value
 

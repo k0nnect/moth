@@ -125,15 +125,16 @@ let make c =
             let applied = match field "applied" r with `Bool b -> b | _ -> failwith "\"applied\" must be true or false" in
             (applied, Wire.group_infos (field "groups" r), Wire.stats (field "stats" r))));
     drop = (fun ids -> req "drop" [ ("ids", `List (List.map (fun i -> `String i) ids)) ] ignore);
+    (* both forms ask for holes: a position that can't be read keeps its place in the page *)
     peek =
       (fun ~id ~vtype ~offset ~limit ->
         req "peek"
-          [ ("group", `String id); ("offset", `Int offset); ("limit", `Int limit) ]
+          [ ("group", `String id); ("offset", `Int offset); ("limit", `Int limit); ("holes", `Bool true) ]
           (fun r -> Wire.items ~vtype (field "items" r)));
     peek_from =
       (fun ~id ~vtype ~addr ~limit ->
         req "peek"
-          [ ("group", `String id); ("from", Wire.addr_to_json addr); ("limit", `Int limit) ]
+          [ ("group", `String id); ("from", Wire.addr_to_json addr); ("limit", `Int limit); ("holes", `Bool true) ]
           (fun r -> Wire.items ~vtype (field "items" r)));
     read =
       (fun ~addr ~vtype ->

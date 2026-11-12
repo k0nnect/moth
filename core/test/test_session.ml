@@ -20,7 +20,8 @@ let show_pred = function
 let check_pred n w g = check_str n (show_pred w) (show_pred g)
 let check_err n msg r = match r with Error e -> check_str n msg e | Ok _ -> Alcotest.failf "%s: expected the error %S" n msg
 let gi ?(tracked = true) ?values id count : group_info = { id; count; tracked; has_values = Option.value values ~default:tracked }
-let it addr v : item = { addr; v }
+let it addr v : item = { addr; v = Some v }
+let hole addr : item = { addr; v = None }
 
 let fresh () =
   let h, f = Fake_helper.create () in
@@ -843,6 +844,69 @@ let near_pages_and_the_ends_of_memory () =
   check_bool "at the top of memory, from reach below" true (last_peek_from_addr f "i32" = 0xffffffffffffe000L);
   check_bool "nothing wraps around" true (aways l = [ 16; 4080 ])
 
+(* R14: a position whose value can't be read is a row in its place, shown as ?, so rows are
+   numbered by position; it is set and kept as any row is *)
+let rows_that_cannot_be_read () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 6 ];
+  ignore (ok (Session.find s "77"));
+  let at k = Int64.of_int (0x20ff0 + (4 * (k - 1))) in
+  (* rows 3 and 4 are on a page the game freed after the step *)
+  queue_peek f "i32" [ hole (at 3); hole (at 4); it (at 5) (Vint 77L); it (at 6) (Vint 77L) ];
+  let l = ok (Session.results s ~all:false ~from:3 ~limit:4 ~near:None) in
+  check_bool "asked from row 3" true (last_peek f "i32" = (2, 4));
+  check_bool "numbered by position, ? where it can't be read" true
+    (List.map (fun (r : Session.row) -> (r.n, r.addr, r.shown)) l.rows = [ (3, at 3, "?"); (4, at 4, "?"); (5, at 5, "77"); (6, at 6, "77") ]);
+  queue_peek f "i32" [ it (at 5) (Vint 77L); it (at 6) (Vint 77L) ];
+  let l = ok (Session.results s ~all:false ~from:5 ~limit:4 ~near:None) in
+  check_bool "the same positions, the same numbers" true (List.map (fun (r : Session.row) -> (r.n, r.addr)) l.rows = [ (5, at 5); (6, at 6) ]);
+  queue_peek f "i32" [ it (at 1) (Vint 77L); it (at 2) (Vint 77L); hole (at 3); hole (at 4) ];
+  ignore (ok (Session.results s ~all:false ~from:1 ~limit:4 ~near:None));
+  check_str "kept as any row" "kept #3 as v1 (?, whole number)" (ok (Session.keep_row s ~row:3 ~name:None));
+  queue_error f "write" { code = "write_failed"; message = "cannot write 0x20ff8" };
+  check_err "set as any row: the write says why it failed" "cannot write 0x20ff8" (Session.set s ~row:3 "9");
+  check_bool "written where the row is" true (last_write f = (at 3, "i32", Put_value (Vint 9L)));
+  (* the first rows can't be read: they are still rows *)
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 15360 ];
+  ignore (ok (Session.find s "0"));
+  queue_peek f "i32" [ hole 0x20000L; hole 0x20004L; hole 0x20008L ];
+  let l = ok (Session.results s ~all:false ~from:1 ~limit:3 ~near:None) in
+  check_bool "three rows of ?" true (List.map (fun (r : Session.row) -> (r.n, r.shown)) l.rows = [ (1, "?"); (2, "?"); (3, "?") ] && l.total = 15360)
+
+(* the page below the value was freed after the step: its positions come back as holes, and the
+   listing near the value pages on past them *)
+let near_past_a_freed_page () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 15360 ];
+  ignore (ok (Session.find s "0"));
+  queue_peek_from f "i32" (List.init 64 (fun k -> hole (Int64.of_int (0x20010 + (4 * k)))));
+  queue_peek_from f "i32" [ it 0x21010L (Vint 0L); it 0x21014L (Vint 0L); it 0x22100L (Vint 0L) ];
+  let l = ok (near ~limit:3 s "0x21010") in
+  check_bool "paged on past the holes" true (peek_froms f = [ ("i32", 0x20010L, 64); ("i32", 0x2010dL, 64) ]);
+  check_int "the holes in reach are rows too" 66 l.total;
+  check_bool "the readable rows around them, nearest first" true
+    (List.map (fun (r : Session.row) -> (r.n, r.addr, r.shown, r.away)) l.rows
+    = [ (1, 0x21010L, "0", Some 0); (2, 0x21014L, "0", Some 4); (3, 0x2010cL, "?", Some (-3844)) ])
+
+(* R7: set and keep take the rows of the latest listing only *)
+let only_the_latest_listing () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 8 ];
+  ignore (ok (Session.find s "5"));
+  let at k = Int64.of_int (0x1000 + (4 * k)) in
+  queue_peek f "i32" (List.init 5 (fun k -> it (at k) (Vint 5L)));
+  ignore (ok (Session.results s ~all:false ~from:1 ~limit:5 ~near:None));
+  queue_peek f "i32" (List.init 3 (fun k -> it (at (5 + k)) (Vint 5L)));
+  ignore (ok (Session.results s ~all:false ~from:6 ~limit:5 ~near:None));
+  check_err "a row of the page before" "no result #1. run: moth results" (Session.set s ~row:1 "9");
+  check_err "nor kept" "no result #1. run: moth results" (Session.keep_row s ~row:1 ~name:None);
+  check_int "nothing written" 0 (write_calls f);
+  queue_write f ~prev:(Vint 5L) ~prev_bits:5L;
+  queue_read f (Vint 9L);
+  check_str "a row of the latest" "set #6 to 9 (was 5)" (set_text (Session.set s ~row:6 "9"));
+  check_bool "at its position" true (last_write f = (at 5, "i32", Put_value (Vint 9L)))
+
 let a_kept_row_outlives_the_hunt () =
   let s, f = fresh () in
   queue_scan f [ gi "i32" 1 ];
@@ -1033,6 +1097,9 @@ let () =
           t "near an address" near_an_address;
           t "near nothing, or no such name" near_nothing;
           t "near: pages and the ends of memory" near_pages_and_the_ends_of_memory;
+          t "rows that cannot be read" rows_that_cannot_be_read;
+          t "near, past a freed page" near_past_a_freed_page;
+          t "only the latest listing" only_the_latest_listing;
           t "a kept row outlives the hunt" a_kept_row_outlives_the_hunt;
           t "keep at an address" keep_at_an_address;
           t "a kept value that cannot be read" a_kept_value_that_cannot_be_read;
