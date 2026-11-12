@@ -35,7 +35,7 @@ struct ScanStats {
 };
 
 struct EngineConfig {
-  uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed; values give way first (see Engine::scan)
+  uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed (see Engine::scan and Engine::narrow)
   uint64_t value_cap = 64'000'000;        // a group keeps values only while it has at most this many positions
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
   unsigned workers = 1;                   // threads searching a scan's blocks; 0: hardware threads - 1, from 1 to 8
@@ -61,10 +61,15 @@ class Engine {
   // so the result is the same for any worker count. keep=false replaces all groups; keep=true
   // replaces only groups with a listed id, and the listed groups then follow the others in
   // groups(). Returns the listed groups in request order.
-  // Storage is held within budget_bytes during the walk (after each block) and at its end (after
-  // each listed group's values are shrunk to what they hold): while it is over, the listed groups'
-  // values are dropped from the last group backwards, each group staying tracked without values;
-  // only if it is still over are listed groups untracked from the last one backwards.
+  // After each block of the walk, storage is held within budget_bytes, counting each group's
+  // positions and the values it holds: first, listed groups are untracked from the last one
+  // backwards until the positions alone fit; then, while positions and values are still over,
+  // the values of tracked listed groups are dropped from the last one backwards, each group
+  // staying tracked without values. No group is untracked to make room for values. A value
+  // buffer also keeps room to grow into, never more than the values it holds, so during the walk
+  // the helper's memory can run over budget_bytes by up to the size of the values held. The room
+  // is freed when the walk ends; storage_bytes() is then within budget_bytes, unless the groups
+  // kept from before are over it alone.
   // Throws EngineError: bad_request (a previous-value predicate or a moved range, align 0, an id
   // listed twice), nothing changed; target_gone (the process is not alive), and the replaced
   // groups are gone.
@@ -118,10 +123,11 @@ class Engine {
   // workers had room for at once. A worker compacts each 256 KiB slice of a block before the
   // next, so this stays within one slice's worth per worker.
   uint64_t peak_raw_offsets() const { return peak_raw_offsets_; }
-  // The most bytes the last scan's listed groups held, positions and values, after any block of
-  // its walk was added and the storage held within the budget. With the groups kept from before,
-  // that is within budget_bytes unless those alone are over it. While a block is being added it
-  // can be higher, by that block's matches and by a value buffer doubling its room.
+  // The most bytes the last scan's listed groups counted toward the budget, their positions and
+  // the values they hold, after any block of its walk was added and the budget applied (see
+  // scan). With the groups kept from before, that is within budget_bytes unless those alone are
+  // over it. The memory really held can be higher, by the value buffers' room to grow, and while
+  // a block is being added by that block's matches.
   uint64_t peak_walk_bytes() const { return peak_walk_bytes_; }
 
  private:
@@ -137,7 +143,8 @@ class Engine {
     void append(const uint8_t* p);        // appends the value whose bytes start at p
     void clear();                         // removes every value and frees their memory
     void shrink_to_fit();                 // gives back the room beyond the values
-    uint64_t bytes() const { return bytes_.capacity(); }  // heap held
+    uint64_t bytes() const { return bytes_.capacity(); }  // heap held, room to grow included
+    uint64_t used_bytes() const { return used_; }         // what the values themselves take
 
    private:
     void grow();  // doubles the room

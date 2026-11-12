@@ -274,6 +274,22 @@ TEST_CASE("over budget, values go from the last group backwards and both groups 
     CHECK(e.storage_bytes() <= 6000);
   }
 }
+TEST_CASE("the budget counts the values a group holds, not the room it keeps to grow into") {
+  // 1100 i32 zeros: 304 bytes of positions and 4400 of values fit 6000, though the values'
+  // buffer reached 8 KiB while they were stored
+  FakeMemory m; m.add_region(0x10000, 8192); for (int i = 1100; i < 2048; i++) m.poke<int32_t>(0x10000 + i * 4, 1);
+  Engine e(m, {.budget_bytes = 6000}); ScanStats s;
+  auto g = e.scan({G("a", I32, 4, 0, eq(0))}, false, s);
+  CHECK(g[0].count == 1100); CHECK(g[0].tracked); CHECK(g[0].has_values); CHECK(e.storage_bytes() <= 4704);
+}
+TEST_CASE("no group is untracked to make room for values") {
+  // a: three i32 100s, about 70 bytes with their values. z: the 4093 u8 zeros, whose positions
+  // (about 560 bytes) do not fit 500 beside a's. z goes, and a keeps its values.
+  FakeMemory m; m.add_region(0x10000, 4096); for (int i = 0; i < 3; i++) m.poke<int32_t>(0x10000 + i * 16, 100);
+  Engine e(m, {.budget_bytes = 500}); ScanStats s;
+  auto g = e.scan({G("a", I32, 4, 0, eq(100)), G("z", U8, 1, 0, eq(0))}, false, s);
+  CHECK(g[0].tracked); CHECK(g[0].has_values); CHECK_FALSE(g[1].tracked); CHECK(e.storage_bytes() <= 500);
+}
 TEST_CASE("a scan keeps its storage within the budget during the walk, values going first") {
   // 4 MiB of zeros in 64 KiB blocks: an i32 group's positions take about 130 KiB, and its values
   // would reach 4 MiB by the end of the walk

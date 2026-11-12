@@ -422,13 +422,16 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
     if (j == nullptr) return false;
     for (size_t i = 0; i < fresh.size(); i++) add_found(fresh[i], std::move(j->found[i]), j->data.data());
     // Holding the storage within the budget after every block keeps memory near it during the
-    // walk instead of only after it. Positions and values only grow while they are held, so what
-    // goes here would go at the end too, except when a group later passes value_cap and frees its
-    // own values, or when the room a value buffer keeps to grow into is what passes the budget.
+    // walk instead of only after it. Untracking here depends on positions alone, which only grow,
+    // so the end would untrack the same groups. Values dropped here could have fit at the end when
+    // storage counted beside them is freed later: a group passing value_cap frees its values, an
+    // untracked group its positions. The budget counts the values held, not the room their
+    // buffers keep to grow into, so memory can run over it by up to the values held until the
+    // walk ends.
     fit_budget(fresh, kept);
-    uint64_t held = 0;
-    for (const Group& g : fresh) held += bytes_of(g);
-    peak_walk_bytes_ = std::max(peak_walk_bytes_, held);
+    uint64_t counted = 0;
+    for (const Group& g : fresh) counted += g.positions.bytes() + g.values.used_bytes();
+    peak_walk_bytes_ = std::max(peak_walk_bytes_, counted);
     searchers.release(j);
     return true;
   };
@@ -460,7 +463,7 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
   peak_raw_offsets_ = searchers.finish();
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
   for (Group& g : fresh) g.values.shrink_to_fit();  // the room to grow into is no longer needed
-  fit_budget(fresh, kept);
+  fit_budget(fresh, kept);  // decides as after the last block, so it acts only if no block was walked
 
   std::vector<GroupInfo> out;
   out.reserve(fresh.size());
@@ -482,21 +485,27 @@ void Engine::add_found(Group& g, PositionSet::Block b, const uint8_t* data) {
   g.positions.append(std::move(b));
 }
 
-// While kept plus the fresh groups' storage is over the budget: drops the fresh groups' values
-// from the last group backwards, each group staying tracked; then, if that is not enough, untracks
-// fresh groups from the last one backwards.
+// Holds kept plus the fresh groups' storage within the budget, counting each fresh group's
+// positions and the values it holds (not its value buffer's room to grow). First untracks fresh
+// groups from the last one backwards until the positions alone fit; then drops the values of
+// tracked fresh groups from the last one backwards while positions and values are still over,
+// each group staying tracked. No group is untracked to make room for values.
 void Engine::fit_budget(std::vector<Group>& fresh, uint64_t kept) {
-  uint64_t total = kept;
-  for (const Group& g : fresh) total += bytes_of(g);
-  for (size_t i = fresh.size(); i-- > 0 && total > cfg_.budget_bytes;) {
-    if (!fresh[i].has_values) continue;
-    total -= fresh[i].values.bytes();
-    forget_values(fresh[i]);
+  uint64_t positions = kept, values = 0;
+  for (const Group& g : fresh) {
+    positions += g.positions.bytes();
+    values += g.values.used_bytes();
   }
-  for (size_t i = fresh.size(); i-- > 0 && total > cfg_.budget_bytes;) {
+  for (size_t i = fresh.size(); i-- > 0 && positions > cfg_.budget_bytes;) {
     if (!fresh[i].tracked) continue;
-    total -= bytes_of(fresh[i]);
+    positions -= fresh[i].positions.bytes();
+    values -= fresh[i].values.used_bytes();
     untrack(fresh[i]);
+  }
+  for (size_t i = fresh.size(); i-- > 0 && positions + values > cfg_.budget_bytes;) {
+    if (!fresh[i].has_values) continue;
+    values -= fresh[i].values.used_bytes();
+    forget_values(fresh[i]);
   }
 }
 
