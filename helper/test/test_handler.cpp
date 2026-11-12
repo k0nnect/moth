@@ -1,4 +1,6 @@
 #include <limits>
+#include <memory>
+#include <new>
 #include <string>
 
 #include "doctest/doctest.h"
@@ -344,6 +346,57 @@ TEST_CASE("a snapshot over cap_mb is too_big and leaves the hunt alone") {
   REQUIRE(st["groups"].size() == 1); CHECK(st["groups"][0]["id"] == "old");
   auto pk = J(h.handle_line(R"({"op":"peek","group":"old","offset":0,"limit":5})"));
   CHECK(pk["ok"] == true); CHECK(pk["items"][0]["v"] == "7");
+}
+
+// A FakePlatform whose process list, or whose memory's reads, can fail to get memory.
+struct OomPlatform : FakePlatform {
+  bool oom_ps = false, oom_read = false;
+  std::vector<ProcInfo> processes() override {
+    if (oom_ps) throw std::bad_alloc();
+    return FakePlatform::processes();
+  }
+  std::unique_ptr<ProcessMemory> open(uint32_t pid, ProcInfo& out) override {
+    FakePlatform::open(pid, out);  // its checks, and out
+    return std::make_unique<Reads>(mem(pid), oom_read);
+  }
+  struct Reads : ProcessMemory {
+    FakeMemory& m;
+    const bool& oom;
+    Reads(FakeMemory& f, const bool& o) : m(f), oom(o) {}
+    std::vector<Region> writable_regions() override { return m.writable_regions(); }
+    std::vector<Region> readable_regions() override { return m.readable_regions(); }
+    size_t read(uint64_t a, void* o, size_t n) override {
+      if (oom) throw std::bad_alloc();
+      return m.read(a, o, n);
+    }
+    bool write(uint64_t a, const void* d, size_t n) override { return m.write(a, d, n); }
+    bool alive() override { return m.alive(); }
+  };
+};
+
+TEST_CASE("an allocation that fails is no_memory, out of memory, in any op, and the hunt stays") {
+  OomPlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x10000, 4096); p.mem(1).poke<int32_t>(0x10008, 7);
+  Handler h(p);
+  p.oom_ps = true;
+  auto r = J(h.handle_line(R"({"id":1,"op":"ps"})"));
+  CHECK(r["ok"] == false); CHECK(r["id"] == 1);
+  CHECK(r["error"] == json{{"code", "no_memory"}, {"message", "out of memory"}});
+  p.oom_ps = false;
+  CHECK(code(h, R"({"op":"attach","pid":1})") == "ok");
+  CHECK(code(h, R"({"op":"scan","keep":false,"groups":[{"id":"a","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"7"}}]})") == "ok");
+  p.oom_read = true;
+  for (const char* line : {R"({"op":"narrow","atomic":true,"groups":[{"id":"a","pred":{"op":"eq_prev"}}]})",
+                           R"({"op":"read","addr":"0x10008","type":"i32"})",
+                           R"({"op":"peek","group":"a","offset":0,"limit":5})",
+                           R"({"op":"scan","keep":true,"groups":[{"id":"b","type":"i16","align":2,"exclude_align":0,"pred":{"op":"eq","v":"7"}}]})"}) {
+    r = J(h.handle_line(line));
+    CHECK(r["ok"] == false);
+    CHECK(r["error"] == json{{"code", "no_memory"}, {"message", "out of memory"}});
+  }
+  p.oom_read = false;
+  auto pk = J(h.handle_line(R"({"op":"peek","group":"a","offset":0,"limit":5})"));  // the group is as it was
+  REQUIRE(pk["items"].size() == 1); CHECK(pk["items"][0]["addr"] == "0x10008");
+  CHECK(code(h, R"({"op":"narrow","atomic":true,"groups":[{"id":"a","pred":{"op":"eq_prev"}}]})") == "ok");
 }
 
 TEST_CASE("snapshot groups are peeked by type, and a keep:false scan replaces them") {

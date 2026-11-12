@@ -61,6 +61,11 @@ let too_many = "too many matches to compare by change yet. type the new number i
 let game_closed = "the game closed. attach again once it's running."
 let helper_lost = "lost contact with moth's helper. attach again."
 let hunt_lost = "the hunt was lost. start again with: moth find <number>"
+let out_of_memory = "moth's helper ran out of memory doing that. close something large, then try again."
+
+let lost_values =
+  "moth lost what it remembered of the last step, so it can't compare by change now. type the number it shows (moth next <number>), or start again: moth snapshot"
+
 let no_row n = Printf.sprintf "no result #%d. run: moth results" n
 let no_kept name = Printf.sprintf "no kept value called %s. see: moth kept" name
 let find_kept t name = List.find_opt (fun k -> k.kname = name) t.named
@@ -82,7 +87,8 @@ let clear t =
 
 (* Runs one step. A helper error ends it; losing the game or the helper also clears the session.
    A group the helper no longer has ends the hunt, which can't go on without it; the writes and
-   the kept values stay. *)
+   the kept values stay. The helper running out of memory, or no longer holding the values a
+   step compares with, leaves its positions as they were, so the hunt stays. *)
 let guard t f =
   try f () with
   | Helper_failed { code = "target_gone"; _ } ->
@@ -94,6 +100,8 @@ let guard t f =
   | Helper_failed { code = "no_such_group"; _ } ->
       drop_hunt t;
       Error hunt_lost
+  | Helper_failed { code = "no_memory"; _ } -> Error out_of_memory
+  | Helper_failed { code = "no_values"; _ } -> Error lost_values
   | Helper_failed e -> Error (if e.message = "" then e.code else e.message)
 
 (* the helper's time, bytes read, bytes it could not read and lost candidates over one step *)

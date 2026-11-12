@@ -484,6 +484,30 @@ let game_closes () =
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   check_int "hunt kept" 1 (ok (Session.next_number s "5")).main
 
+let out_of_memory = "moth's helper ran out of memory doing that. close something large, then try again."
+
+let lost_values =
+  "moth lost what it remembered of the last step, so it can't compare by change now. type the number it shows (moth next <number>), or start again: moth snapshot"
+
+(* the helper running out of memory part-way through a step, or no longer having the values a
+   relation step compares with, is said plainly; neither ends the hunt, and a number still works *)
+let helper_failures_said_plainly () =
+  List.iter
+    (fun ((e : err), said) ->
+      let s, f = fresh () in
+      queue_scan f [ gi "i32" 500 ];
+      ignore (ok (Session.find s "13"));
+      let before = Session.current s in
+      queue_error f "narrow" e;
+      check_err e.code said (Session.next_relation s Down);
+      check_bool (e.code ^ ": the hunt as it was") true (before <> None && Session.current s = before);
+      queue_error f "narrow" e;
+      check_err (e.code ^ ", a number") said (Session.next_number s "12");
+      check_bool (e.code ^ ": the hunt as it was, again") true (Session.current s = before);
+      queue_narrow f ~applied:true [ gi "i32" 4 ];
+      check_int (e.code ^ ": a number still works") 4 (ok (Session.next_number s "12")).main)
+    [ ({ code = "no_memory"; message = "out of memory" }, out_of_memory); ({ code = "no_values"; message = "group i32 has no stored values" }, lost_values) ]
+
 let current () =
   let s, f = fresh () in
   check_bool "no hunt yet" true (Session.current s = None);
@@ -1296,6 +1320,25 @@ let hunts_replace_each_other () =
   check_ids "kept values outlast both" [ "xp" ] (kept_names s);
   check_bool "and so do the writes" true (Session.writes s = [ (0x6c551068L, "i32", Vint 15L, Vint 16L) ])
 
+(* probe G: the helper runs out of memory part-way through the first step and lets go of the
+   snapshot. The hunt stays, still with no step; a relation step then finds no values to compare
+   with, and a number still works. *)
+let a_snapshot_step_out_of_memory () =
+  let s, f = fresh () in
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  let before = Session.current s in
+  queue_error f "narrow" { code = "no_memory"; message = "out of memory" };
+  check_err "out of memory" out_of_memory (Session.next_relation s Down);
+  check_bool "the hunt as it was" true (before <> None && Session.current s = before);
+  check_bool "still no step" true (Session.blind s);
+  queue_error f "narrow" { code = "no_values"; message = "group i32 has no stored values" };
+  check_err "no values now" lost_values (Session.next_relation s Down);
+  check_bool "the hunt as it was, again" true (Session.current s = before);
+  queue_narrow f ~applied:true [ gi "i32" 66; gi "f32" 0; gi "i16" 0; gi "i64" 0; gi "f64" 0; gi "u8" 0 ];
+  check_int "a number still works" 66 (ok (Session.next_number s "173")).main;
+  check_bool "a step now" false (Session.blind s)
+
 (* ---- what a step that kept nothing says ---- *)
 
 let by_relation_text =
@@ -1668,7 +1711,13 @@ let () =
           t "a write check when things fail" a_write_check_when_things_fail;
           t "a write that could not be checked" a_write_that_could_not_be_checked;
         ] );
-      ("errors", [ t "out of order" out_of_order; t "game closes" game_closes; t "failed find, lost groups" failed_find_and_lost_groups ]);
+      ( "errors",
+        [
+          t "out of order" out_of_order;
+          t "game closes" game_closes;
+          t "failed find, lost groups" failed_find_and_lost_groups;
+          t "helper failures said plainly" helper_failures_said_plainly;
+        ] );
       ( "pages, near, kept",
         [
           t "small groups come first and pages continue" small_groups_come_first_and_pages_continue;
@@ -1707,6 +1756,7 @@ let () =
           t "a snapshot that fails" a_snapshot_that_fails;
           t "snapshots carry the limit" snapshots_carry_the_limit;
           t "hunts replace each other" hunts_replace_each_other;
+          t "a snapshot step out of memory" a_snapshot_step_out_of_memory;
         ] );
       ( "dead ends",
         [

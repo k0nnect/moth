@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <new>
 #include <vector>
 
 #include "nlohmann/json.hpp"
@@ -500,6 +501,8 @@ std::string Handler::handle_line(const std::string& line) {
     const std::string w = e.what();
     const std::string prefix = e.code + ": ";
     reply = json{{"ok", false}, {"error", {{"code", e.code}, {"message", w.compare(0, prefix.size(), prefix) == 0 ? w.substr(prefix.size()) : w}}}};
+  } catch (const std::bad_alloc&) {  // in any op
+    reply = json{{"ok", false}, {"error", {{"code", "no_memory"}, {"message", "out of memory"}}}};
   } catch (const std::exception& e) {
     reply = json{{"ok", false}, {"error", {{"code", "bad_request"}, {"message", e.what()}}}};
   }

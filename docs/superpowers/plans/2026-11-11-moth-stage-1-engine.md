@@ -107,7 +107,7 @@ bin/                             build output, gitignored
 - Values `v` and `prev`: decimal string for integer types (`"100"`, `"-3"`), JSON number for float types. A float that is not finite is the string `"nan"`, `"inf"` or `"-inf"` in `peek`, `read` and `write` replies; a `write` request's `v` is always a finite number. The core decodes `peek` values by the group's type, which it knows. Addresses: hex string (`"0x1f3a0010"`).
 - `bits` and `prev_bits`: a value's raw bytes, little-endian, as a lowercase `0x` hex string of two digits per byte of the type (`"0x00000064"` for an `i32` 100, `"0x7fc00000"` for an `f32` nan; a request may leave out leading zeros). A `write` carries `v` or `bits`, not both. `undo` writes back `prev_bits`, so it restores exactly the previous bytes for every type.
 - `scan` with `keep:false` replaces every group. With `keep:true` it replaces only the groups it lists.
-- Error codes: `bad_request`, `unknown_op`, `not_attached`, `no_such_process`, `access_denied`, `modules_failed`, `no_such_group`, `no_values`, `target_gone`, `read_failed`, `write_failed`.
+- Error codes: `bad_request`, `unknown_op`, `not_attached`, `no_such_process`, `access_denied`, `modules_failed`, `no_such_group`, `no_values`, `target_gone`, `read_failed`, `write_failed`, `no_memory` (in any op, when the helper could not get memory; the message is `out of memory`).
 
 **Client protocol.** Newline-delimited JSON over the Unix socket `$MOTH_HOME/core.sock`. Request `{"id":<n>,"actor":"user","cmd":"<cmd>","args":[strings],"opts":{...}}`. Reply `{"id":<n>,"ok":true,"result":<json>,"text":"<rendered>"}` or `{"id":<n>,"ok":false,"error":"<text>"}`. `MOTH_HOME` defaults to `~/Library/Application Support/moth`.
 
