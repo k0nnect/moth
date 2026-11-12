@@ -30,13 +30,21 @@ type row = { n : int; addr : int64; interp_id : string; tag : string; shown : st
     there (see [Wire.bits_of_value]) *)
 type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
 
-val create : Helper_api.helper -> t
+(** what to tell the user, the write, and whether the address still held it a moment later
+    ([true] when it could not be read back) *)
+type set_done = { text : string; w : written; held : bool }
+
+(** [budget_mb]: sent on a find's scan, none by default. [settle]: the wait between a write and
+    reading it back, a quarter of a second by default. *)
+val create : ?budget_mb:int -> ?settle:(unit -> unit) -> Helper_api.helper -> t
 
 (** starts a new hunt. A scan that fails ends the hunt there was. *)
 val find : t -> string -> (outcome, string) result
 
-(** narrows to the number typed. With no exact match it falls back on the direction the number
-    moved from the last number typed, unless a relation step came since; then it is a dead end. *)
+(** narrows to the number typed. When it differs from the last number typed, a float reading in
+    a group with stored values must also have moved. With no exact match it falls back on the
+    direction the number moved from the last number typed, unless a relation step, a set or an
+    undo came since; then it is a dead end. *)
 val next_number : t -> string -> (outcome, string) result
 
 val next_relation : t -> relation -> (outcome, string) result
@@ -44,8 +52,10 @@ val next_relation : t -> relation -> (outcome, string) result
 (** lists the hunt's smaller groups; [set] uses the latest listing until the hunt changes *)
 val results : t -> all:bool -> (row list, string) result
 
-(** what to tell the user, and the write *)
-val set : t -> row:int -> string -> (string * written, string) result
+(** writes the number, waits ([settle]), then reads the address back: the game putting back the
+    bytes the write replaced, or anything else there, is a second line and [held = false]. The
+    write can be undone either way. *)
+val set : t -> row:int -> string -> (set_done, string) result
 
 (** writes back the exact bytes the newest write replaced *)
 val undo : t -> (string * written, string) result

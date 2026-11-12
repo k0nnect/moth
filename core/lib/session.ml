@@ -30,15 +30,18 @@ type listed = { at : int; li : Interp.t; laddr : int64 }
 type write = { wn : int; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
 
 type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
+type set_done = { text : string; w : written; held : bool }
 
 type t = {
   h : helper;
+  budget_mb : int option; (* sent on a find's scan *)
+  settle : unit -> unit; (* the wait between a write and reading it back *)
   mutable hunt : hunt option;
   mutable listing : listed list; (* the last results listing, until the hunt changes *)
   mutable undo : write list; (* newest first *)
 }
 
-let create h = { h; hunt = None; listing = []; undo = [] }
+let create ?budget_mb ?(settle = fun () -> Unix.sleepf 0.25) h = { h; budget_mb; settle; hunt = None; listing = []; undo = [] }
 let no_hunt = "no hunt in progress. start one with: moth find <number>"
 let too_many = "too many matches to compare by change yet. type the new number instead."
 let game_closed = "the game closed. attach again once it's running."
@@ -143,6 +146,10 @@ let commit t current last =
   t.hunt <- Some { current; last };
   t.listing <- []
 
+(* a write or an undo changed a stored value, so the last number typed no longer says which way
+   a later number went *)
+let forget_last t = match t.hunt with Some hunt -> t.hunt <- Some { hunt with last = None } | None -> ()
+
 let find t text =
   match Value.parse text with
   | Error e -> Error e
@@ -151,7 +158,7 @@ let find t text =
           let plan = List.filter_map (fun i -> Option.map (fun p -> (i, p)) (Interp.pred_for i v)) (Interp.plan v) in
           let tl = tally () in
           let infos, st =
-            match t.h.scan ~keep:false ~budget_mb:None (List.map (fun (i, p) -> spec_of i p) plan) with
+            match t.h.scan ~keep:false ~budget_mb:t.budget_mb (List.map (fun (i, p) -> spec_of i p) plan) with
             | Ok r -> r
             | Error e ->
                 (* the helper may have dropped the old groups already, so the old hunt is over *)
@@ -179,10 +186,16 @@ let next_number t text =
               let tl = tally () in
               let pred g = Interp.pred_for g.interp m in
               let fits g = pred g <> None in
+              (* when the number changed, a float reading must have moved too, or a decimal lying
+                 between the two numbers stays; only a group with stored values can tell *)
+              let moved = match hunt.last with Some last -> relation_between m last <> Same | None -> false in
+              let exact g =
+                match pred g with Some (Range r) when moved && g.info.has_values -> Some (Range { r with moved = true }) | p -> p
+              in
               (* the exact number in the tracked groups, all or nothing *)
               let applied, narrowed =
                 narrow t tl
-                  (List.filter_map (fun g -> if g.info.tracked && g.info.count > 0 then Option.map (fun p -> (g.info.id, p)) (pred g) else None) hunt.current)
+                  (List.filter_map (fun g -> if g.info.tracked && g.info.count > 0 then Option.map (fun p -> (g.info.id, p)) (exact g) else None) hunt.current)
               in
               (* the untracked groups, searched again for it *)
               let rescan = List.filter_map (fun g -> if g.info.tracked then None else Option.map (spec_of g.interp) (pred g)) hunt.current in
@@ -269,8 +282,26 @@ let set t ~row text =
                   let vtype = l.li.vtype in
                   let r = call (t.h.write ~addr:l.laddr ~vtype (Put_value next)) in
                   t.undo <- { wn = row; wi = l.li; waddr = l.laddr; prev = r.prev; prev_bits = r.prev_bits; next } :: t.undo;
+                  forget_last t;
                   let w = { where = l.laddr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
-                  Ok (Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li r.prev), w))))
+                  let text = Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li r.prev) in
+                  (* a moment later, the raw bytes there say whether the game kept the write; a
+                     read that fails says nothing, unless the game or the helper is gone *)
+                  t.settle ();
+                  let why =
+                    match t.h.read ~addr:l.laddr ~vtype with
+                    | Error ({ code = "target_gone" | "helper_lost"; _ } as e) -> raise (Helper_failed e)
+                    | Error _ -> None
+                    | Ok v ->
+                        let bits = Wire.bits_of_value ~vtype v in
+                        if bits = w.bits_after then None
+                        else if bits = r.prev_bits then
+                          Some
+                            (Printf.sprintf "the game put it straight back to %s. it's worked out from something else, so writing here won't stick."
+                               (Interp.decode l.li r.prev))
+                        else Some (Printf.sprintf "it already reads %s: the game keeps changing it." (Interp.decode l.li v))
+                  in
+                  match why with None -> Ok { text; w; held = true } | Some why -> Ok { text = text ^ "\n" ^ why; w; held = false })))
 
 let undo t =
   match t.undo with
@@ -280,6 +311,7 @@ let undo t =
           let vtype = w.wi.vtype in
           let r = call (t.h.write ~addr:w.waddr ~vtype (Put_bits w.prev_bits)) in
           t.undo <- rest;
+          forget_last t;
           let done_ = { where = w.waddr; wtype = vtype; bits_before = r.prev_bits; bits_after = w.prev_bits } in
           Ok (Printf.sprintf "restored #%d to %s" w.wn (Interp.decode w.wi w.prev), done_))
 

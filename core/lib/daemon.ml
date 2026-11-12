@@ -403,9 +403,9 @@ let handle st ~cmd ~args ~opts =
       Result.map rows (Session.results s ~all:(List.assoc_opt "all" opts = Some "true"))
   | "set", [ row; v ] ->
       let* s = session () in
-      let* text, w = Session.set s ~row:(Option.get (row_number row)) v in
-      st.wrote <- Some (written_json w);
-      Ok (said text)
+      let* d = Session.set s ~row:(Option.get (row_number row)) v in
+      st.wrote <- Some (written_json d.w);
+      Ok (said d.text)
   | "undo", _ ->
       let* s = session () in
       let* text, w = Session.undo s in
