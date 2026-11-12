@@ -495,7 +495,7 @@ In `test_daemon.ml`, with the fake helper, one test each:
 - `results -n 0`, `-n 201`, `--from 0`: the usage errors above, and the helper is not called;
 - `keep #1 xp`, `kept`, `set xp 95`, `forget xp` round trip: the texts from Task 5, `kept --json` is a list of `{name, addr, tag, shown}`, the `set` JSON has `"held":true`;
 - `keep 0x6c551068 15 xp`: address form reaches `keep_at`;
-- `keep #2 5` and `keep #2 0x10` are refused (the name message) and nothing is kept; `keep 15` and `keep` alone give the usage error;
+- `keep #2 5` and `keep #2 0x10` are refused (the name message) and nothing is kept; `keep 15` and `keep` alone give the usage error; (Changed by ruling R16, from the final review: `keep` takes a bare row number as `set` does, so `keep 1 xp` and `keep 1` keep row 1, `keep 15` is `no result #15. run: moth results` when there is no row 15, and `keep 2 5` fails on the name rule. `keep 0`, `keep x` and `keep` alone give the usage error, whose text is unchanged. The help gains a line after the command list: `a result number can be written 3 or #3. in a script, write 3 or quote '#3'.`)
 - `set #1 9` where the read-back shows the old value: JSON `"held":false` and the two-line text;
 - `status` when the helper's `status` answers `None`: text `not attached. disco.exe closed.`, JSON `closed`, and a following `kept` says not attached;
 - a daemon started with `MOTH_BUDGET_MB=64` sends `budget_mb = Some 64` on `find`; with `MOTH_BUDGET_MB=abc` it sends `None`.
@@ -568,7 +568,7 @@ This task needs Chris at the keyboard. Do not mark stage 1b done without it. No 
 - Modify: `docs/verification/disco-elysium.md` (add a dated "stage 1b" section; leave the stage 1 record as it is)
 
 - [ ] **Step 1: Attach.** Chris starts the game from CrossOver with his headphones already connected and loads a save. `bin/moth attach --bottle "Disco Elysium" disco.exe`.
-- [ ] **Step 2: Experience, by numbers.** `find <xp>`, Chris gains experience, `next <new>`, until one address is left. `keep #1 xp`. `set xp 95`; the next gain levels him up.
+- [ ] **Step 2: Experience, by numbers.** `find <xp>`, Chris gains experience, `next <new>`, until one address is left. `keep 1 xp`. `set xp 95`; the next gain levels him up.
 - [ ] **Step 3: Money, through its neighbour.** `find <money as shown>`, then `results --near xp`. Set the nearest plausible row to an obvious amount; Chris confirms on screen. `keep` it as `money`.
 - [ ] **Step 4: Skill points.** With a skill point in hand: `find 1`, Chris spends it, `next 0`. Record both step times. `results --near xp`, set the nearest row to 5; Chris confirms five on the character sheet.
 - [ ] **Step 5: A recalculated number.** Conceptualization as in stage 1 (`find 6`, shirt off, `next 5`, shirt on, `next 6`), then `set` one of the rows. Record what moth said.

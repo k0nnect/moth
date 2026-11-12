@@ -22,6 +22,7 @@ let usage =
   stop                                 stop moth's background service
   daemon                               run the background service in the foreground
 
+  a result number can be written 3 or #3. in a script, write 3 or quote '#3'.
   --json prints the result as json.
 |}
 

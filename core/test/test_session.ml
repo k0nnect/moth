@@ -1081,9 +1081,19 @@ let set_a_kept_value () =
   check_int "no fallback narrow" 1 (narrow_calls f)
 
 let unknown_names () =
-  let s, _ = fresh () in
+  let s, f = fresh () in
   check_err "set" unknown_xp (Session.set_kept s ~name:"xp" "95");
-  check_err "forget" unknown_xp (Session.forget s "xp")
+  check_err "forget" unknown_xp (Session.forget s "xp");
+  (* a name with the form of an address says how to change one *)
+  check_err "set, an address"
+    "no kept value called 0x6c551068. to change an address, keep it first: moth keep 0x6c551068 <the number it shows>"
+    (Session.set_kept s ~name:"0x6c551068" "95");
+  check_err "set, an address in capitals"
+    "no kept value called 0X6C551068. to change an address, keep it first: moth keep 0X6C551068 <the number it shows>"
+    (Session.set_kept s ~name:"0X6C551068" "95");
+  check_err "set, not quite an address" "no kept value called 0x6g. see: moth kept" (Session.set_kept s ~name:"0x6g" "95");
+  check_err "forget, an address" "no kept value called 0x6c551068. see: moth kept" (Session.forget s "0x6c551068");
+  check_int "nothing written" 0 (write_calls f)
 
 let kept_values_and_a_closed_game () =
   let s, f = fresh () in

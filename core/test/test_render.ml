@@ -1,6 +1,8 @@
 open Moth_core
 
 let check_str n w g = Alcotest.(check string) n w g
+let check_bool n w g = Alcotest.(check bool) n w g
+let last_line s = List.nth (String.split_on_char '\n' s) (List.length (String.split_on_char '\n' s) - 1)
 
 let outcome () =
   check_str "counts" "259,560 matches (241,178 whole number, 18,382 decimal)"
@@ -95,6 +97,15 @@ let rows_near () =
          { n = 3; addr = 0x6c551068L; interp_id = "i32"; tag = "whole number"; shown = "15"; away = Some 0 };
        ])
 
+let listing () =
+  let row n : Session.row = { n; addr = Int64.of_int (0x1000 + (4 * n)); interp_id = "i32"; tag = "whole number"; shown = "3"; away = None } in
+  let page rows total : Session.listing = { rows; total; from = (List.hd rows).n } in
+  check_str "the total with separators" "showing 1-3 of 10,245. more: moth results --from 4" (last_line (Render.listing ~all:false (page [ row 1; row 2; row 3 ] 10245)));
+  check_str "and the rows" "showing 1,001-1,002 of 10,245. more: moth results --all --from 1003 --near xp"
+    (last_line (Render.listing ~near:"xp" ~all:true (page [ row 1001; row 1002 ] 10245)));
+  check_str "small numbers as before" "showing 21-22 of 30. more: moth results --from 23" (last_line (Render.listing ~all:false (page [ row 21; row 22 ] 30)));
+  check_bool "the last page has no such line" false (String.contains (Render.listing ~all:false (page [ row 1; row 2 ] 2)) 's')
+
 let kept () =
   check_str "kept" "xp     95    0x6c551068  whole number\ncents  5.32  0x6c551078  whole number ×100\nhp     ?     0x10        decimal"
     (Render.kept
@@ -115,6 +126,7 @@ let () =
           Alcotest.test_case "commas" `Quick commas;
           Alcotest.test_case "rows" `Quick rows;
           Alcotest.test_case "rows near a value" `Quick rows_near;
+          Alcotest.test_case "a page of results" `Quick listing;
           Alcotest.test_case "kept" `Quick kept;
           Alcotest.test_case "sizes" `Quick sizes;
         ] );

@@ -421,9 +421,11 @@ let check_usage ~cmd ~args ~opts =
       let* () = need (whole "n" (fun n -> n >= 1 && n <= 200)) "results -n needs a number from 1 to 200" in
       need (whole "from" (fun n -> n >= 1)) "results --from needs a row number, 1 or more"
   | "keep" ->
+      (* a result's number, #3 or 3 as set takes it (a shell reads # as a comment), or an address
+         and the number it shows *)
       need
         (match args with
-        | ([ r ] | [ r; _ ]) when String.starts_with ~prefix:"#" r -> row_number r <> None
+        | ([ r ] | [ r; _ ]) when row_number r <> None -> true
         | [ a; _ ] | [ a; _; _ ] -> address a <> None
         | _ -> false)
         "keep needs a result, or an address and the number it shows: moth keep <#n> [name], or moth keep <0xaddr> <number> [name]"

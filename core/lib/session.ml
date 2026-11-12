@@ -531,6 +531,12 @@ let forget t name =
       t.named <- List.filter (fun k -> k.kname <> name) t.named;
       Ok ("forgot " ^ name)
 
-let set_kept t ~name text = match find_kept t name with None -> Error (no_kept name) | Some k -> write_checked t ~label:name k.ki k.kat text
+let set_kept t ~name text =
+  match find_kept t name with
+  | Some k -> write_checked t ~label:name k.ki k.kat text
+  | None when parse_addr name <> None ->
+      (* an address is changed through a kept value *)
+      Error (Printf.sprintf "no kept value called %s. to change an address, keep it first: moth keep %s <the number it shows>" name name)
+  | None -> Error (no_kept name)
 
 let current t = Option.map (fun h -> outcome_of (tally ()) h.current) t.hunt

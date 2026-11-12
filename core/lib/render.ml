@@ -71,7 +71,7 @@ let listing ?near ~all (l : Session.listing) =
   match (l.rows, List.rev l.rows) with
   | (first : Session.row) :: _, (last : Session.row) :: _ when last.n < l.total ->
       let again = (if all then " --all" else "") ^ Printf.sprintf " --from %d" (last.n + 1) ^ match near with Some t -> " --near " ^ t | None -> "" in
-      Printf.sprintf "%s\nshowing %d-%d of %d. more: moth results%s" text first.n last.n l.total again
+      Printf.sprintf "%s\nshowing %s-%s of %s. more: moth results%s" text (commas first.n) (commas last.n) (commas l.total) again
   | _ -> text
 
 let kept = function

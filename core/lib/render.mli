@@ -15,7 +15,8 @@ val counts : Session.outcome -> string
 val rows : Session.row list -> string
 
 (** a page of results: its rows, then, when rows remain, the line saying which rows these are
-    and the command for the next page, which repeats [--all] and [--near <target>] when given *)
+    and of how many (with thousands separators) and the command for the next page, which
+    repeats [--all] and [--near <target>] when given *)
 val listing : ?near:string -> all:bool -> Session.listing -> string
 
 (** one line per kept value: name, value, address, tag *)

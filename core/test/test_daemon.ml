@@ -683,6 +683,10 @@ let keep_by_name () =
       check_err "forgotten" "no kept value called xp. see: moth kept" (call d "forget" [ "xp" ]);
       check_err "set, forgotten" "no kept value called xp. see: moth kept" (call d "set" [ "xp"; "1" ]);
       check_err "set, a name there can't be" "no kept value called X Y. see: moth kept" (call d "set" [ "X Y"; "1" ]);
+      check_err "set, an address"
+        "no kept value called 0x6c551068. to change an address, keep it first: moth keep 0x6c551068 <the number it shows>"
+        (call d "set" [ "0x6c551068"; "95" ]);
+      check_err "forget, an address" "no kept value called 0x6c551068. see: moth kept" (call d "forget" [ "0x6c551068" ]);
       check_err "forget usage" "forget needs a name: moth forget <name>" (call d "forget" []);
       check_err "forget usage, two" "forget needs a name: moth forget <name>" (call d "forget" [ "a"; "b" ]);
       check_err "kept takes nothing" "kept takes no arguments" (call d "kept" [ "xp" ]))
@@ -725,8 +729,26 @@ let keep_refused () =
       let usage = "keep needs a result, or an address and the number it shows: moth keep <#n> [name], or moth keep <0xaddr> <number> [name]" in
       List.iter
         (fun args -> check_err (String.concat " " ("keep" :: args)) usage (call d "keep" args))
-        [ [ "15" ]; []; [ "0x10" ]; [ "#1"; "a"; "b" ]; [ "#0" ]; [ "#x" ]; [ "2"; "xp" ]; [ "0x"; "5" ]; [ "0xg1"; "5" ]; [ "0x10"; "5"; "a"; "b" ] ];
+        [ []; [ "0x10" ]; [ "#1"; "a"; "b" ]; [ "#0" ]; [ "#x" ]; [ "0x"; "5" ]; [ "0xg1"; "5" ]; [ "0x10"; "5"; "a"; "b" ] ];
       check_str "nothing kept" nothing_kept (text (call d "kept" [])))
+
+(* R16: keep takes a bare result number, as set does, so a script need not quote # *)
+let keep_a_bare_number () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 2;
+      Fake_helper.queue_peek f "i32" (threes 2);
+      ignore (text (call d "results" []));
+      check_str "keep 1 xp" "kept #1 as xp (3, whole number)" (text (call d "keep" [ "1"; "xp" ]));
+      check_str "keep 1" "kept #1 as v1 (3, whole number)" (text (call d "keep" [ "1" ]));
+      check_err "keep 2 5: the name rule" name_msg (call d "keep" [ "2"; "5" ]);
+      check_err "a row not listed" "no result #15. run: moth results" (call d "keep" [ "15" ]);
+      let usage = "keep needs a result, or an address and the number it shows: moth keep <#n> [name], or moth keep <0xaddr> <number> [name]" in
+      List.iter (fun args -> check_err (String.concat " " ("keep" :: args)) usage (call d "keep" args)) [ [ "0" ]; [ "x" ]; [ "0"; "xp" ]; [ "x"; "xp" ]; [ "1"; "a"; "b" ] ];
+      Fake_helper.queue_read f (Vint 3L);
+      Fake_helper.queue_read f (Vint 3L);
+      check_str "kept, and nothing else" "xp  3  0x1000  whole number\nv1  3  0x1000  whole number" (text (call d "kept" [])))
 
 let set_put_back () =
   let fk, sh = fake () in
@@ -936,6 +958,7 @@ let () =
           t "keep, kept, set by name, forget" keep_by_name;
           t "keep by address" keep_by_address;
           t "keep refused" keep_refused;
+          t "keep a bare result number" keep_a_bare_number;
           t "a set the game put back" set_put_back;
           t "a write that could not be checked" a_write_that_could_not_be_checked;
           t "events say held, and the options" events_say_more;

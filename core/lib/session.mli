@@ -102,7 +102,8 @@ val kept : t -> (kept list, string) result
 
 val forget : t -> string -> (string, string) result
 
-(** [set] for a kept value, named in its texts and in [undo]'s *)
+(** [set] for a kept value, named in its texts and in [undo]'s. A name that is not kept but has
+    the form of an address gets an answer saying to keep it first. *)
 val set_kept : t -> name:string -> string -> (set_done, string) result
 
 (** the writes [undo] can still reverse: addr, vtype, previous, new; newest first *)
