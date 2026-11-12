@@ -47,8 +47,9 @@ void add_span(Spans& spans, size_t from, size_t to) {
     spans.push_back({from, to});
 }
 
-// The writable regions as one step (a scan or a narrow) finds them when it first needs them, after
-// a read failed: listed at most once per step, ascending, with touching regions joined.
+// The readable regions as one step (a scan or a narrow) finds them when it first needs them, after
+// a read failed: listed at most once per step, ascending, with touching regions joined. Readable,
+// not writable: a page made read-only since the scan can still be read.
 class Listing {
  public:
   explicit Listing(ProcessMemory& mem) : mem_(mem) {}
@@ -65,7 +66,7 @@ class Listing {
  private:
   void list() {
     listed_ = true;
-    std::vector<Region> rs = mem_.writable_regions();
+    std::vector<Region> rs = mem_.readable_regions();
     std::sort(rs.begin(), rs.end(), [](const Region& a, const Region& b) { return a.base < b.base; });
     for (const Region& r : rs) {
       if (r.size == 0) continue;
@@ -88,7 +89,7 @@ class Listing {
 // that gets nothing and covers more than one page is split in two at a page boundary near its
 // middle, and each half read the same way. So with a read that gets all or nothing (as
 // ReadProcessMemory does), an unreadable page loses only its own bytes, at about two reads per
-// halving. Given a listing, such a read first asks it for the writable regions: what lies outside
+// halving. Given a listing, such a read first asks it for the readable regions: what lies outside
 // all of them (memory the game has freed since it was listed) is not read again, and each part
 // inside one is read as above, split only if it fails too. Splitting stops once the process has
 // closed. Returns the bytes read.
@@ -360,7 +361,7 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
 
   std::vector<Region> regions = mem_.writable_regions();
   std::sort(regions.begin(), regions.end(), [](const Region& a, const Region& b) { return a.base < b.base; });
-  Listing listing(mem_);  // the regions listed again, once, if a read fails during the walk
+  Listing listing(mem_);  // the readable regions, listed once if a read fails during the walk
 
   peak_raw_offsets_ = 0;
   Searchers searchers(specs, workers_, cfg_.block_size + kOverlap);
@@ -537,7 +538,7 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
   std::vector<Run> spans, runs;
   Spans arrived;            // the buffer bytes that were read, run after run
   Bytes buf;
-  Listing listing(mem_);    // the regions listed, once, if a read fails
+  Listing listing(mem_);    // the readable regions, listed once if a read fails
   for (;;) {
     // the lowest next block among the lanes, and every lane whose next block is the same
     const PositionSet::Block* head = nullptr;

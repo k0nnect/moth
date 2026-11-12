@@ -1,3 +1,4 @@
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -22,14 +23,19 @@ template <class F> std::string error_code(F&& f) {
   return "";
 }
 
-// FakeMemory whose game frees the region at freed just after the scan lists the regions.
-struct FreeingMemory : FakeMemory {
-  uint64_t freed = 0;
-  int listings = 0;
+// FakeMemory whose game runs then() just after the scan lists the writable regions; it counts the
+// listings of each kind.
+struct ChangingMemory : FakeMemory {
+  std::function<void()> then;
+  int writable_listings = 0, readable_listings = 0;
   std::vector<Region> writable_regions() override {
     std::vector<Region> out = FakeMemory::writable_regions();
-    if (listings++ == 0) remove_region(freed);
+    if (writable_listings++ == 0 && then) then();
     return out;
+  }
+  std::vector<Region> readable_regions() override {
+    readable_listings++;
+    return FakeMemory::readable_regions();
   }
 };
 
@@ -79,14 +85,24 @@ TEST_CASE("a readable block is read with one call") {
   CHECK(m.read_calls == 1); CHECK(s.unreadable_bytes == 0);
 }
 TEST_CASE("a region freed after the scan listed it costs no read per page") {
-  // four 4 MiB blocks that all fail; the regions are listed again once, not once per block
+  // four 4 MiB blocks that all fail; the readable regions are listed once, not once per block
   const uint64_t big = 16u << 20;
-  FreeingMemory m; m.set_all_or_nothing(true); m.freed = 0x100000;
+  ChangingMemory m; m.set_all_or_nothing(true); m.then = [&] { m.remove_region(0x100000); };
   m.add_region(0x100000, big); m.add_region(0x100000 + big, 4096); m.poke<int32_t>(0x100000 + big, 7);
   Engine e(m, {.block_size = 4u << 20}); ScanStats s;
   CHECK(e.scan({G("a", I32, 4, 0, eq(7))}, false, s)[0].count == 1);
   CHECK(s.unreadable_bytes == big); CHECK(s.bytes == 4096);
-  CHECK(m.read_calls == 5); CHECK(m.listings == 2);
+  CHECK(m.read_calls == 5); CHECK(m.writable_listings == 1); CHECK(m.readable_listings == 1);
+}
+TEST_CASE("a scan still reads a region made read-only beside a page freed in it") {
+  // reads get all or nothing; the block's read fails on the freed page, and the read-only pages,
+  // no longer writable but still readable, are read again in halves
+  ChangingMemory m; m.set_all_or_nothing(true); m.add_region(0x10000, 4 * 4096);
+  for (int i = 0; i < 4; i++) m.poke<int32_t>(0x10040 + i * 4096, 7);
+  m.then = [&] { m.set_readonly(0x10000, true); m.free_page(0x11000); };
+  Engine e(m); ScanStats s;
+  CHECK(e.scan({G("a", I32, 4, 0, eq(7))}, false, s)[0].count == 3);
+  CHECK(s.unreadable_bytes == 4096); CHECK(s.bytes == 3 * 4096);
 }
 TEST_CASE("values are kept only up to value_cap") {
   FakeMemory m; m.add_region(0x10000, 4096); for (int i = 0; i < 5; i++) m.poke<int32_t>(0x10000 + i * 4, 100);

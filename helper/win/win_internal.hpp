@@ -12,6 +12,7 @@ class WinMemory : public ProcessMemory {
   WinMemory(const WinMemory&) = delete;
   WinMemory& operator=(const WinMemory&) = delete;
   std::vector<Region> writable_regions() override;
+  std::vector<Region> readable_regions() override;
   size_t read(uint64_t addr, void* out, size_t len) override;
   bool write(uint64_t addr, const void* data, size_t len) override;
   bool alive() override;

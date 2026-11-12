@@ -27,7 +27,7 @@ struct GroupInfo {
 // ms: wall-clock time of the step. A narrow walks no regions: its regions and unreadable_bytes are 0.
 // A read that fails or comes back short is read again in smaller parts, down to single pages, so
 // only bytes that really cannot be read are left out (see read_spans in engine.cpp). After a failed
-// read a step lists the writable regions once, and bytes no longer in any are left out unread.
+// read a step lists the readable regions once, and bytes no longer in any are left out unread.
 struct ScanStats {
   uint64_t regions = 0, bytes = 0, unreadable_bytes = 0, lost = 0;
   double ms = 0;

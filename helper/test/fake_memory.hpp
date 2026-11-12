@@ -50,6 +50,15 @@ class FakeMemory : public ProcessMemory {
     return out;
   }
 
+  // Every region but unreadable ones, read-only ones included. A freed page stays inside its region.
+  std::vector<Region> readable_regions() override {
+    std::vector<Region> out;
+    if (!alive_) return out;
+    for (const auto& [base, r] : regions_)
+      if (!r.unreadable) out.push_back({base, r.bytes.size()});
+    return out;
+  }
+
   size_t read(uint64_t addr, void* out, size_t len) override {
     read_calls++;
     if (!alive_) return 0;

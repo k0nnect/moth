@@ -208,6 +208,16 @@ TEST_CASE("a region that lost its middle pages keeps the candidates still listed
   CHECK(s.bytes == (4096 - 0x40) + 0x44); CHECK(m.read_calls == 3);
   auto p = e.peek("a", 0, 9); REQUIRE(p.size() == 2); CHECK(p[1].addr == 0x13040);
 }
+TEST_CASE("a region made read-only after the scan loses only the candidates in its freed page") {
+  // reads get all or nothing; the run fails on the freed page, and the read-only pages, no longer
+  // writable but still readable, keep their candidates
+  FakeMemory m; m.set_all_or_nothing(true); m.add_region(0x10000, 4 * 4096);
+  for (int i = 0; i < 4; i++) m.poke<int32_t>(0x10040 + i * 4096, 100);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  m.set_readonly(0x10000, true); m.free_page(0x11000);
+  CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(g[0].count == 3); CHECK(s.lost == 1);
+  auto p = e.peek("a", 0, 9); REQUIRE(p.size() == 3); CHECK(p[1].addr == 0x12040);
+}
 TEST_CASE("the game closing in the middle of a narrow changes nothing") {
   DyingMemory m; three(m); m.add_region(0x50000, 4096); m.poke<int32_t>(0x50000, 100);
   Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);

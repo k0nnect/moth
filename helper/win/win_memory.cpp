@@ -12,15 +12,10 @@ bool writable_protection(DWORD p) {
   return base == PAGE_READWRITE || base == PAGE_WRITECOPY || base == PAGE_EXECUTE_READWRITE ||
          base == PAGE_EXECUTE_WRITECOPY;
 }
-}  // namespace
+bool readable_protection(DWORD p) { return (p & (PAGE_GUARD | PAGE_NOACCESS)) == 0; }
 
-WinMemory::WinMemory(HANDLE process) : process_(process) {}
-
-WinMemory::~WinMemory() {
-  if (process_) CloseHandle(process_);
-}
-
-std::vector<Region> WinMemory::writable_regions() {
+// The committed regions whose protection passes keep, ascending, with touching ones joined.
+std::vector<Region> committed_regions(HANDLE process, bool (*keep)(DWORD)) {
   std::vector<Region> out;
   SYSTEM_INFO si;
   GetSystemInfo(&si);
@@ -28,11 +23,11 @@ std::vector<Region> WinMemory::writable_regions() {
   const uint64_t limit = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
   while (addr < limit) {
     MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQueryEx(process_, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof mbi) != sizeof mbi) break;
+    if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof mbi) != sizeof mbi) break;
     uint64_t base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
     uint64_t size = mbi.RegionSize;
     if (size == 0) break;
-    if (mbi.State == MEM_COMMIT && writable_protection(mbi.Protect)) {
+    if (mbi.State == MEM_COMMIT && keep(mbi.Protect)) {
       if (!out.empty() && out.back().base + out.back().size == base)
         out.back().size += size;
       else
@@ -44,6 +39,18 @@ std::vector<Region> WinMemory::writable_regions() {
   }
   return out;
 }
+}  // namespace
+
+WinMemory::WinMemory(HANDLE process) : process_(process) {}
+
+WinMemory::~WinMemory() {
+  if (process_) CloseHandle(process_);
+}
+
+std::vector<Region> WinMemory::writable_regions() { return committed_regions(process_, writable_protection); }
+
+// No-access and guard pages are committed but fail a read.
+std::vector<Region> WinMemory::readable_regions() { return committed_regions(process_, readable_protection); }
 
 size_t WinMemory::read(uint64_t addr, void* out, size_t len) {
   SIZE_T got = 0;

@@ -46,6 +46,7 @@ class FakePlatform : public Platform {
     FakeMemory& m;
     explicit Forward(FakeMemory& f) : m(f) {}
     std::vector<Region> writable_regions() override { return m.writable_regions(); }
+    std::vector<Region> readable_regions() override { return m.readable_regions(); }
     size_t read(uint64_t a, void* o, size_t n) override { return m.read(a, o, n); }
     bool write(uint64_t a, const void* d, size_t n) override { return m.write(a, d, n); }
     bool alive() override { return m.alive(); }
