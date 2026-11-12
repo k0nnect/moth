@@ -1,7 +1,7 @@
 open Helper_api
 
 type relation = Down | Up | Same | Changed
-type note = Fell_back of relation | Showing_wide | Untracked | Lost of int
+type note = Fell_back of relation | Showing_wide | Untracked | Lost of int | Snapshot_taken
 
 type outcome = {
   main : int;
@@ -17,41 +17,48 @@ type outcome = {
 
 type row = { n : int; addr : int64; interp_id : string; tag : string; shown : string; away : int option }
 type listing = { rows : row list; total : int; from : int }
-type kept = { name : string; kaddr : int64; ktag : string; kshown : string }
+type kept = { name : string; kaddr : int64; ktag : string; kshown : string; set_to : string option; put_back : bool }
 
 (* one helper group and the interpretation it searches for *)
 type group = { interp : Interp.t; info : group_info }
 
 (* current: the hunt's groups in plan order. last: the last number typed that applied, which the
-   helper's stored values hold; None after a relation step (a fallback is one) moved them on. *)
-type hunt = { current : group list; last : Value.t option }
+   helper's stored values hold; None after a relation step (a fallback is one) moved them on, and
+   for a hunt from a snapshot. blind: a hunt from a snapshot no step has narrowed yet, every
+   aligned place still a candidate. *)
+type hunt = { current : group list; last : Value.t option; blind : bool }
 
 (* a row of the latest listing, which set and keep_row take by its number *)
 type listed = { at : int; li : Interp.t; laddr : int64; lshown : string }
 
-(* a value kept by name: where it is, read and written as [ki] *)
-type keeping = { kname : string; kat : int64; ki : Interp.t }
+(* wid: the write's number, in the order made. wlabel: how the texts name it, "#2" or a kept
+   name. prev_bits: the bytes the write replaced, which undo puts back exactly *)
+type write = { wid : int; wlabel : string; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
 
-(* wlabel: how the texts name it, "#2" or a kept name. prev_bits: the bytes the write replaced,
-   which undo puts back exactly *)
-type write = { wlabel : string; wi : Interp.t; waddr : int64; prev : value; prev_bits : int64; next : value }
+(* a value kept by name: where it is, read and written as [ki]. kset: the newest write made to
+   it by name, until that write is undone *)
+type keeping = { kname : string; kat : int64; ki : Interp.t; kset : write option }
 
 type written = { where : int64; wtype : string; bits_before : int64; bits_after : int64 }
 type set_done = { text : string; w : written; held : bool option }
 
 type t = {
   h : helper;
-  budget_mb : int option; (* sent on a find's scan *)
+  budget_mb : int option; (* sent on a find's scan and on a snapshot *)
+  snapshot_mb : int option; (* the most memory a snapshot may take, sent on each *)
   settle : unit -> unit; (* the wait between a write and reading it back *)
   mutable hunt : hunt option;
   mutable listing : listed list; (* the rows of the last results listing, until the hunt changes *)
   mutable undo : write list; (* newest first *)
+  mutable next_wid : int; (* the number the next write gets *)
   mutable named : keeping list; (* the values kept by name, in the order kept *)
 }
 
-let create ?budget_mb ?(settle = fun () -> Unix.sleepf 0.25) h = { h; budget_mb; settle; hunt = None; listing = []; undo = []; named = [] }
+let create ?budget_mb ?snapshot_mb ?(settle = fun () -> Unix.sleepf 0.25) h =
+  { h; budget_mb; snapshot_mb; settle; hunt = None; listing = []; undo = []; next_wid = 0; named = [] }
+
 let no_hunt = "no hunt in progress. start one with: moth find <number>"
-let too_many = "too many matches to compare by change yet. type the new number instead."
+let too_many = "too many matches to compare by change yet. type the new number instead, or start again by change alone: moth snapshot"
 let game_closed = "the game closed. attach again once it's running."
 let helper_lost = "lost contact with moth's helper. attach again."
 let hunt_lost = "the hunt was lost. start again with: moth find <number>"
@@ -157,9 +164,16 @@ let narrow t tl items =
     add tl st;
     (applied, infos)
 
-let commit t current last =
-  t.hunt <- Some { current; last };
+(* the hunt is [current] now; a step that applied leaves it blind no longer *)
+let commit ?(blind = false) t current last =
+  t.hunt <- Some { current; last; blind };
   t.listing <- []
+
+(* the groups the helper reports for the interpretations, in their order *)
+let groups_of interps infos =
+  List.filter_map
+    (fun (interp : Interp.t) -> Option.map (fun info -> { interp; info }) (List.find_opt (fun (i : group_info) -> i.id = interp.id) infos))
+    interps
 
 (* a write or an undo changed a stored value, so the last number typed no longer says which way
    a later number went *)
@@ -182,13 +196,56 @@ let find t text =
                 raise (Helper_failed e)
           in
           add tl st;
-          let current =
-            List.filter_map
-              (fun ((interp : Interp.t), _) -> Option.map (fun info -> { interp; info }) (List.find_opt (fun (i : group_info) -> i.id = interp.id) infos))
-              plan
-          in
+          let current = groups_of (List.map fst plan) infos in
           commit t current (Some v);
           Ok (outcome_of tl current))
+
+(* ---- a hunt from a snapshot ---- *)
+
+let size n =
+  let f = float_of_int n in
+  let kb = max 1 (int_of_float (Float.round (f /. 1024.))) in
+  let mb = int_of_float (Float.round (f /. 1048576.)) in
+  if kb < 1024 then Printf.sprintf "%d kb" kb else if mb < 1024 then Printf.sprintf "%d mb" mb else Printf.sprintf "%.1f gb" (f /. 1073741824.)
+
+(* the helper's size check refused with "<bytes> to snapshot, limit <bytes>": the two counts *)
+let refused_sizes message =
+  let count s = if s <> "" && String.for_all (fun c -> c >= '0' && c <= '9') s then int_of_string_opt s else None in
+  match String.split_on_char ' ' message with
+  | [ need; "to"; "snapshot,"; "limit"; limit ] -> ( match (count need, count limit) with Some n, Some l -> Some (n, l) | _ -> None)
+  | _ -> None
+
+let over_limit need limit =
+  Printf.sprintf "the game has %s of memory to snapshot, more than moth's limit of %s. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>"
+    (size need) (size limit)
+
+let no_memory = "moth couldn't get the memory for a snapshot. close something large, or hunt with a number: moth find <number>"
+
+let snapshot t =
+  guard t (fun () ->
+      let groups = List.map (fun (i : Interp.t) -> (i.id, i.vtype, i.align)) Interp.blind_plan in
+      match t.h.snapshot ~cap_mb:t.snapshot_mb ~budget_mb:t.budget_mb groups with
+      | Error { code = "too_big"; message } -> (
+          match refused_sizes message with
+          | Some (need, limit) ->
+              (* the size check refused before the helper changed anything: the hunt there was stays *)
+              Error (over_limit need limit)
+          | None ->
+              (* it couldn't get the memory and has let go of its groups (a message without the
+                 two sizes is taken the same way), so the hunt there was is over *)
+              drop_hunt t;
+              Error no_memory)
+      | Error e ->
+          (* the helper may have dropped the old groups already, as in a find *)
+          drop_hunt t;
+          raise (Helper_failed e)
+      | Ok (infos, st) ->
+          let tl = tally () in
+          add tl st;
+          let current = groups_of Interp.blind_plan infos in
+          commit ~blind:true t current None;
+          let o = outcome_of tl current in
+          Ok { o with notes = Snapshot_taken :: o.notes })
 
 let next_number t text =
   match t.hunt with
@@ -380,9 +437,12 @@ let listing_of t ~from ~total found =
 (* where a near target is: a 0x address, else a kept value's *)
 let target_addr t target = match parse_addr target with Some a -> Some a | None -> Option.map (fun k -> k.kat) (find_kept t target)
 
+let nothing_yet = "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed."
+
 let results t ~all ~from ~limit ~near =
   match t.hunt with
   | None -> Error no_hunt
+  | Some { blind = true; _ } -> Error nothing_yet
   | Some hunt -> (
       let gs = shown_groups hunt ~all in
       let list numbered = guard t (fun () -> Result.map (fun (found, total) -> listing_of t ~from ~total found) (numbered ())) in
@@ -397,15 +457,18 @@ let results t ~all ~from ~limit ~near =
 
 (* writes the number at [addr] as [i] and records it for undo; then, a moment later, the raw
    bytes there say whether the game kept it. [label] names it in the texts: "#2", or a kept
-   value's name. *)
-let write_checked t ~label (i : Interp.t) addr text =
+   value's name. A write made through a kept value, [by_name], is that value's newest. *)
+let write_checked ?(by_name = false) t ~label (i : Interp.t) addr text =
   match Result.bind (Value.parse text) (Interp.encode i) with
   | Error e -> Error e
   | Ok next ->
       guard t (fun () ->
           let vtype = i.vtype in
           let r = call (t.h.write ~addr ~vtype (Put_value next)) in
-          t.undo <- { wlabel = label; wi = i; waddr = addr; prev = r.prev; prev_bits = r.prev_bits; next } :: t.undo;
+          let made = { wid = t.next_wid; wlabel = label; wi = i; waddr = addr; prev = r.prev; prev_bits = r.prev_bits; next } in
+          t.next_wid <- t.next_wid + 1;
+          t.undo <- made :: t.undo;
+          if by_name then t.named <- List.map (fun k -> if k.kname = label then { k with kset = Some made } else k) t.named;
           forget_last t;
           let w = { where = addr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
           let text = Printf.sprintf "set %s to %s (was %s)" label (Interp.decode i next) (Interp.decode i r.prev) in
@@ -450,6 +513,8 @@ let undo t =
           let vtype = w.wi.vtype in
           let r = call (t.h.write ~addr:w.waddr ~vtype (Put_bits w.prev_bits)) in
           t.undo <- rest;
+          (* a kept value whose newest write this was has none to speak of now *)
+          t.named <- List.map (fun k -> match k.kset with Some s when s.wid = w.wid -> { k with kset = None } | _ -> k) t.named;
           forget_last t;
           let done_ = { where = w.waddr; wtype = vtype; bits_before = r.prev_bits; bits_after = w.prev_bits } in
           Ok (Printf.sprintf "restored %s to %s" w.wlabel (Interp.decode w.wi w.prev), done_))
@@ -478,7 +543,7 @@ let new_name t name =
       let rec free k = if find_kept t (Printf.sprintf "v%d" k) = None then Printf.sprintf "v%d" k else free (k + 1) in
       Ok (free 1)
 
-let add_kept t name i addr = t.named <- t.named @ [ { kname = name; kat = addr; ki = i } ]
+let add_kept t name i addr = t.named <- t.named @ [ { kname = name; kat = addr; ki = i; kset = None } ]
 
 (* the value at [addr] as [i]'s type, or [None] when that memory can't be read *)
 let read_as t (i : Interp.t) addr =
@@ -497,8 +562,12 @@ let keep_row t ~row ~name =
           match List.find_opt (fun l -> l.at = row) t.listing with
           | None -> Error (no_row row)
           | Some l ->
-              add_kept t name l.li l.laddr;
-              Ok (Printf.sprintf "kept #%d as %s (%s, %s)" row name l.lshown (Interp.describe l.li))))
+              guard t (fun () ->
+                  (* how it reads now, which a write since the listing may have changed; as listed
+                     when it can't be read *)
+                  let shown = match read_as t l.li l.laddr with Some v -> Interp.decode l.li v | None -> l.lshown in
+                  add_kept t name l.li l.laddr;
+                  Ok (Printf.sprintf "kept #%d as %s (%s, %s)" row name shown (Interp.describe l.li)))))
 
 let keep_at t ~addr text ~name =
   match new_name t name with
@@ -520,8 +589,17 @@ let kept t =
       Ok
         (List.map
            (fun k ->
-             let kshown = shown_as k.ki (read_as t k.ki k.kat) in
-             { name = k.kname; kaddr = k.kat; ktag = Interp.describe k.ki; kshown })
+             let now = read_as t k.ki k.kat in
+             (* the game put the newest write by name back when the raw bytes there now are the
+                ones it replaced and not the ones it wrote, as the write's own check reads them *)
+             let set_to, put_back =
+               match k.kset with
+               | None -> (None, false)
+               | Some w ->
+                   let bits v = Wire.bits_of_value ~vtype:w.wi.vtype v in
+                   (Some (Interp.decode w.wi w.next), match now with Some v -> bits v = w.prev_bits && bits v <> bits w.next | None -> false)
+             in
+             { name = k.kname; kaddr = k.kat; ktag = Interp.describe k.ki; kshown = shown_as k.ki now; set_to; put_back })
            t.named))
 
 let forget t name =
@@ -533,7 +611,7 @@ let forget t name =
 
 let set_kept t ~name text =
   match find_kept t name with
-  | Some k -> write_checked t ~label:name k.ki k.kat text
+  | Some k -> write_checked ~by_name:true t ~label:name k.ki k.kat text
   | None when parse_addr name <> None ->
       (* an address is changed through a kept value *)
       Error (Printf.sprintf "no kept value called %s. to change an address, keep it first: moth keep %s <the number it shows>" name name)

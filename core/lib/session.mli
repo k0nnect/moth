@@ -1,12 +1,16 @@
 (** The hunt: what to ask the helper for each number or change the user reports, and what
     came of it. The helper holds the candidates; this keeps the groups (one per interpretation
-    from [Interp.plan], in plan order), the last number typed, the last results listing, the
-    writes that can still be undone and the values kept by name. Losing the game or the helper
-    ends the hunt and drops the writes and the kept values; a lost group ends only the hunt. *)
+    from [Interp.plan], or from [Interp.blind_plan] for a hunt from a snapshot, in plan order),
+    the last number typed, the last results listing, the writes that can still be undone and the
+    values kept by name. One hunt at a time: a [find] or a [snapshot] replaces the hunt there
+    was. Losing the game or the helper ends the hunt and drops the writes and the kept values; a
+    lost group ends only the hunt. *)
 
 type t
 type relation = Down | Up | Same | Changed
-type note = Fell_back of relation | Showing_wide | Untracked | Lost of int
+
+(** [Snapshot_taken]: the hunt is a snapshot just taken, every aligned place a candidate *)
+type note = Fell_back of relation | Showing_wide | Untracked | Lost of int | Snapshot_taken
 
 (** [main] and [wide]: matches in the tracked groups of each tier. [by_tag]: the tracked groups
     being shown (wide ones only under [Showing_wide]) summed per [Interp.describe] tag, in plan
@@ -42,19 +46,32 @@ type written = { where : int64; wtype : string; bits_before : int64; bits_after 
     back (the text's second line says why) *)
 type set_done = { text : string; w : written; held : bool option }
 
-(** [budget_mb]: sent on a find's scan, none by default. [settle]: the wait between a write and
-    reading it back, a quarter of a second by default. *)
-val create : ?budget_mb:int -> ?settle:(unit -> unit) -> Helper_api.helper -> t
+(** [budget_mb]: sent on a find's scan and on a snapshot, none by default. [snapshot_mb]: the
+    most memory a snapshot may take, sent on each, none by default (the helper's own limit).
+    [settle]: the wait between a write and reading it back, a quarter of a second by default. *)
+val create : ?budget_mb:int -> ?snapshot_mb:int -> ?settle:(unit -> unit) -> Helper_api.helper -> t
 
 (** starts a new hunt. A scan that fails ends the hunt there was. *)
 val find : t -> string -> (outcome, string) result
+
+(** starts a new hunt from a snapshot of the game's memory: every aligned place of each of
+    [Interp.blind_plan]'s groups, with no number typed, so no baseline. The outcome carries
+    [Snapshot_taken] and the bytes read. Until a step applies there is nothing to list. When the
+    helper's size check refuses, the hunt there was stays and the error gives both sizes; any
+    other failure ends it, as a failed [find] does. *)
+val snapshot : t -> (outcome, string) result
+
+(** bytes as the user reads them, in 1024s: ["4 kb"], ["12 mb"], ["1.2 gb"] (never under 1 kb);
+    [Render.size] is this *)
+val size : int -> string
 
 (** narrows to the number typed. A float reading in a group with stored values must also have
     moved when the ranges this number and the last number typed give it overlap only in part, or
     not at all; when one range holds the other (5 and 5.3), it need not. With no exact match it
     falls back on the direction the number moved from the last number typed, unless a relation
-    step, a fallback, a set or an undo came since; then it is a dead end. A fallback is a relation
-    step: after it there is no last number typed. *)
+    step, a fallback, a set or an undo came since, or none was typed (a hunt from a snapshot);
+    then it is a dead end. A fallback is a relation step: after it there is no last number
+    typed. *)
 val next_number : t -> string -> (outcome, string) result
 
 val next_relation : t -> relation -> (outcome, string) result
@@ -63,7 +80,8 @@ val next_relation : t -> relation -> (outcome, string) result
 val reach : int
 
 (** rows [from] to [from + limit - 1] (1-based) of a listing of the groups shown: the tracked
-    ones with matches in main, and in wide too under [all] or when only wide is left.
+    ones with matches in main, and in wide too under [all] or when only wide is left. A hunt from
+    a snapshot that no step has narrowed yet has nothing to list, and says to step first.
 
     Without [near], the groups go fewest matches first, ties in plan order, each in address
     order, numbered from 1 across that order; [total] is their counts summed. With [near] (a kept
@@ -85,12 +103,16 @@ val set : t -> row:int -> string -> (set_done, string) result
 (** writes back the exact bytes the newest write replaced *)
 val undo : t -> (string * written, string) result
 
-(** a kept value: its name, address and tag, and how it reads now (["?"] when it can't be read) *)
-type kept = { name : string; kaddr : int64; ktag : string; kshown : string }
+(** a kept value: its name, address and tag, and how it reads now (["?"] when it can't be read).
+    [set_to]: the newest write made to it through [set_kept], as shown, until that write is
+    undone. [put_back]: the bytes there now are the ones that write replaced, not the ones it
+    wrote: the game put the value back. *)
+type kept = { name : string; kaddr : int64; ktag : string; kshown : string; set_to : string option; put_back : bool }
 
-(** keeps a row of the latest listing by name, or as the first of [v1], [v2], ... not in use. A
-    name is a lowercase letter and up to 23 lowercase letters, digits, [_] or [-]; at most 64
-    values are kept. Kept values outlast the hunt. *)
+(** keeps a row of the latest listing by name, or as the first of [v1], [v2], ... not in use, and
+    says how it reads now (as the listing showed it when it can't be read). A name is a lowercase
+    letter and up to 23 lowercase letters, digits, [_] or [-]; at most 64 values are kept. Kept
+    values outlast the hunt. *)
 val keep_row : t -> row:int -> name:string option -> (string, string) result
 
 (** keeps the address as the first interpretation of the number, in plan order, that reads as it
@@ -102,8 +124,9 @@ val kept : t -> (kept list, string) result
 
 val forget : t -> string -> (string, string) result
 
-(** [set] for a kept value, named in its texts and in [undo]'s. A name that is not kept but has
-    the form of an address gets an answer saying to keep it first. *)
+(** [set] for a kept value, named in its texts and in [undo]'s; [kept] then says whether the game
+    put it back. A name that is not kept but has the form of an address gets an answer saying to
+    keep it first. *)
 val set_kept : t -> name:string -> string -> (set_done, string) result
 
 (** the writes [undo] can still reverse: addr, vtype, previous, new; newest first *)

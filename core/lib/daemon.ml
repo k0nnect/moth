@@ -235,6 +235,7 @@ let note_name = function
   | Showing_wide -> "showing_wide"
   | Untracked -> "untracked"
   | Lost _ -> "lost"
+  | Snapshot_taken -> "snapshot"
 
 let outcome (o : Session.outcome) =
   let lost = List.fold_left (fun a -> function Session.Lost n -> a + n | _ -> a) 0 o.notes in

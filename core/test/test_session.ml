@@ -210,7 +210,8 @@ let relations () =
   let s, f = fresh () in
   queue_scan f [ gi ~values:false "i32" 3_000_000; gi ~values:false "f32" 2_500_000 ];
   ignore (ok (Session.find s "1"));
-  check_err "too many" "too many matches to compare by change yet. type the new number instead." (Session.next_relation s Down);
+  check_err "too many" "too many matches to compare by change yet. type the new number instead, or start again by change alone: moth snapshot"
+    (Session.next_relation s Down);
   check_int "nothing sent" 0 (narrow_calls f);
   let s, f = fresh () in
   queue_scan f [ gi "i32" 500; gi ~values:false "f32" 3_000_000; gi ~tracked:false "u8" 9_000_000 ];
@@ -775,7 +776,7 @@ let a_write_check_when_things_fail () =
 let near ?(from = 1) ?(limit = 20) s target = Session.results s ~all:false ~from ~limit ~near:(Some target)
 let aways (l : Session.listing) = List.map (fun (r : Session.row) -> Option.get r.away) l.rows
 let ns (l : Session.listing) = List.map (fun (r : Session.row) -> r.n) l.rows
-let kept_one name kaddr ktag kshown : Session.kept = { name; kaddr; ktag; kshown }
+let kept_one name kaddr ktag kshown : Session.kept = { name; kaddr; ktag; kshown; set_to = None; put_back = false }
 let kept_names s = List.map (fun (k : Session.kept) -> k.name) (ok (Session.kept s))
 let unknown_xp = "no kept value called xp. see: moth kept"
 let name_rule = "a name is lowercase letters, digits, - and _, starting with a letter."
@@ -914,6 +915,7 @@ let rows_that_cannot_be_read () =
   check_bool "the same positions, the same numbers" true (List.map (fun (r : Session.row) -> (r.n, r.addr)) l.rows = [ (5, at 5); (6, at 6) ]);
   queue_peek f "i32" [ it (at 1) (Vint 77L); it (at 2) (Vint 77L); hole (at 3); hole (at 4) ];
   ignore (ok (Session.results s ~all:false ~from:1 ~limit:4 ~near:None));
+  queue_error f "read" { code = "read_failed"; message = "cannot read 0x20ff8" };
   check_str "kept as any row" "kept #3 as v1 (?, whole number)" (ok (Session.keep_row s ~row:3 ~name:None));
   queue_error f "write" { code = "write_failed"; message = "cannot write 0x20ff8" };
   check_err "set as any row: the write says why it failed" "cannot write 0x20ff8" (Session.set s ~row:3 "9");
@@ -965,13 +967,14 @@ let a_kept_row_outlives_the_hunt () =
   ignore (ok (Session.find s "15"));
   queue_peek f "i32" [ it 0x6c551068L (Vint 15L) ];
   ignore (ok (first_page s));
+  queue_read f (Vint 15L);
   check_str "kept" "kept #1 as xp (15, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "xp")));
   check_err "a row not listed" "no result #2. run: moth results" (Session.keep_row s ~row:2 ~name:(Some "hp"));
   queue_scan f [ gi "i32" 40 ];
   ignore (ok (Session.find s "20"));
   queue_read f (Vint 20L);
   check_bool "kept through a new find, read now" true (ok (Session.kept s) = [ kept_one "xp" 0x6c551068L "whole number" "20" ]);
-  check_bool "read as its type" true (reads f = [ (0x6c551068L, "i32") ]);
+  check_bool "read as its type, when kept and now" true (reads f = [ (0x6c551068L, "i32"); (0x6c551068L, "i32") ]);
   check_err "a row needs a listing" "no result #1. run: moth results" (Session.keep_row s ~row:1 ~name:(Some "hp"))
 
 let keep_at_an_address () =
@@ -1111,6 +1114,313 @@ let kept_values_and_a_closed_game () =
   check_bool "cleared" true (ok (Session.kept s) = []);
   check_err "set by name" unknown_xp (Session.set_kept s ~name:"xp" "9")
 
+(* ---- a hunt from a snapshot ---- *)
+
+let blind_groups = [ gi "i32" 1000; gi "f32" 1000; gi "i16" 2000; gi "i64" 500; gi "f64" 500; gi "u8" 4000 ]
+let blind_ids = [ "i32"; "f32"; "i16"; "i64"; "f64"; "u8" ]
+let nothing_yet = "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed."
+
+let a_snapshot_hunt () =
+  let s, f = fresh () in
+  queue_snapshot ~stats:(stats ~bytes:4096 0.) f [ gi "i32" 1000; gi "f32" 1000; gi "i16" 2000; gi "i64" 500; gi "f64" 500; gi "u8" 4000 ];
+  let o = ok (Session.snapshot s) in
+  check_bool "note" true (List.mem Session.Snapshot_taken o.notes);
+  check_str "text" "snapshot of 4 kb taken. change the value in the game, then tell moth how it moved: moth next down, up, same or changed."
+    (Render.outcome o);
+  check_bool "asked for the blind plan" true
+    (last_snapshot_groups f = [ ("i32", "i32", 4); ("f32", "f32", 4); ("i16", "i16", 2); ("i64", "i64", 8); ("f64", "f64", 8); ("u8", "u8", 1) ]);
+  check_err "nothing to list before a step" "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed."
+    (Session.results s ~all:false ~from:1 ~limit:20 ~near:None);
+  queue_narrow f ~applied:true [ gi "i32" 3; gi "f32" 2; gi "i16" 5; gi "i64" 0; gi "f64" 0; gi "u8" 9 ];
+  let o = ok (Session.next_relation s Session.Down) in
+  check_int "main" 10 o.main;
+  check_pred "each group asked" Lt_prev (last_narrow_pred f "f32");
+  queue_narrow f ~applied:true [ gi "i32" 1; gi "f32" 0; gi "i16" 1 ];
+  ignore (ok (Session.next_number s "97"));
+  check_pred "a number after change steps" (Eq 97L) (last_narrow_pred f "i32");
+  check_pred "no baseline, so no moved" (Range { lo = 96.; hi = 98.; floor = 1e-6; moved = false }) (last_narrow_pred f "f32")
+
+(* a dead end is not a step, so there is still nothing to list; a relation step or a number that
+   applies is. A snapshot during a snapshot hunt starts it again. *)
+let a_snapshot_hunt_step_by_step () =
+  let s, f = fresh () in
+  queue_snapshot f blind_groups;
+  let o = ok (Session.snapshot s) in
+  check_ids "the hunt is the snapshot's groups" blind_ids (ids_of o);
+  check_bool "in their tiers" true (List.map snd o.groups = Interp.[ Main; Main; Main; Main; Main; Wide ]);
+  (* the first step a number: no baseline, so no exact match is a dead end, not a fallback *)
+  queue_narrow f ~applied:false [];
+  let o = ok (Session.next_number s "97") in
+  check_bool "dead end" true o.dead_end;
+  check_int "no fallback narrow" 1 (narrow_calls f);
+  check_ids "every group that can hold it, together" blind_ids (last_narrow_ids f);
+  check_str "says how else to hunt"
+    "nothing left that fits. that step was not applied, so you can try a different number, or hunt by how it moves: moth snapshot" (Render.outcome o);
+  check_err "still nothing to list" nothing_yet (first_page s);
+  check_err "nor near a value" nothing_yet (near s "0x1000");
+  queue_narrow f ~applied:false [];
+  check_bool "a relation dead end" true (ok (Session.next_relation s Up)).dead_end;
+  check_err "is no step either" nothing_yet (first_page s);
+  check_int "nothing peeked" 0 (List.length (peeks f) + List.length (peek_froms f));
+  queue_narrow f ~applied:true [ gi "i32" 2; gi "f32" 0; gi "i16" 0; gi "i64" 0; gi "f64" 0; gi "u8" 0 ];
+  ignore (ok (Session.next_relation s Up));
+  queue_peek f "i32" [ it 0x1000L (Vint 98L); it 0x2000L (Vint 99L) ];
+  check_ids "a relation step lists" [ "98"; "99" ] (List.map (fun (r : Session.row) -> r.shown) (rows_of (first_page s)));
+  (* again, over the hunt there was *)
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  check_int "a second snapshot" 2 (snapshot_calls f);
+  check_err "nothing to list again" nothing_yet (first_page s);
+  check_err "the old rows are gone" "no result #1. run: moth results" (Session.set s ~row:1 "5");
+  queue_narrow f ~applied:true [ gi "i32" 1; gi "f32" 0; gi "i16" 0; gi "i64" 0; gi "f64" 0; gi "u8" 0 ];
+  ignore (ok (Session.next_number s "98"));
+  queue_peek f "i32" [ it 0x1000L (Vint 98L) ];
+  check_int "a number is a step too" 1 (List.length (rows_of (first_page s)))
+
+(* a group the snapshot could not track is left out of a relation step, and said *)
+let a_snapshot_group_untracked () =
+  let s, f = fresh () in
+  queue_snapshot f [ gi "i32" 1000; gi "f32" 1000; gi "i16" 2000; gi "i64" 500; gi "f64" 500; gi ~tracked:false "u8" 4000 ];
+  let o = ok (Session.snapshot s) in
+  check_bool "noted" true (o.notes = [ Session.Snapshot_taken; Session.Untracked ]);
+  queue_narrow f ~applied:true [ gi "i32" 3; gi "f32" 0; gi "i16" 0; gi "i64" 0; gi "f64" 0 ];
+  let o = ok (Session.next_relation s Down) in
+  check_ids "not compared" [ "i32"; "f32"; "i16"; "i64"; "f64" ] (last_narrow_ids f);
+  check_bool "still said" true (List.mem Session.Untracked o.notes)
+
+(* the size check refused: the helper changed nothing, so neither does moth *)
+let a_snapshot_too_big () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 5 ];
+  ignore (ok (Session.find s "100"));
+  queue_peek f "i32" [ it 0x10L (Vint 100L) ];
+  ignore (ok (first_page s));
+  let before = Session.current s in
+  queue_error f "snapshot" { code = "too_big"; message = "4516605952 to snapshot, limit 1073741824" };
+  check_err "the two sizes"
+    "the game has 4.2 gb of memory to snapshot, more than moth's limit of 1.0 gb. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>"
+    (Session.snapshot s);
+  check_bool "the hunt is still there" true (before <> None && Session.current s = before);
+  queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
+  queue_read f (Vint 7L);
+  check_str "and its listing" "set #1 to 7 (was 100)" (set_text (Session.set s ~row:1 "7"));
+  queue_narrow f ~applied:true [ gi "i32" 1 ];
+  check_int "and its steps" 1 (ok (Session.next_number s "7")).main;
+  (* no hunt before: none after *)
+  let s, f = fresh () in
+  queue_error f "snapshot" { code = "too_big"; message = "20000000 to snapshot, limit 16777216" };
+  check_err "small sizes" "the game has 19 mb of memory to snapshot, more than moth's limit of 16 mb. raise it with MOTH_SNAPSHOT_MB, or hunt with a number: moth find <number>"
+    (Session.snapshot s);
+  check_bool "no hunt" true (Session.current s = None)
+
+(* the helper could not get the memory and has let go of its groups; a too_big without the two
+   sizes is taken the same way *)
+let a_snapshot_without_memory () =
+  let no_memory = "moth couldn't get the memory for a snapshot. close something large, or hunt with a number: moth find <number>" in
+  List.iter
+    (fun message ->
+      let s, f = fresh () in
+      queue_scan f [ gi "i32" 5 ];
+      ignore (ok (Session.find s "100"));
+      queue_error f "snapshot" { code = "too_big"; message };
+      check_err message no_memory (Session.snapshot s);
+      check_bool (message ^ ": the hunt is over") true (Session.current s = None);
+      check_err (message ^ ": no steps") no_hunt (Session.next_number s "5"))
+    [ "could not get memory for the snapshot"; "4516605952 to snapshot"; "4.2e9 to snapshot, limit 1073741824"; "+5 to snapshot, limit 4"; "" ]
+
+(* any other failure ends the hunt there was, as a failed find does; losing the game or the
+   helper ends the kept values and the writes too *)
+let a_snapshot_that_fails () =
+  let s, f = fresh () in
+  queue_read f (Vint 15L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+  queue_scan f [ gi "i32" 5 ];
+  ignore (ok (Session.find s "100"));
+  queue_error f "snapshot" { code = "bad_request"; message = "out of memory" };
+  check_err "passed through" "out of memory" (Session.snapshot s);
+  check_bool "the hunt is over" true (Session.current s = None);
+  queue_read f (Vint 15L);
+  check_ids "kept values stay" [ "xp" ] (kept_names s);
+  List.iter
+    (fun ((e : err), msg) ->
+      let s, f = fresh () in
+      queue_read f (Vint 15L);
+      ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+      queue_write f ~prev:(Vint 15L) ~prev_bits:15L;
+      queue_read f (Vint 16L);
+      ignore (ok (Session.set_kept s ~name:"xp" "16"));
+      queue_scan f [ gi "i32" 5 ];
+      ignore (ok (Session.find s "100"));
+      queue_error f "snapshot" e;
+      check_err e.code msg (Session.snapshot s);
+      check_bool (e.code ^ ": no hunt") true (Session.current s = None);
+      check_bool (e.code ^ ": nothing kept") true (ok (Session.kept s) = []);
+      check_bool (e.code ^ ": no writes") true (Session.writes s = []))
+    [ (gone, closed); ({ code = "helper_lost"; message = "" }, "lost contact with moth's helper. attach again.") ]
+
+let snapshots_carry_the_limit () =
+  let s, f = fresh () in
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  check_bool "no limit set" true (last_snapshot_cap f = None);
+  check_bool "no budget set" true (last_snapshot_budget f = None);
+  let h, f = Fake_helper.create () in
+  let s = Session.create ~budget_mb:64 ~snapshot_mb:2048 ~settle:(fun () -> ()) h in
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  check_bool "the limit" true (last_snapshot_cap f = Some 2048);
+  check_bool "the budget, as a find sends it" true (last_snapshot_budget f = Some 64)
+
+(* one hunt at a time: each kind replaces the other; kept values and writes outlast both *)
+let hunts_replace_each_other () =
+  let s, f = fresh () in
+  queue_read f (Vint 15L);
+  ignore (ok (Session.keep_at s ~addr:0x6c551068L "15" ~name:(Some "xp")));
+  queue_write f ~prev:(Vint 15L) ~prev_bits:15L;
+  queue_read f (Vint 16L);
+  ignore (ok (Session.set_kept s ~name:"xp" "16"));
+  queue_scan f [ gi "i32" 5 ];
+  ignore (ok (Session.find s "100"));
+  queue_snapshot f blind_groups;
+  ignore (ok (Session.snapshot s));
+  check_ids "a snapshot replaces a number hunt" blind_ids (ids_of (Option.get (Session.current s)));
+  queue_scan f [ gi "i32" 7 ];
+  let o = ok (Session.find s "100") in
+  check_bool "a find replaces a snapshot hunt" false (last_scan_keep f);
+  check_ids "with the number's groups" [ "i32" ] (ids_of o);
+  queue_peek f "i32" [ it 0x10L (Vint 100L) ];
+  check_int "and lists at once" 1 (List.length (rows_of (first_page s)));
+  queue_read f (Vint 16L);
+  check_ids "kept values outlast both" [ "xp" ] (kept_names s);
+  check_bool "and so do the writes" true (Session.writes s = [ (0x6c551068L, "i32", Vint 15L, Vint 16L) ])
+
+(* ---- kept values: what they read now, and the game putting a write back ---- *)
+
+(* money, kept from a listing that showed 106.98 *)
+let money_listed () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32x100" 1 ];
+  ignore (ok (Session.find s "106.98"));
+  queue_peek f "i32x100" [ it 0x2a0L (Vint 10698L) ];
+  ignore (ok (first_page s));
+  (s, f)
+
+let keep_reads_the_value_now () =
+  let s, f = money_listed () in
+  queue_read f (Vint 20000L);
+  check_str "the value read now" "kept #1 as money (200.00, whole number ×100)" (ok (Session.keep_row s ~row:1 ~name:(Some "money")));
+  check_bool "read there, as its type" true (reads f = [ (0x2a0L, "i32") ]);
+  queue_error f "read" { code = "read_failed"; message = "cannot read 0x2a0" };
+  check_str "the listing's value when it can't be read" "kept #1 as cash (106.98, whole number ×100)"
+    (ok (Session.keep_row s ~row:1 ~name:(Some "cash")));
+  queue_read f (Vint 20000L);
+  queue_read f (Vint 20000L);
+  check_ids "both kept" [ "money"; "cash" ] (kept_names s);
+  (* losing the game there ends everything, as in any step *)
+  queue_error f "read" gone;
+  check_err "closed" closed (Session.keep_row s ~row:1 ~name:(Some "wallet"));
+  check_bool "nothing kept" true (ok (Session.kept s) = [])
+
+let a_kept_value_the_game_put_back () =
+  let s, f = fresh () in
+  queue_read f (Vint 13L);
+  ignore (ok (Session.keep_at s ~addr:0x1e84dfd34L "13" ~name:(Some "conc")));
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 20L);
+  (* the check a moment later: still 20 *)
+  ignore (ok (Session.set_kept s ~name:"conc" "20"));
+  queue_read f (Vint 20L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "not put back yet" false k.put_back;
+  check_bool "set_to" true (k.set_to = Some "20");
+  queue_read f (Vint 13L);
+  (* later: the game recalculated *)
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "put back" true k.put_back;
+  let line = Render.kept [ k ] in
+  check_bool "line says so" true (String.ends_with ~suffix:"you set it to 20; the game put it back." line);
+  check_bool "and still starts with the name" true (String.starts_with ~prefix:"conc" line)
+
+(* the game moved on from the value written: not put back. Undoing the write forgets it. *)
+let a_kept_value_that_moved_on () =
+  let s, f = money_listed () in
+  queue_read f (Vint 10698L);
+  ignore (ok (Session.keep_row s ~row:1 ~name:(Some "money")));
+  queue_write f ~prev:(Vint 10698L) ~prev_bits:10698L;
+  queue_read f (Vint 20000L);
+  ignore (ok (Session.set_kept s ~name:"money" "200"));
+  queue_read f (Vint 20085L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "moved on: not put back" false k.put_back;
+  check_bool "set_to" true (k.set_to = Some "200.00");
+  check_str "the line as before" "money  200.85  0x2a0  whole number ×100" (Render.kept [ k ]);
+  queue_write f ~prev:(Vint 20085L) ~prev_bits:20085L;
+  ignore (said (Session.undo s));
+  queue_read f (Vint 10698L);
+  let k = List.hd (ok (Session.kept s)) in
+  check_bool "undone: set_to" true (k.set_to = None);
+  check_bool "undone: reading what it replaced is no put back" false k.put_back
+
+(* only the newest write made by name counts: a row's write does not, another write's undo leaves
+   it, and a value forgotten and kept again under the same name starts with none *)
+let what_a_kept_value_remembers () =
+  let s, f = fresh () in
+  queue_scan f [ gi "i32" 2 ];
+  ignore (ok (Session.find s "13"));
+  queue_peek f "i32" [ it 0x10L (Vint 13L); it 0x20L (Vint 13L) ];
+  ignore (ok (first_page s));
+  queue_read f (Vint 13L);
+  ignore (ok (Session.keep_row s ~row:1 ~name:(Some "conc")));
+  let conc () =
+    queue_read f (Vint 13L);
+    List.hd (ok (Session.kept s))
+  in
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 20L);
+  ignore (ok (Session.set s ~row:1 "20"));
+  let k = conc () in
+  check_bool "a row's write is not the kept value's" true (k.set_to = None && not k.put_back);
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 30L);
+  ignore (ok (Session.set_kept s ~name:"conc" "30"));
+  queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
+  queue_read f (Vint 40L);
+  ignore (ok (Session.set s ~row:2 "40"));
+  queue_write f ~prev:(Vint 40L) ~prev_bits:40L;
+  check_str "undo the other write" "restored #2 to 13" (said (Session.undo s));
+  let k = conc () in
+  check_bool "another write's undo leaves it" true (k.set_to = Some "30" && k.put_back);
+  check_str "forget" "forgot conc" (ok (Session.forget s "conc"));
+  queue_read f (Vint 13L);
+  ignore (ok (Session.keep_at s ~addr:0x10L "13" ~name:(Some "conc")));
+  let k = conc () in
+  check_bool "kept again: no write" true (k.set_to = None && not k.put_back);
+  queue_write f ~prev:(Vint 30L) ~prev_bits:30L;
+  check_str "the old write is undone by name" "restored conc to 13" (said (Session.undo s));
+  check_bool "the new one has none still" true ((conc ()).set_to = None)
+
+(* a float is compared by its bytes: reading the bytes written is no put back, however the floats
+   compare, and -0 is not the 0 a write replaced *)
+let a_kept_float_by_its_bytes () =
+  let s, f = fresh () in
+  let f32 x = Int32.float_of_bits (Int32.bits_of_float x) in
+  queue_read f (Vfloat (f32 0.1));
+  ignore (ok (Session.keep_at s ~addr:0x40L "0.1" ~name:(Some "rate")));
+  let rate v =
+    queue_read f (Vfloat v);
+    List.hd (ok (Session.kept s))
+  in
+  queue_write f ~prev:(Vfloat (f32 0.1)) ~prev_bits:(Int64.of_int32 (Int32.bits_of_float 0.1));
+  queue_read f (Vfloat (f32 0.1));
+  ignore (ok (Session.set_kept s ~name:"rate" "0.1"));
+  let k = rate (f32 0.1) in
+  check_bool "set to what it held" true (k.set_to = Some "0.1" && not k.put_back);
+  queue_write f ~prev:(Vfloat 0.) ~prev_bits:0L;
+  queue_read f (Vfloat 5.);
+  ignore (ok (Session.set_kept s ~name:"rate" "5"));
+  check_bool "-0" false (rate (-0.)).put_back;
+  check_bool "0" true (rate 0.).put_back
+
 let () =
   let t n f = Alcotest.test_case n `Quick f in
   Alcotest.run "session"
@@ -1171,5 +1481,21 @@ let () =
           t "set a kept value" set_a_kept_value;
           t "unknown names" unknown_names;
           t "kept values and a closed game" kept_values_and_a_closed_game;
+          t "keep reads the value now" keep_reads_the_value_now;
+          t "a kept value the game put back" a_kept_value_the_game_put_back;
+          t "a kept value that moved on" a_kept_value_that_moved_on;
+          t "what a kept value remembers" what_a_kept_value_remembers;
+          t "a kept float, by its bytes" a_kept_float_by_its_bytes;
+        ] );
+      ( "snapshot",
+        [
+          t "a snapshot hunt" a_snapshot_hunt;
+          t "a snapshot hunt, step by step" a_snapshot_hunt_step_by_step;
+          t "a snapshot group untracked" a_snapshot_group_untracked;
+          t "a snapshot too big" a_snapshot_too_big;
+          t "a snapshot without memory" a_snapshot_without_memory;
+          t "a snapshot that fails" a_snapshot_that_fails;
+          t "snapshots carry the limit" snapshots_carry_the_limit;
+          t "hunts replace each other" hunts_replace_each_other;
         ] );
     ]

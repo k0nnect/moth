@@ -10,7 +10,7 @@ let commas n =
     digits;
   Buffer.contents b
 
-let dead_end = "nothing left that fits. that step was not applied, so you can try a different number."
+let dead_end = "nothing left that fits. that step was not applied, so you can try a different number, or hunt by how it moves: moth snapshot"
 
 let counts (o : Session.outcome) =
   let total = if List.mem Session.Showing_wide o.notes then o.wide else o.main in
@@ -22,38 +22,42 @@ let counts (o : Session.outcome) =
 let went = function Session.Down -> "went down" | Up -> "went up" | Same -> "stayed the same" | Changed -> "changed"
 
 (* position of a note's line under the counts line *)
-let rank = function Session.Fell_back _ -> 0 | Showing_wide -> 1 | Untracked -> 2 | Lost _ -> 3
+let rank = function Session.Fell_back _ -> 0 | Showing_wide -> 1 | Untracked -> 2 | Lost _ -> 3 | Snapshot_taken -> 4
 
+(* a snapshot's note has no line of its own: its line takes the counts line's place *)
 let note_line = function
-  | Session.Fell_back r -> Printf.sprintf "no exact match for that number. kept the ones that %s instead." (went r)
-  | Showing_wide -> "nothing matched as a plain number. showing other ways it could be stored."
-  | Untracked -> "some rarer forms are too common to track yet. they'll be rechecked on your next number."
-  | Lost n -> Printf.sprintf "%s %s disappeared because the game freed that memory." (commas n) (if n = 1 then "match" else "matches")
+  | Session.Fell_back r -> Some (Printf.sprintf "no exact match for that number. kept the ones that %s instead." (went r))
+  | Showing_wide -> Some "nothing matched as a plain number. showing other ways it could be stored."
+  | Untracked -> Some "some rarer forms are too common to track yet. they'll be rechecked on your next number."
+  | Lost n -> Some (Printf.sprintf "%s %s disappeared because the game freed that memory." (commas n) (if n = 1 then "match" else "matches"))
+  | Snapshot_taken -> None
 
-let size n =
-  let f = float_of_int n in
-  let kb = max 1 (int_of_float (Float.round (f /. 1024.))) in
-  let mb = int_of_float (Float.round (f /. 1048576.)) in
-  if kb < 1024 then Printf.sprintf "%d kb" kb else if mb < 1024 then Printf.sprintf "%d mb" mb else Printf.sprintf "%.1f gb" (f /. 1073741824.)
+let size = Session.size
 
 let unreadable_line n = Printf.sprintf "couldn't read %s of the game's memory, so matches there are missing." (size n)
+
+let snapshot_line bytes =
+  Printf.sprintf "snapshot of %s taken. change the value in the game, then tell moth how it moved: moth next down, up, same or changed." (size bytes)
 
 let outcome (o : Session.outcome) =
   if o.dead_end then dead_end
   else
+    let head = if List.mem Session.Snapshot_taken o.notes then snapshot_line o.bytes else counts o in
     let notes = List.stable_sort (fun a b -> compare (rank a) (rank b)) o.notes in
     let unread = if o.unreadable > 0 then [ unreadable_line o.unreadable ] else [] in
-    String.concat "\n" ((counts o :: unread) @ List.map note_line notes)
+    String.concat "\n" ((head :: unread) @ List.filter_map note_line notes)
 
 (* lines of cells, two spaces apart, each column but the last padded to its widest cell *)
-let table lines =
+let table_lines lines =
   let widths = List.fold_left (fun ws l -> List.map2 (fun w c -> max w (String.length c)) ws l) (List.map (fun _ -> 0) (List.hd lines)) lines in
   let pad w s = s ^ String.make (w - String.length s) ' ' in
   let line l =
     let last = List.length l - 1 in
     String.concat "  " (List.mapi (fun i (w, c) -> if i = last then c else pad w c) (List.combine widths l))
   in
-  String.concat "\n" (List.map line lines)
+  List.map line lines
+
+let table lines = String.concat "\n" (table_lines lines)
 
 let away = function Some 0 -> "0" | Some d -> Printf.sprintf "%+d" d | None -> ""
 
@@ -76,4 +80,8 @@ let listing ?near ~all (l : Session.listing) =
 
 let kept = function
   | [] -> "nothing kept yet. keep a result with: moth keep <#n> [name]"
-  | ks -> table (List.map (fun (k : Session.kept) -> [ k.name; k.kshown; Printf.sprintf "0x%Lx" k.kaddr; k.ktag ]) ks)
+  | ks ->
+      let cells (k : Session.kept) = [ k.name; k.kshown; Printf.sprintf "0x%Lx" k.kaddr; k.ktag ] in
+      (* a value the game put back after a set by name says so after its tag *)
+      let put_back (k : Session.kept) = match k.set_to with Some v when k.put_back -> Printf.sprintf "  you set it to %s; the game put it back." v | _ -> "" in
+      String.concat "\n" (List.map2 (fun line k -> line ^ put_back k) (table_lines (List.map cells ks)) ks)
