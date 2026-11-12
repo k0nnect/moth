@@ -593,9 +593,12 @@ let same_first () =
       let rows = (page ~all:true ~n:200 ()).rows in
       check (List.exists (fun r -> r.addr = stamina.addr) rows) "stamina (0x%Lx) is not listed. results: %s" stamina.addr (show_rows rows))
 
-(* 27: a snapshot of a 1 GB target and the first step over it, by the helper's own times *)
+(* 27: a snapshot of a 1 GB target and the first step over it, by the helper's own times. At this
+   size the groups still lean on the snapshot after that step, so a step by how stamina moved then
+   compares with the snapshot as the first step left it, through the real helper's reads. *)
 let snapshot_speed () =
-  with_target ~filler_mb:1024 (fun _ ->
+  with_target ~filler_mb:1024 (fun t ->
+      let stamina = Target_ctl.var t "stamina" in
       let rate what o =
         let ms = to_number (member "ms" o) and gb = to_number (member "bytes" o) /. gib in
         check (gb >= 1.) "%s read only %.3f GB, less than the 1 GB filler" what gb;
@@ -604,9 +607,22 @@ let snapshot_speed () =
         s_per_gb
       in
       let snap = rate "snapshot" (moth [ "snapshot" ]) in
-      let same = rate "next same" (next "same") in
+      let same_step = next "same" in
+      let same = rate "next same" same_step in
       check (snap < max_s_per_gb) "the snapshot took %.2f s/GB, over the %.1f s/GB bar" snap max_s_per_gb;
-      check (same < max_s_per_gb) "next same took %.2f s/GB, over the %.1f s/GB bar" same max_s_per_gb)
+      check (same < max_s_per_gb) "next same took %.2f s/GB, over the %.1f s/GB bar" same max_s_per_gb;
+      (* over 64,000,000 places, so the values it compares with are the snapshot's *)
+      let i32 = match List.find_opt (fun g -> to_string (member "id" g) = "i32") (to_list (member "groups" same_step)) with Some g -> g | None -> failf "no i32 group in %s" (show same_step) in
+      check
+        (to_bool (member "has_values" i32) && to_int (member "count" i32) > 64_000_000)
+        "after next same the i32 group is %s, expected over 64,000,000 places that still have values" (show i32);
+      Target_ctl.set t "stamina" "40";
+      let down = next "down" in
+      check (not (to_bool (member "dead_end" down))) "next down after stamina went from 62.5 to 40 was a dead end: %s" (show down);
+      match (page ~near:(hex stamina.addr) ()).rows with
+      | first :: _ as rows ->
+          check (first.addr = stamina.addr && first.away = Some 0) "the first row near stamina (0x%Lx) is not stamina's own, away 0. results: %s" stamina.addr (show_rows rows)
+      | [] -> failf "no rows near stamina")
 
 (* 28: a snapshot bigger than MOTH_SNAPSHOT_MB is refused, and the hunt there was goes on *)
 let snapshot_over_limit () =
