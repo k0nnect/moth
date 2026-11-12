@@ -42,7 +42,9 @@ struct EngineConfig {
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
   unsigned workers = 1;                   // threads searching a scan's blocks and comparing a narrow's runs;
                                           // 0: hardware threads - 1, from 1 to 8
-  uint64_t snapshot_cap_bytes = 8ull << 30;  // the most writable memory a snapshot copies (see Engine::snapshot)
+  // The most writable memory a snapshot copies. While a step over a snapshot runs, the helper can
+  // hold up to about this plus twice budget_bytes plus the runs' buffers (see Engine::snapshot).
+  uint64_t snapshot_cap_bytes = 8ull << 30;
 };
 
 struct Item {
@@ -102,6 +104,12 @@ class Engine {
   // budget_bytes are untracked from the last one backwards, after each block as in a scan; the
   // snapshot is not counted in storage_bytes() or the budget. If no listed group is left tracked,
   // the snapshot is released.
+  // Memory: between steps the helper holds the snapshot (at most snapshot_cap_bytes) and candidate
+  // storage within budget_bytes. While a step runs (see narrow) it also holds the step's new
+  // positions and any values gained, within budget_bytes again, and the runs' buffers,
+  // (workers_used() + 4) * block_size. So the peak is about the snapshot plus twice budget_bytes
+  // plus those buffers. The new positions are built beside the old ones because an atomic step
+  // that keeps nothing, and a step that fails part way, must leave the old positions intact.
   // Throws EngineError, with nothing changed: bad_request (align 0 or not a multiple of the type's
   // width, an id listed twice), too_big "<bytes> to snapshot, limit <bytes>" (both plain decimal
   // byte counts), target_gone (the process is not alive). With every group and the snapshot
@@ -139,10 +147,16 @@ class Engine {
   // just read, so its next relation compares with this step; it copies none of their values. Places
   // no group keeps are left as they were, and are no longer candidates. A step that is not applied
   // kept nothing, so it replaced nothing. After an applied step, such a group with at most
-  // value_cap positions takes its values from the snapshot, which are the bytes just read, unless
-  // they would take storage over budget_bytes, and no longer leans on it; the snapshot is released
-  // once no group does. A group leaning on it that a narrow does not list still compares with the
+  // value_cap positions takes its values from the snapshot, which are the bytes just read, and no
+  // longer leans on it; if those values would take storage over budget_bytes, it takes none and
+  // goes on leaning on the snapshot, with has_values still true. The snapshot is released once no
+  // group leans on it. A group leaning on it that a narrow does not list still compares with the
   // snapshot, which by then may hold newer bytes at places other groups kept.
+  // Memory: until a step is known to be applied without error, the old positions stay as they
+  // were, so the new positions are built beside them (within budget_bytes, since a group's
+  // positions only shrink) and values gained are taken while both are held. With a snapshot the
+  // peak is therefore about the snapshot plus twice budget_bytes plus the runs' buffers,
+  // (workers_used() + 4) * block_size; between steps it is the snapshot plus budget_bytes.
   // Throws EngineError, with nothing changed: no_such_group (an unknown id, or an untracked
   // group, which has no positions to narrow), bad_request (an id listed twice), no_values (a
   // previous-value predicate or a moved range on a group without values), target_gone (the

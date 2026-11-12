@@ -520,3 +520,77 @@ TEST_CASE("a snapshot hunt whose blocks are split into runs compares each place 
     step(Pred::EqPrev);
   }
 }
+TEST_CASE("more than 2^20 places take their values from the snapshot in shares, around a page it could not read") {
+  // 8 MiB of pseudo-random bytes in 1 MiB blocks, with a page in the fourth block that cannot be
+  // read when the snapshot is taken, so that block is not one stretch. A range step leaves u8 with
+  // the bytes 0 to 63 and i16 with the values 0 to 32767, about 2.1 million places each, and i32
+  // with every place, whose values are taken a whole bitmap word at a time; all are under
+  // value_cap, so each takes its values from the snapshot: in shares of 2^20 values on 4 workers,
+  // and on the calling thread on 1. EqPrev, with nothing changed, then keeps every place only if
+  // every value taken is right; LtPrev, after every third byte goes down by one, keeps the places
+  // whose value went down.
+  constexpr uint64_t base = 0x10000000, size = 8u << 20, hole = (3u << 20) + 0x5000;   // the page, as an offset
+  std::vector<uint8_t> before(size);
+  uint64_t x = 0x9e3779b97f4a7c15;
+  for (uint8_t& b : before) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b = static_cast<uint8_t>(x >> 29); }
+  std::vector<uint8_t> after = before;
+  for (uint64_t i = 0; i < size; i += 3) after[i] = static_cast<uint8_t>(after[i] - 1);
+  auto in_hole = [&](uint64_t i, uint64_t w) { return i + w > hole && i < hole + 4096; };
+  auto i16 = [](const std::vector<uint8_t>& v, uint64_t i) { return static_cast<int16_t>(v[i] | (v[i + 1] << 8)); };
+  auto i32 = [](const std::vector<uint8_t>& v, uint64_t i) { int32_t r; std::memcpy(&r, v.data() + i, 4); return r; };
+  // the places each step keeps, as offsets
+  std::vector<uint64_t> u8_kept, i16_kept, i32_kept, u8_down, i16_down, i32_down;
+  for (uint64_t i = 0; i < size; i++) {
+    if (in_hole(i, 1) || before[i] >= 64) continue;
+    u8_kept.push_back(i);
+    if (after[i] < before[i]) u8_down.push_back(i);
+  }
+  for (uint64_t i = 0; i < size; i += 2) {
+    if (in_hole(i, 2) || i16(before, i) < 0) continue;
+    i16_kept.push_back(i);
+    if (i16(after, i) < i16(before, i)) i16_down.push_back(i);
+  }
+  for (uint64_t i = 0; i < size; i += 4) {
+    if (in_hole(i, 4)) continue;
+    i32_kept.push_back(i);
+    if (i32(after, i) < i32(before, i)) i32_down.push_back(i);
+  }
+  REQUIRE(u8_kept.size() > (3u << 19)); REQUIRE(i16_kept.size() > (3u << 19));   // at least two shares each
+  REQUIRE(i32_kept.size() > (3u << 19));
+  auto addrs = [&](Engine& e, const std::string& id) {
+    std::vector<uint64_t> out;
+    for (const Item& it : e.peek(id, 0, 1u << 30)) out.push_back(it.addr - base);
+    return out;
+  };
+  for (unsigned w : {1u, 4u}) {
+    CAPTURE(w);
+    FakeMemory m; m.add_region(base, size); REQUIRE(m.write(base, before.data(), size)); m.free_page(base + hole);
+    Engine e(m, {.block_size = 1u << 20, .workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    e.snapshot({{"u8", U8, 1}, {"i16", I16, 2}, {"i32", I32, 4}}, s); CHECK(s.unreadable_bytes == 4096);
+    CHECK(e.narrow({{"u8", range(-1, 64)}, {"i16", range(-1, 32768)}, {"i32", range(-2147483649.0, 2147483648.0)}},
+                   true, g, s));
+    CHECK(g[0].count == u8_kept.size()); CHECK(g[1].count == i16_kept.size()); CHECK(g[2].count == i32_kept.size());
+    for (const GroupInfo& i : g) CHECK(i.has_values);
+    CHECK(e.snapshot_bytes() == 0);                                     // every group took its values
+    CHECK(e.narrow({{"u8", {Pred::EqPrev}}, {"i16", {Pred::EqPrev}}, {"i32", {Pred::EqPrev}}}, true, g, s));
+    CHECK(g[0].count == u8_kept.size()); CHECK(g[1].count == i16_kept.size()); CHECK(g[2].count == i32_kept.size());
+    for (uint64_t i = 0; i < size; i += 3)
+      if (!in_hole(i, 1)) m.poke<uint8_t>(base + i, after[i]);
+    CHECK(e.narrow({{"u8", {Pred::LtPrev}}, {"i16", {Pred::LtPrev}}, {"i32", {Pred::LtPrev}}}, true, g, s));
+    CHECK(addrs(e, "u8") == u8_down); CHECK(addrs(e, "i16") == i16_down); CHECK(addrs(e, "i32") == i32_down);
+  }
+}
+TEST_CASE("a snapshot group under value_cap whose values would pass the budget goes on leaning on the snapshot") {
+  // 1024 i32 zeros: positions take 176 bytes; 500 places' values would take 2000 more
+  FakeMemory m; m.add_region(0x10000, 4096);
+  Engine e(m, {.budget_bytes = 1000, .value_cap = 600}); ScanStats s; std::vector<GroupInfo> g;
+  e.snapshot({{"a", I32, 4}}, s);
+  for (int i = 0; i < 500; i++) m.poke<int32_t>(0x10000 + i * 4, 10);
+  CHECK(e.narrow({{"a", {Pred::NePrev}}}, true, g, s));
+  CHECK(g[0].count == 500); CHECK(g[0].has_values); CHECK(e.snapshot_bytes() == 4096); CHECK(e.storage_bytes() <= 1000);
+  for (int i = 0; i < 100; i++) m.poke<int32_t>(0x10000 + i * 4, 5);            // down from the 10 of the last step
+  for (int i = 100; i < 200; i++) m.poke<int32_t>(0x10000 + i * 4, 20);
+  CHECK(e.narrow({{"a", {Pred::LtPrev}}}, true, g, s)); CHECK(g[0].count == 100);
+  auto p = e.peek("a", 0, 1000); REQUIRE(p.size() == 100); CHECK(p.front().addr == 0x10000); CHECK(p.back().addr == 0x10000 + 99 * 4);
+  CHECK(e.snapshot_bytes() == 0); CHECK(g[0].has_values);                        // 400 bytes of values fit
+}
