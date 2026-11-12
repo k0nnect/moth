@@ -87,11 +87,17 @@ let plan (v : Value.t) =
       @ scaled "i32" @ scaled "i64"
       @ [ mk "f32u" "f32" 1 4 Wide Plain ]
 
+let tiny = 1e-6
+
+(* a float reading ignores values below [tiny] in magnitude (but not zero) when the number was
+   typed with at most 4 decimal places: nothing that coarse is meant to be that small *)
+let floor_of = function Value.Int _ -> tiny | Value.Dec d -> if d.decimals <= 4 then tiny else 0.
+
 let pred_for t (v : Value.t) : Helper_api.pred option =
   match t.encoding with
   | Plain when is_float_type t.vtype ->
       let c = Value.to_float v and e = eps_of v in
-      Some (Range (c -. e, c +. e))
+      Some (Range { lo = c -. e; hi = c +. e; floor = floor_of v; moved = false })
   | Plain -> (
       match v with
       | Value.Int n when fits t.vtype n -> Some (Eq n)
@@ -102,7 +108,13 @@ let pred_for t (v : Value.t) : Helper_api.pred option =
       | _ -> None)
   | Fraction ->
       let c = Value.to_float v and e = eps_of v in
-      Some (Range ((c -. e) /. 100., (c +. e) /. 100.))
+      Some (Range { lo = (c -. e) /. 100.; hi = (c +. e) /. 100.; floor = floor_of v; moved = false })
+
+let holds t v (x : Helper_api.value) =
+  match (pred_for t v, x) with
+  | Some (Eq n), Vint m -> n = m
+  | Some (Range r), Vfloat f -> f > r.lo && f < r.hi && (r.floor <= 0. || f = 0. || Float.abs f >= r.floor)
+  | _ -> false
 
 let describe t =
   match t.encoding with

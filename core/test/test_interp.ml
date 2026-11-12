@@ -10,7 +10,7 @@ let feq a b = Float.abs (a -. b) < 1e-9
 let check_pred n (w : Helper_api.pred option) (g : Helper_api.pred option) =
   let same =
     match (w, g) with
-    | Some (Range (a, b)), Some (Range (c, d)) -> feq a c && feq b d
+    | Some (Range a), Some (Range b) -> feq a.lo b.lo && feq a.hi b.hi && feq a.floor b.floor && a.moved = b.moved
     | a, b -> a = b
   in
   Alcotest.(check bool) n true same
@@ -38,11 +38,11 @@ let cases () =
   check_tier "i32x100 of a decimal is main" Main (i "i32x100" (dec "132.50")).tier;
   check_int "i32u excludes aligned" 4 (i "i32u" (Int 100L)).exclude_align;
   check_pred "eq" (Some (Eq 100L)) (Interp.pred_for (i "i32" (Int 100L)) (Int 100L));
-  check_pred "float range" (Some (Range (99., 101.))) (Interp.pred_for (i "f32" (Int 100L)) (Int 100L));
+  check_pred "float range" (Some (Range { lo = 99.; hi = 101.; floor = 1e-6; moved = false })) (Interp.pred_for (i "f32" (Int 100L)) (Int 100L));
   check_pred "scaled" (Some (Eq 8500L)) (Interp.pred_for (i "i32x100" (Int 100L)) (Int 85L));
-  check_pred "pct" (Some (Range (0.84, 0.86))) (Interp.pred_for (i "f32pct" (Int 100L)) (Int 85L));
+  check_pred "pct" (Some (Range { lo = 0.84; hi = 0.86; floor = 1e-6; moved = false })) (Interp.pred_for (i "f32pct" (Int 100L)) (Int 85L));
   check_pred "cents" (Some (Eq 13250L)) (Interp.pred_for (i "i32x100" (dec "132.50")) (dec "132.50"));
-  check_pred "decimal range" (Some (Range (132.49, 132.51))) (Interp.pred_for (i "f32" (dec "132.50")) (dec "132.50"));
+  check_pred "decimal range" (Some (Range { lo = 132.49; hi = 132.51; floor = 1e-6; moved = false })) (Interp.pred_for (i "f32" (dec "132.50")) (dec "132.50"));
   check_pred "whole given decimal" None (Interp.pred_for (i "i32" (Int 100L)) (dec "85.5"));
   check_pred "does not fit" None (Interp.pred_for (i "u8" (Int 100L)) (Int 300L));
   check_enc "int" (Ok (Vint 999L)) (Interp.encode (i "i32" (Int 100L)) (Int 999L));
@@ -109,6 +109,35 @@ let eight_byte_scaled () =
   check_str "i32" "whole number ×100" (Interp.describe (i "i32x100" (dec "132.50")));
   check_str "i64, three places" "whole number ×1000 (8-byte)" (Interp.describe (i "i64x1000" (dec "1.505")))
 
+let v s = dec s
+let interp id n = List.find (fun (i : Interp.t) -> i.id = id) (Interp.plan (v n))
+
+let floor_on_float_readings () =
+  let p id n = Interp.pred_for (interp id n) (v n) in
+  let b n x = Alcotest.(check bool) n true x in
+  b "f32 of 1" (p "f32" "1" = Some (Range { lo = 0.; hi = 2.; floor = 1e-6; moved = false }));
+  b "f32 of 0" (p "f32" "0" = Some (Range { lo = -1.; hi = 1.; floor = 1e-6; moved = false }));
+  b "f32pct of 1" (p "f32pct" "1" = Some (Range { lo = 0.; hi = 0.02; floor = 1e-6; moved = false }));
+  b "six decimals: no floor" (match p "f32" "0.000002" with Some (Range r) -> r.floor = 0. | _ -> false);
+  b "four decimals: floor" (match p "f32" "0.1234" with Some (Range r) -> r.floor = Interp.tiny | _ -> false);
+  b "five decimals: no floor" (match p "f32" "0.12345" with Some (Range r) -> r.floor = 0. | _ -> false)
+
+let holds () =
+  let b n x = Alcotest.(check bool) n true x in
+  b "i32 15" (Interp.holds (interp "i32" "15") (v "15") (Vint 15L));
+  b "i32 16" (not (Interp.holds (interp "i32" "15") (v "15") (Vint 16L)));
+  b "85.3 shows as 85" (Interp.holds (interp "f32" "85") (v "85") (Vfloat 85.3));
+  b "a tiny float is not 1" (not (Interp.holds (interp "f32" "1") (v "1") (Vfloat 1e-30)));
+  b "zero is 0" (Interp.holds (interp "f32" "0") (v "0") (Vfloat 0.));
+  b "negative zero is 0" (Interp.holds (interp "f32" "0") (v "0") (Vfloat (-0.)));
+  b "a tiny negative is not 0" (not (Interp.holds (interp "f32" "0") (v "0") (Vfloat (-1e-30))));
+  b "negative number" (Interp.holds (interp "f32" "-85") (v "-85") (Vfloat (-85.3)));
+  b "nan" (not (Interp.holds (interp "f32" "1") (v "1") (Vfloat Float.nan)));
+  b "a float for a whole-number reading" (not (Interp.holds (interp "i32" "15") (v "15") (Vfloat 15.)));
+  b "a whole number for a float reading" (not (Interp.holds (interp "f32" "15") (v "15") (Vint 15L)));
+  b "no pred" (not (Interp.holds (interp "i32" "15") (v "15.5") (Vint 15L)));
+  b "cents" (Interp.holds (interp "i32x100" "5.32") (v "5.32") (Vint 532L))
+
 let () =
   Alcotest.run "interp"
     [
@@ -118,5 +147,7 @@ let () =
           Alcotest.test_case "fixes" `Quick fixes;
           Alcotest.test_case "scaled exactly" `Quick scaled_exactly;
           Alcotest.test_case "eight-byte scaled" `Quick eight_byte_scaled;
+          Alcotest.test_case "floor on float readings" `Quick floor_on_float_readings;
+          Alcotest.test_case "holds" `Quick holds;
         ] );
     ]

@@ -6,18 +6,27 @@ let check_bool n w g = Alcotest.(check bool) n w g
 let js = Yojson.Safe.to_string
 let raises_failure f = match f () with exception Failure _ -> true | _ -> false
 
+let range_keys () =
+  let keys p = match Wire.pred_to_json p with `Assoc l -> List.map fst l | _ -> [] in
+  Alcotest.(check (list string)) "plain" [ "op"; "lo"; "hi" ] (keys (Range { lo = 0.; hi = 2.; floor = 0.; moved = false }));
+  let j = Wire.pred_to_json (Range { lo = 0.; hi = 2.; floor = 1e-6; moved = true }) in
+  check_bool "floor" true (Yojson.Safe.Util.member "floor" j = `Float 1e-6);
+  check_bool "moved" true (Yojson.Safe.Util.member "moved" j = `Bool true);
+  Alcotest.(check (list string)) "floor only" [ "op"; "lo"; "hi"; "floor" ]
+    (keys (Range { lo = 0.; hi = 2.; floor = 1e-6; moved = false }))
+
 let requests () =
   check_str "scan request" {|{"id":3,"op":"scan","keep":false,"groups":[{"id":"i32","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"100"}}]}|}
     (Wire.request ~id:3 ~op:"scan" [ "keep", `Bool false; "groups", `List [ Wire.group_spec_to_json { id = "i32"; vtype = "i32"; align = 4; exclude_align = 0; pred = Eq 100L } ] ]);
   check_str "no fields" {|{"id":1,"op":"ps"}|} (Wire.request ~id:1 ~op:"ps" []);
   check_str "negative eq" {|{"op":"eq","v":"-3"}|} (js (Wire.pred_to_json (Eq (-3L))));
-  check_str "range" {|{"op":"range","lo":99.0,"hi":101.0}|} (js (Wire.pred_to_json (Range (99., 101.))));
+  check_str "range" {|{"op":"range","lo":99.0,"hi":101.0}|} (js (Wire.pred_to_json (Range { lo = 99.; hi = 101.; floor = 0.; moved = false })));
   check_str "lt_prev" {|{"op":"lt_prev"}|} (js (Wire.pred_to_json Lt_prev));
   check_str "gt_prev" {|{"op":"gt_prev"}|} (js (Wire.pred_to_json Gt_prev));
   check_str "eq_prev" {|{"op":"eq_prev"}|} (js (Wire.pred_to_json Eq_prev));
   check_str "ne_prev" {|{"op":"ne_prev"}|} (js (Wire.pred_to_json Ne_prev));
   check_str "unaligned spec" {|{"id":"f32u","type":"f32","align":1,"exclude_align":4,"pred":{"op":"range","lo":0.5,"hi":1.5}}|}
-    (js (Wire.group_spec_to_json { id = "f32u"; vtype = "f32"; align = 1; exclude_align = 4; pred = Range (0.5, 1.5) }));
+    (js (Wire.group_spec_to_json { id = "f32u"; vtype = "f32"; align = 1; exclude_align = 4; pred = Range { lo = 0.5; hi = 1.5; floor = 0.; moved = false } }));
   check_str "int value" {|"-3"|} (js (Wire.value_to_json (Vint (-3L))));
   check_str "float value" "85.5" (js (Wire.value_to_json (Vfloat 85.5)));
   check_str "addr" {|"0x1f3a0010"|} (js (Wire.addr_to_json 0x1f3a0010L));
@@ -104,6 +113,7 @@ let () =
       ( "wire",
         [
           Alcotest.test_case "requests" `Quick requests;
+          Alcotest.test_case "range keys" `Quick range_keys;
           Alcotest.test_case "replies" `Quick replies;
           Alcotest.test_case "decoders" `Quick decoders;
           Alcotest.test_case "bits" `Quick bits;

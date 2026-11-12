@@ -6,7 +6,11 @@ let request ~id ~op fields = Yojson.Safe.to_string (`Assoc (("id", `Int id) :: (
 
 let pred_to_json = function
   | Eq n -> `Assoc [ ("op", `String "eq"); ("v", `String (Int64.to_string n)) ]
-  | Range (lo, hi) -> `Assoc [ ("op", `String "range"); ("lo", `Float lo); ("hi", `Float hi) ]
+  | Range r ->
+      `Assoc
+        ([ ("op", `String "range"); ("lo", `Float r.lo); ("hi", `Float r.hi) ]
+        @ (if r.floor > 0. then [ ("floor", `Float r.floor) ] else [])
+        @ if r.moved then [ ("moved", `Bool true) ] else [])
   | Lt_prev -> `Assoc [ ("op", `String "lt_prev") ]
   | Gt_prev -> `Assoc [ ("op", `String "gt_prev") ]
   | Eq_prev -> `Assoc [ ("op", `String "eq_prev") ]

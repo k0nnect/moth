@@ -65,11 +65,25 @@ let fake_helper ?on_ps ~tokens () ~port ~token ~log:_ =
 
 let start ?on_ps ?(tokens = [ `Right ]) () = Helper_conn.start ~launch:(fake_helper ?on_ps ~tokens ()) ~label:"test" ~log ()
 
+let scan_budget_and_peek_from () =
+  let h = ok (start ()) in
+  let sent () = Yojson.Safe.from_string !last_request in
+  ignore (h.scan ~keep:false ~budget_mb:(Some 64) []);
+  check_bool "budget sent" true (field "budget_mb" (sent ()) = `Int 64);
+  ignore (h.scan ~keep:false ~budget_mb:None []);
+  check_bool "no budget" true (match sent () with `Assoc l -> not (List.mem_assoc "budget_mb" l) | _ -> false);
+  check_bool "peek_from" true (h.peek_from ~id:"i32" ~vtype:"i32" ~addr:0x6c551000L ~limit:64 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
+  check_bool "from, no offset" true
+    (match sent () with
+    | `Assoc l -> List.assoc_opt "from" l = Some (`String "0x6c551000") && not (List.mem_assoc "offset" l)
+    | _ -> false);
+  h.close ()
+
 let basics () =
   let h = ok (start ()) in
   check_bool "ps" true (h.ps () = Ok [ (208, "disco.exe") ]);
   check_bool "peek" true (h.peek ~id:"i32" ~vtype:"i32" ~offset:0 ~limit:5 = Ok [ { addr = 0x10L; v = Vint 7L } ]);
-  check_bool "error mapped" true (match h.scan ~keep:false [] with Error { code = "not_attached"; _ } -> true | _ -> false);
+  check_bool "error mapped" true (match h.scan ~keep:false ~budget_mb:None [] with Error { code = "not_attached"; _ } -> true | _ -> false);
   check_bool "status" true (h.status () = Ok (Some { pid = 208; name = "disco.exe"; bits = 64 }));
   check_bool "detach" true (h.detach () = Ok ());
   h.close ()
@@ -155,6 +169,7 @@ let () =
       ( "conn",
         [
           Alcotest.test_case "requests" `Quick basics;
+          Alcotest.test_case "scan budget, peek from" `Quick scan_budget_and_peek_from;
           Alcotest.test_case "values by type, writes by value or bytes" `Quick typed_values;
           Alcotest.test_case "wrong token" `Quick wrong_token;
           Alcotest.test_case "never connects" `Quick never_connects;

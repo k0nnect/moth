@@ -11,7 +11,7 @@ let check_ids n w g = Alcotest.(check (list string)) n w g
 
 let show_pred = function
   | Eq n -> Printf.sprintf "eq %Ld" n
-  | Range (a, b) -> Printf.sprintf "range %h %h" a b
+  | Range r -> Printf.sprintf "range %h %h %h %b" r.lo r.hi r.floor r.moved
   | Lt_prev -> "lt_prev"
   | Gt_prev -> "gt_prev"
   | Eq_prev -> "eq_prev"
@@ -60,7 +60,7 @@ let next_narrows () =
   check_bool "atomic" true (last_narrow_atomic f);
   check_pred "i32x100" (Eq 8500L) (last_narrow_pred f "i32x100");
   check_pred "i32" (Eq 85L) (last_narrow_pred f "i32");
-  check_pred "f32" (Range (84., 86.)) (last_narrow_pred f "f32");
+  check_pred "f32" (Range { lo = 84.; hi = 86.; floor = 1e-6; moved = false }) (last_narrow_pred f "f32");
   check_int "no rescan" 1 (scan_calls f);
   check_ids "nothing dropped" [] (dropped f);
   check_bool "no fallback" false (fell_back o);

@@ -5,10 +5,12 @@ open Moth_core
 open Helper_api
 
 type call =
-  | Scan of { keep : bool; specs : group_spec list }
+  | Scan of { keep : bool; budget_mb : int option; specs : group_spec list }
   | Narrow of { atomic : bool; items : (string * pred) list }
   | Drop of string list
   | Peek of { id : string; vtype : string; offset : int; limit : int }
+  | Peek_from of { id : string; vtype : string; addr : int64; limit : int }
+  | Read of { addr : int64; vtype : string }
   | Write of { addr : int64; vtype : string; v : put }
 
 type script = {
@@ -17,6 +19,8 @@ type script = {
   narrows : (bool * group_info list * stats, err) result Queue.t;
   drops : (unit, err) result Queue.t;
   peeks : (string, (item list, err) result Queue.t) Hashtbl.t; (* by group; "" answers any group *)
+  peek_froms : (item list, err) result Queue.t;
+  reads : (value, err) result Queue.t;
   writes : (replaced, err) result Queue.t;
 }
 
@@ -36,7 +40,7 @@ let unscripted op = failwith (Printf.sprintf "fake helper: %s is not scripted" o
 
 let create () =
   let f =
-    { calls = []; scans = Queue.create (); narrows = Queue.create (); drops = Queue.create (); peeks = Hashtbl.create 8; writes = Queue.create () }
+    { calls = []; scans = Queue.create (); narrows = Queue.create (); drops = Queue.create (); peeks = Hashtbl.create 8; peek_froms = Queue.create (); reads = Queue.create (); writes = Queue.create () }
   in
   let record c = f.calls <- c :: f.calls in
   let helper =
@@ -45,8 +49,8 @@ let create () =
       modules = (fun _ -> unscripted "modules");
       attach = (fun _ -> unscripted "attach");
       scan =
-        (fun ~keep specs ->
-          record (Scan { keep; specs });
+        (fun ~keep ~budget_mb specs ->
+          record (Scan { keep; budget_mb; specs });
           next "scan" f.scans);
       narrow =
         (fun ~atomic items ->
@@ -61,7 +65,14 @@ let create () =
           record (Peek { id; vtype; offset; limit });
           let q = peek_queue f id in
           if Queue.is_empty q then next "peek" (peek_queue f "") else Queue.take q);
-      read = (fun ~addr:_ ~vtype:_ -> unscripted "read");
+      peek_from =
+        (fun ~id ~vtype ~addr ~limit ->
+          record (Peek_from { id; vtype; addr; limit });
+          next "peek_from" f.peek_froms);
+      read =
+        (fun ~addr ~vtype ->
+          record (Read { addr; vtype });
+          next "read" f.reads);
       write =
         (fun ~addr ~vtype v ->
           record (Write { addr; vtype; v });
@@ -76,6 +87,8 @@ let create () =
 let queue_scan ?(stats = zero_stats) f infos = Queue.push (Ok (infos, stats)) f.scans
 let queue_narrow ?(stats = zero_stats) f ~applied infos = Queue.push (Ok (applied, infos, stats)) f.narrows
 let queue_peek f id items = Queue.push (Ok items) (peek_queue f id)
+let queue_peek_from f items = Queue.push (Ok items) f.peek_froms
+let queue_read f v = Queue.push (Ok v) f.reads
 let queue_write ?(prev_bits = 0L) f ~prev = Queue.push (Ok { prev; prev_bits }) f.writes
 
 let queue_error f op (e : err) =
@@ -84,6 +97,8 @@ let queue_error f op (e : err) =
   | "narrow" -> Queue.push (Error e) f.narrows
   | "drop" -> Queue.push (Error e) f.drops
   | "peek" -> Queue.push (Error e) (peek_queue f "")
+  | "peek_from" -> Queue.push (Error e) f.peek_froms
+  | "read" -> Queue.push (Error e) f.reads
   | "write" -> Queue.push (Error e) f.writes
   | _ -> invalid_arg ("fake helper: cannot queue an error for " ^ op)
 
@@ -95,6 +110,7 @@ let newest what pick f =
 
 let last_scan = newest "scan" (function Scan s -> Some (s.keep, s.specs) | _ -> None)
 let last_scan_ids f = List.map (fun (s : group_spec) -> s.id) (snd (last_scan f))
+let last_scan_budget = newest "scan" (function Scan s -> Some s.budget_mb | _ -> None)
 let last_scan_keep f = fst (last_scan f)
 let last_scan_spec f id = List.find (fun (s : group_spec) -> s.id = id) (snd (last_scan f))
 let last_narrow = newest "narrow" (function Narrow n -> Some (n.atomic, n.items) | _ -> None)

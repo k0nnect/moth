@@ -9,6 +9,13 @@ val plan : Value.t -> t list
     places than a scaled form keeps (99.25 in tenths) *)
 val pred_for : t -> Value.t -> Helper_api.pred option
 
+(** the smallest magnitude a float reading of a number typed with at most 4 decimal places keeps *)
+val tiny : float
+
+(** whether the value is one [pred_for t v] matches ([moved] ignored); false when [pred_for] is
+    [None] or the value is of the wrong kind *)
+val holds : t -> Value.t -> Helper_api.value -> bool
+
 (** what to write for the number, or why it can't be written there *)
 val encode : t -> Value.t -> (Helper_api.value, string) result
 

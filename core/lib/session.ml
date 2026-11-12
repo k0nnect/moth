@@ -151,7 +151,7 @@ let find t text =
           let plan = List.filter_map (fun i -> Option.map (fun p -> (i, p)) (Interp.pred_for i v)) (Interp.plan v) in
           let tl = tally () in
           let infos, st =
-            match t.h.scan ~keep:false (List.map (fun (i, p) -> spec_of i p) plan) with
+            match t.h.scan ~keep:false ~budget_mb:None (List.map (fun (i, p) -> spec_of i p) plan) with
             | Ok r -> r
             | Error e ->
                 (* the helper may have dropped the old groups already, so the old hunt is over *)
@@ -189,7 +189,7 @@ let next_number t text =
               let rescanned =
                 if rescan = [] then []
                 else
-                  let infos, st = call (t.h.scan ~keep:true rescan) in
+                  let infos, st = call (t.h.scan ~keep:true ~budget_mb:None rescan) in
                   add tl st;
                   infos
               in

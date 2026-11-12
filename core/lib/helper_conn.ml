@@ -111,9 +111,10 @@ let make c =
     attach = (fun pid -> req "attach" [ ("pid", `Int pid) ] attached);
     status = (fun () -> req "status" [] (fun r -> match field "attached" r with `Null -> None | a -> Some (attached a)));
     scan =
-      (fun ~keep specs ->
+      (fun ~keep ~budget_mb specs ->
         req ~timeout:long "scan"
-          [ ("groups", `List (List.map Wire.group_spec_to_json specs)); ("keep", `Bool keep) ]
+          ([ ("groups", `List (List.map Wire.group_spec_to_json specs)); ("keep", `Bool keep) ]
+          @ match budget_mb with Some n -> [ ("budget_mb", `Int n) ] | None -> [])
           (fun r -> (Wire.group_infos (field "groups" r), Wire.stats (field "stats" r))));
     narrow =
       (fun ~atomic items ->
@@ -128,6 +129,11 @@ let make c =
       (fun ~id ~vtype ~offset ~limit ->
         req "peek"
           [ ("group", `String id); ("offset", `Int offset); ("limit", `Int limit) ]
+          (fun r -> Wire.items ~vtype (field "items" r)));
+    peek_from =
+      (fun ~id ~vtype ~addr ~limit ->
+        req "peek"
+          [ ("group", `String id); ("from", Wire.addr_to_json addr); ("limit", `Int limit) ]
           (fun r -> Wire.items ~vtype (field "items" r)));
     read =
       (fun ~addr ~vtype ->
