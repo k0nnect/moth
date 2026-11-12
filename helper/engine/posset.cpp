@@ -35,6 +35,20 @@ void PositionSet::add_block(uint64_t base, uint32_t span, std::span<const uint32
   append(b.finish());
 }
 
+void PositionSet::add_full_block(uint64_t base, uint32_t span) {
+  const uint32_t first = first_offset(base);
+  const uint64_t slots = span > first ? (uint64_t{span} - first + align_ - 1) / align_ : 0;
+  if (slots == 0) return;
+  Block b;
+  b.base = base;
+  b.span = span;
+  b.count = static_cast<uint32_t>(slots);
+  b.bitmap = true;
+  b.words.assign(static_cast<size_t>((slots + 31) / 32), ~0u);
+  if (slots % 32 != 0) b.words.back() = (1u << (slots % 32)) - 1;
+  append(std::move(b));
+}
+
 void PositionSet::append(Block b) {
   if (b.count == 0) return;
   count_ += b.count;

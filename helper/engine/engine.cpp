@@ -12,7 +12,9 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
+#include <type_traits>
 
 #include "engine/block_scan.hpp"
 
@@ -353,6 +355,35 @@ template <class Job> class Workers {
 // block is the offset first + i * align (see PositionSet::Block).
 uint32_t first_aligned(uint32_t align, uint64_t base) { return static_cast<uint32_t>((align - base % align) % align); }
 
+// The places of a snapshot block at base, span bytes long: each multiple of align whose w bytes all
+// lie in one stretch that was read. read holds the stretches as offsets in a buffer where base is
+// at. Adds them to positions unless it is null, and returns how many there are. When every aligned
+// offset of the block is one, which is the case for a block read whole that starts and ends at a
+// multiple of 8, the block is added as a full bitmap.
+uint64_t add_places(PositionSet* positions, uint32_t align, uint32_t w, uint64_t base, uint32_t span,
+                    const Spans& read, size_t at) {
+  uint64_t n = 0;
+  for (const auto& [from, to] : read) {
+    const uint64_t lo = base + (from - at), hi = base + (to - at);
+    if (hi < lo + w) continue;
+    const uint64_t first = (lo + align - 1) / align, last = (hi - w) / align;
+    if (last >= first) n += last - first + 1;
+  }
+  if (positions == nullptr || n == 0) return n;
+  const uint32_t first = first_aligned(align, base);
+  if (n == (span > first ? (uint64_t{span} - first + align - 1) / align : 0)) {
+    positions->add_full_block(base, span);
+    return n;
+  }
+  PositionSet::Builder b(align, base, span);
+  for (const auto& [from, to] : read) {
+    const uint64_t lo = base + (from - at), hi = base + (to - at);
+    for (uint64_t a = (lo + align - 1) / align * align; a + w <= hi; a += align) b.add(static_cast<uint32_t>(a - base));
+  }
+  positions->append(b.finish());
+  return n;
+}
+
 // A stretch of one group's positions in a block, each within kRunGap of the one before.
 struct Span {
   uint32_t first, last, end;  // its first and last position, and the end of the last one's value
@@ -406,7 +437,10 @@ struct Part {
   uint32_t align = 0;
   ValueType type = ValueType::U8;
   const Pred* pred = nullptr;
+  unsigned accept = 0;            // a relation: the orders that match (see order); 0: decided by matches()
   const uint8_t* prev = nullptr;  // the old group's stored values, or null when the predicate needs none
+  bool from_snapshot = false;     // the predicate takes previous values from the snapshot's bytes
+  bool to_snapshot = false;       // the group leans on the snapshot: the bytes of the positions kept replace its own
   uint64_t index = 0;             // the first position's index among the old group's, and its stored value's
   uint64_t at = 0, n = 0;         // the first position's index among the block's, and how many there are
   uint32_t first = 0, last = 0;   // the first and last position
@@ -423,12 +457,20 @@ struct Part {
   uint64_t count = 0, lost = 0;   // positions kept, and positions whose bytes were not all read
 };
 
+// The snapshot's bytes for the bytes [from, to) of a run's data, saved at p.
+struct Held {
+  size_t from, to;
+  uint8_t* p;
+};
+
 // One run of a narrow, read by the calling thread and compared by a worker.
 struct RunJob {
   uint64_t base = 0;   // the block's
   uint32_t first = 0;  // the run's first byte, as an offset in the block; data holds the run from it
   Spans arrived;       // the bytes of data that were read
   bool whole = false;  // all of them were
+  std::vector<Held> held;   // when a part leans on the snapshot, its stretches that the run overlaps, ascending
+  bool held_whole = false;  // one stretch holds all of the run
   Bytes data;
   std::vector<Part> parts;
   Buffer<uint32_t> kept;  // the parts' positions kept, for blocks split across runs
@@ -460,60 +502,227 @@ template <size_t W> uint64_t load(const uint8_t* p) {
   return v;
 }
 
-// Compares a part's positions, W bytes each, with their stored values. A position whose bytes
-// were not all read is lost.
-template <size_t W> void compare(RunJob& j, Part& p) {
-  std::optional<PositionSet::Builder> keep;  // the positions kept: the narrowed block, or
-  uint32_t* list = nullptr;                  // the kept offsets, or
-  uint32_t* bits = nullptr;                  // a bit for each place from first to last
-  if (p.alone) {
-    keep.emplace(p.align, p.block->base, p.block->span);
-  } else if (p.bitmap) {
-    bits = j.kept.data() + p.kept_at;
-    std::fill(bits, bits + p.kept_words, 0u);
+// How a value a compares with b, both W bytes in the low bits, as matches() orders them for a
+// relation: -1, 0, 1, or 2 when unordered (a NaN). Kind 0: unsigned, 1: signed, 2: a float, which
+// compares as matches() compares it as a double, since a float widens to a double exactly.
+template <size_t W, int Kind> int order(uint64_t a, uint64_t b) {
+  if constexpr (Kind == 2) {
+    using F = std::conditional_t<W == 4, float, double>;
+    using U = std::conditional_t<W == 4, uint32_t, uint64_t>;
+    const F x = std::bit_cast<F>(static_cast<U>(a)), y = std::bit_cast<F>(static_cast<U>(b));
+    if (x != x || y != y) return 2;
+    return x < y ? -1 : (x > y ? 1 : 0);
+  } else if constexpr (Kind == 1) {
+    using S = std::conditional_t<W == 1, int8_t, std::conditional_t<W == 2, int16_t, std::conditional_t<W == 4, int32_t, int64_t>>>;
+    const S x = static_cast<S>(a), y = static_cast<S>(b);
+    return (x > y) - (x < y);
   } else {
-    list = j.kept.data() + p.kept_at;
+    return (a > b) - (a < b);
   }
+}
+
+// The orders a relation accepts, a bit for each: bit 0 for -1, 1 for 0, 2 for 1, 3 for unordered.
+unsigned accepted_orders(const Pred& p) {
+  switch (p.op) {
+    case Pred::LtPrev: return 1u << 0;
+    case Pred::EqPrev: return 1u << 1;
+    case Pred::GtPrev: return 1u << 2;
+    case Pred::NePrev: return (1u << 0) | (1u << 2) | (1u << 3);
+    default: return 0;
+  }
+}
+
+// The snapshot's bytes for the W bytes at x in a run's data, or null if they are not all held in
+// one stretch. h is the first stretch that ends at or past them; it only moves forward.
+template <size_t W> const uint8_t* held_at(const RunJob& j, size_t x, size_t& h) {
+  if (j.held_whole) return j.held[0].p + x;
+  while (h < j.held.size() && j.held[h].to < x + W) h++;
+  if (h == j.held.size() || j.held[h].from > x) return nullptr;
+  return j.held[h].p + (x - j.held[h].from);
+}
+
+// Compares a part's positions, W bytes each, with their stored values or the snapshot's bytes. A
+// position whose bytes were not all read is lost. Kind is the type's for a relation (see order), or -1 for any
+// predicate, decided by matches().
+template <size_t W, int Kind> void compare(RunJob& j, Part& p) {
   uint8_t* const values = p.copy > 0 ? j.values.data() + p.values_at : nullptr;
   const uint8_t* const data = j.data.data();
   uint64_t i = p.index, count = 0, lost = 0;
   size_t k = 0;  // the first span of arrived that ends at or past the value's bytes; only moves forward
-  each_position(p, [&](uint32_t o) {
-    const uint64_t prev = p.prev != nullptr ? load<W>(p.prev + static_cast<size_t>(i) * W) : 0;
+  size_t h = 0;  // the same in held
+  // Whether the position at o, the next in order, is kept.
+  auto kept = [&](uint32_t o) {
+    uint64_t prev = p.prev != nullptr ? load<W>(p.prev + static_cast<size_t>(i) * W) : 0;
     i++;
     const size_t x = o - j.first;  // the value's bytes in data
     if (!j.whole) {
       while (k < j.arrived.size() && j.arrived[k].second < x + W) k++;
       if (k == j.arrived.size() || j.arrived[k].first > x) {  // not all of them were read
         lost++;
-        return;
+        return false;
       }
     }
-    if (!matches(*p.pred, p.type, load<W>(data + x), prev)) return;
-    if (keep) {
-      keep->add(o);
-    } else if (list != nullptr) {
-      list[count] = o;
+    if (p.from_snapshot) {
+      const uint8_t* const held = held_at<W>(j, x, h);
+      if (held == nullptr) {  // never: a snapshot's groups have only places it holds
+        lost++;
+        return false;
+      }
+      prev = load<W>(held);
+    }
+    if constexpr (Kind < 0) {
+      if (!matches(*p.pred, p.type, load<W>(data + x), prev)) return false;
     } else {
-      const uint32_t place = (o - p.first) / p.align;
-      bits[place / 32] |= 1u << (place % 32);
+      if (((p.accept >> (order<W, Kind>(load<W>(data + x), prev) + 1)) & 1) == 0) return false;
     }
     if (count < p.copy) std::memcpy(values + static_cast<size_t>(count) * W, data + x, W);
     count++;
-  });
-  if (keep) p.kept_block = keep->finish();
+    return true;
+  };
+  if (p.alone && p.block->bitmap) {
+    // A word of places at a time, straight into the narrowed block's bitmap, which has the same
+    // places; it becomes the list a Builder would make if that is no larger.
+    const PositionSet::Block& b = *p.block;
+    const uint32_t first = first_aligned(p.align, b.base);
+    std::vector<uint32_t> words(b.words.size(), 0u);
+    const size_t s0 = (p.first - first) / p.align, s1 = (p.last - first) / p.align;  // their bits
+    for (size_t w = s0 / 32; w <= s1 / 32; w++) {
+      uint32_t bits = b.words[w];
+      if (w == s0 / 32) bits &= ~0u << (s0 % 32);
+      if (w == s1 / 32) bits &= ~0u >> (31 - s1 % 32);
+      uint32_t out = 0;
+      for (; bits != 0; bits &= bits - 1) {
+        const int bit = std::countr_zero(bits);
+        if (kept(first + static_cast<uint32_t>((w * 32 + static_cast<size_t>(bit)) * p.align))) out |= 1u << bit;
+      }
+      words[w] = out;
+    }
+    p.kept_block = PositionSet::Block{b.base, b.span, static_cast<uint32_t>(count), true, {}};
+    if (count > words.size()) {
+      p.kept_block.words = std::move(words);
+    } else {
+      p.kept_block.bitmap = false;
+      p.kept_block.words.reserve(static_cast<size_t>(count));
+      for (size_t w = 0; w < words.size(); w++)
+        for (uint32_t bits = words[w]; bits != 0; bits &= bits - 1)
+          p.kept_block.words.push_back(first + static_cast<uint32_t>((w * 32 + static_cast<size_t>(std::countr_zero(bits))) * p.align));
+    }
+  } else if (p.alone) {
+    PositionSet::Builder keep(p.align, p.block->base, p.block->span);
+    each_position(p, [&](uint32_t o) {
+      if (kept(o)) keep.add(o);
+    });
+    p.kept_block = keep.finish();
+  } else if (p.bitmap) {  // a bit for each place from first to last
+    uint32_t* const bits = j.kept.data() + p.kept_at;
+    std::fill(bits, bits + p.kept_words, 0u);
+    each_position(p, [&](uint32_t o) {
+      if (!kept(o)) return;
+      const uint32_t place = (o - p.first) / p.align;
+      bits[place / 32] |= 1u << (place % 32);
+    });
+  } else {  // the kept offsets
+    uint32_t* const list = j.kept.data() + p.kept_at;
+    each_position(p, [&](uint32_t o) {
+      if (kept(o)) list[count - 1] = o;
+    });
+  }
   p.count = count;
   p.lost = lost;
 }
 
-// A worker's share of a narrow: one run, for each group with positions in it.
+// A relation is compared inline for the part's type; any other predicate goes through matches().
+template <size_t W> void compare_part(RunJob& j, Part& p) {
+  if (p.accept == 0) {
+    compare<W, -1>(j, p);
+  } else if (W >= 4 && is_float(p.type)) {
+    compare<W, 2>(j, p);
+  } else if (is_signed(p.type)) {
+    compare<W, 1>(j, p);
+  } else {
+    compare<W, 0>(j, p);
+  }
+}
+
+// Copies stretches of a run's data into the snapshot's bytes for them, where it holds them. Stretches
+// come in ascending order, and touching ones are copied together.
+class Replacer {
+ public:
+  explicit Replacer(RunJob& j) : j_(j) {}
+  void add(size_t x, size_t n) {
+    if (n_ > 0 && x == x_ + n_) {
+      n_ += n;
+      return;
+    }
+    flush();
+    x_ = x;
+    n_ = n;
+  }
+  void flush() {
+    if (n_ == 0) return;
+    const size_t end = x_ + n_;
+    while (h_ < j_.held.size() && j_.held[h_].to <= x_) h_++;
+    for (size_t k = h_; k < j_.held.size() && j_.held[k].from < end; k++) {
+      const Held& held = j_.held[k];
+      const size_t lo = std::max(x_, held.from), hi = std::min(end, held.to);
+      std::memcpy(held.p + (lo - held.from), j_.data.data() + lo, hi - lo);
+    }
+    n_ = 0;
+  }
+
+ private:
+  RunJob& j_;
+  size_t x_ = 0, n_ = 0;  // the stretch [x_, x_ + n_) of data, not yet copied
+  size_t h_ = 0;          // the first stretch of held that ends after it
+};
+
+// Replaces the snapshot's bytes at each position a part kept, W bytes each, with the bytes read.
+template <size_t W> void replace_kept(RunJob& j, const Part& p) {
+  Replacer r(j);
+  // a bitmap of n words whose bit i is the place first + i * align; a full word is one stretch
+  // when the places touch
+  auto bitmap = [&](const uint32_t* words, size_t n, uint32_t first) {
+    for (size_t k = 0; k < n; k++) {
+      const uint32_t o = first + static_cast<uint32_t>(k * 32 * p.align);
+      if (words[k] == ~0u && p.align == W) {
+        r.add(o - j.first, 32 * W);
+        continue;
+      }
+      for (uint32_t bits = words[k]; bits != 0; bits &= bits - 1)
+        r.add(o + static_cast<uint32_t>(std::countr_zero(bits)) * p.align - j.first, W);
+    }
+  };
+  if (p.alone && p.kept_block.bitmap) {
+    bitmap(p.kept_block.words.data(), p.kept_block.words.size(), first_aligned(p.align, p.kept_block.base));
+  } else if (p.alone) {
+    for (uint32_t o : p.kept_block.words) r.add(o - j.first, W);
+  } else if (p.bitmap) {
+    bitmap(j.kept.data() + p.kept_at, p.kept_words, p.first);
+  } else {
+    for (uint64_t c = 0; c < p.count; c++) r.add(j.kept.data()[p.kept_at + static_cast<size_t>(c)] - j.first, W);
+  }
+  r.flush();
+}
+
+// A worker's share of a narrow: one run, for each group with positions in it. The snapshot's bytes
+// are replaced only once every part is compared, since a place one part kept may be the bytes
+// another part compares with (an i32 place holds four u8 places).
 void compare_run(RunJob& j) {
   for (Part& p : j.parts) {
     switch (width_of(p.type)) {
-      case 1: compare<1>(j, p); break;
-      case 2: compare<2>(j, p); break;
-      case 4: compare<4>(j, p); break;
-      default: compare<8>(j, p); break;
+      case 1: compare_part<1>(j, p); break;
+      case 2: compare_part<2>(j, p); break;
+      case 4: compare_part<4>(j, p); break;
+      default: compare_part<8>(j, p); break;
+    }
+  }
+  for (const Part& p : j.parts) {
+    if (!p.to_snapshot || p.count == 0) continue;
+    switch (width_of(p.type)) {
+      case 1: replace_kept<1>(j, p); break;
+      case 2: replace_kept<2>(j, p); break;
+      case 4: replace_kept<4>(j, p); break;
+      default: replace_kept<8>(j, p); break;
     }
   }
 }
@@ -526,6 +735,49 @@ void copy_value(void* to, const void* from, size_t w) {
     case 2: std::memcpy(to, from, 2); return;
     case 4: std::memcpy(to, from, 4); return;
     default: std::memcpy(to, from, 8); return;
+  }
+}
+
+// A share of a group's blocks whose values a worker takes from the snapshot, and where they go.
+struct TakeJob {
+  std::span<const PositionSet::Block> blocks;
+  uint8_t* out = nullptr;
+  bool held = true;   // false if a position's bytes were not held
+  bool done = false;  // taken
+};
+
+// A share is at least this many values, so a small group takes its values on the calling thread.
+constexpr uint64_t kTakeShare = uint64_t{1} << 20;
+
+// Copies the snapshot's bytes at each position of a share's blocks (offsets aligned to align), W
+// bytes each, to its out, in order. A bitmap word of places that touch is one copy.
+template <size_t W> void take_values(const Snapshot& snapshot, TakeJob& t, uint32_t align) {
+  uint8_t* out = t.out;
+  for (const PositionSet::Block& b : t.blocks) {
+    const uint8_t* const whole = snapshot.at(b.base, b.span);  // a block read whole is one stretch
+    auto one = [&](uint32_t o) {
+      const uint8_t* const p = whole != nullptr ? whole + o : snapshot.at(b.base + o, W);
+      if (p == nullptr) return false;  // never: a snapshot's groups have only places it holds
+      std::memcpy(out, p, W);
+      out += W;
+      return true;
+    };
+    if (!b.bitmap) {
+      for (uint32_t o : b.words)
+        if (!one(o)) t.held = false;
+      continue;
+    }
+    const uint32_t first = first_aligned(align, b.base);
+    for (size_t k = 0; k < b.words.size(); k++) {
+      const uint32_t o = first + static_cast<uint32_t>(k * 32 * align);
+      if (b.words[k] == ~0u && align == W && whole != nullptr) {
+        std::memcpy(out, whole + o, 32 * W);
+        out += 32 * W;
+        continue;
+      }
+      for (uint32_t bits = b.words[k]; bits != 0; bits &= bits - 1)
+        if (!one(o + static_cast<uint32_t>(std::countr_zero(bits)) * align)) t.held = false;
+    }
   }
 }
 
@@ -567,6 +819,13 @@ void Engine::Values::append(const uint8_t* p, uint64_t n) {
 
 void Engine::Values::grow(size_t need) { bytes_.resize(std::max(2 * bytes_.size(), used_ + need)); }
 
+uint8_t* Engine::Values::extend(uint64_t n) {
+  const size_t len = static_cast<size_t>(n) * width_;
+  if (bytes_.size() - used_ < len) bytes_.resize(used_ + len);
+  used_ += len;
+  return bytes_.data() + (used_ - len);
+}
+
 void Engine::Values::clear() {
   std::vector<uint8_t>().swap(bytes_);
   used_ = 0;
@@ -588,11 +847,13 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
   validate(specs);
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
 
-  // Free the groups being replaced first, so old and new candidates are never held together.
+  // Free the groups being replaced first, so old and new candidates are never held together, and
+  // the snapshot if no group is left leaning on it.
   if (keep)
     std::erase_if(groups_, [&](const Group& g) { return listed(specs, g.spec.id); });
   else
     groups_.clear();
+  release_unused_snapshot();
   const uint64_t kept = storage_bytes();
   std::vector<Group> fresh;
   fresh.reserve(specs.size());
@@ -705,6 +966,90 @@ void Engine::fit_budget(std::vector<Group>& fresh, uint64_t kept) {
   }
 }
 
+std::vector<GroupInfo> Engine::snapshot(const std::vector<SnapSpec>& specs, ScanStats& stats) {
+  const auto start = std::chrono::steady_clock::now();
+  stats = ScanStats{};
+  for (size_t i = 0; i < specs.size(); i++) {
+    const SnapSpec& s = specs[i];
+    if (s.align == 0 || s.align % width_of(s.type) != 0)
+      throw EngineError("bad_request", "a snapshot group's align must be a positive multiple of its type's width: " + s.id);
+    for (size_t j = 0; j < i; j++)
+      if (specs[j].id == s.id) throw EngineError("bad_request", "group listed twice: " + s.id);
+  }
+  if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
+  std::vector<Region> regions = mem_.writable_regions();
+  std::sort(regions.begin(), regions.end(), [](const Region& a, const Region& b) { return a.base < b.base; });
+  uint64_t total = 0;
+  for (const Region& r : regions) total += r.size;
+  if (total > cfg_.snapshot_cap_bytes)
+    throw EngineError("too_big", std::to_string(total) + " to snapshot, limit " + std::to_string(cfg_.snapshot_cap_bytes));
+
+  // Release first, so two snapshots, or a snapshot and the candidates it replaces, are never held
+  // together.
+  groups_.clear();
+  snapshot_.clear();
+  std::vector<Group> fresh;
+  try {
+    fresh = copy_regions(regions, specs, stats);
+    if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
+  } catch (const std::bad_alloc&) {  // the groups' storage is freed by now
+    snapshot_.clear();
+    throw EngineError("too_big", "could not get memory for the snapshot");
+  } catch (...) {
+    snapshot_.clear();
+    throw;
+  }
+  std::vector<GroupInfo> out;
+  out.reserve(fresh.size());
+  for (Group& g : fresh) {
+    g.snap = g.tracked;
+    out.push_back(info(g));
+    groups_.push_back(std::move(g));
+  }
+  release_unused_snapshot();
+  stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  return out;
+}
+
+// Reads each region, block by block, into a buffer of the snapshot's own, and returns the listed
+// groups with the places of their type in the bytes that arrived, untracked from the last one
+// backwards after each block while their positions are over the budget. A group gets none of its
+// values: they are the snapshot's.
+std::vector<Engine::Group> Engine::copy_regions(const std::vector<Region>& regions, const std::vector<SnapSpec>& specs,
+                                                ScanStats& stats) {
+  std::vector<Group> fresh;
+  fresh.reserve(specs.size());
+  for (const SnapSpec& s : specs) {
+    fresh.emplace_back(GroupSpec{s.id, s.type, s.align, 0, Pred{Pred::EqPrev}});
+    fresh.back().has_values = false;
+  }
+  Listing listing(mem_);  // the readable regions, listed once if a read fails
+  // A block that starts at a multiple of 8 then ends at one, so no aligned place runs over its end.
+  const uint64_t step = std::max<uint64_t>(8, cfg_.block_size / 8 * 8);
+  Spans read, held;
+  for (const Region& r : regions) {
+    stats.regions++;
+    uint8_t* const buffer = snapshot_.add_region(r.size);
+    held.clear();
+    for (uint64_t off = 0; off < r.size; off += step) {
+      const uint32_t span = static_cast<uint32_t>(std::min(step, r.size - off));
+      read.clear();
+      const size_t got = read_spans(mem_, r.base + off, buffer, static_cast<size_t>(off), span, read, &listing);
+      stats.bytes += got;
+      stats.unreadable_bytes += span - got;
+      for (const auto& [from, to] : read) add_span(held, from, to);
+      if (got == 0) continue;
+      for (Group& g : fresh)
+        g.count += add_places(g.tracked ? &g.positions : nullptr, g.spec.align,
+                              static_cast<uint32_t>(width_of(g.spec.type)), r.base + off, span, read, static_cast<size_t>(off));
+      fit_budget(fresh, 0);
+    }
+    for (const auto& [from, to] : held) snapshot_.hold(r.base + from, to - from, buffer + from);
+    snapshot_.end_region();
+  }
+  return fresh;
+}
+
 std::vector<Item> Engine::peek(const std::string& id, uint64_t offset, uint64_t limit, bool holes) {
   const Group& g = find(id);
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
@@ -747,23 +1092,33 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
                         "group " + it.id + " is untracked, so it has no positions to narrow; scan it again");
     if (std::find(at.begin(), at.end(), k) != at.end())
       throw EngineError("bad_request", "group listed twice: " + it.id);
-    if (compares_with_last(it.pred) && !g.has_values)
+    if (compares_with_last(it.pred) && !g.has_values && !g.snap)
       throw EngineError("no_values", "group " + it.id + " has no stored values");
     at.push_back(k);
   }
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
 
-  // The replacements are built beside the groups, so nothing changes until the narrow applies.
-  std::vector<Group> fresh = narrowed(at, items, stats);
+  // The replacements are built beside the groups, so nothing changes until the narrow applies,
+  // but the snapshot: its bytes are replaced in place at the places kept, so a step that keeps
+  // nothing replaces nothing. A step that fails after that releases it.
+  std::vector<Group> fresh;
+  bool replacing = false;  // a run leaning on the snapshot was handed out
+  try {
+    fresh = narrowed(at, items, stats, replacing);
+    // Reads also fail once the game closes; that is reported, not taken as lost matches.
+    if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
+  } catch (...) {
+    if (replacing) forget_snapshot();
+    throw;
+  }
   uint64_t total = 0;
   for (const Group& g : fresh) total += g.count;
-  // Reads also fail once the game closes; that is reported, not taken as lost matches.
-  if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
 
   const bool applied = !atomic || total > 0;
   if (applied) {
     fit_gained_values(fresh, at);
     for (size_t i = 0; i < fresh.size(); i++) groups_[at[i]] = std::move(fresh[i]);
+    release_unused_snapshot();
   } else {
     stats.lost = 0;  // nothing was dropped
   }
@@ -794,7 +1149,7 @@ bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vect
 // when it takes the run back. The narrowed blocks the workers build are the groups' new positions,
 // at most a bit per place, and are not counted.
 std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items,
-                                            ScanStats& stats) {
+                                            ScanStats& stats, bool& replacing) {
   struct Lane {
     const Group* old;
     const Pred* pred;
@@ -813,7 +1168,13 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
   constexpr size_t kNone = ~size_t{0};
   std::vector<Lane> lanes;
   lanes.reserve(at.size());
-  for (size_t i = 0; i < at.size(); i++) lanes.push_back({&groups_[at[i]], &items[i].pred, Group(groups_[at[i]].spec)});
+  for (size_t i = 0; i < at.size(); i++) {
+    lanes.push_back({&groups_[at[i]], &items[i].pred, Group(groups_[at[i]].spec)});
+    if (lanes.back().old->snap) {  // leans on the snapshot until fit_gained_values gives it values
+      lanes.back().out.has_values = false;
+      lanes.back().out.snap = true;
+    }
+  }
   std::vector<size_t> set;  // the lanes narrowing the current block
   std::vector<Span> spans;
   std::vector<Run> runs;
@@ -944,7 +1305,10 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
           p.align = g.spec.align;
           p.type = g.spec.type;
           p.pred = lane.pred;
+          p.accept = accepted_orders(*lane.pred);
           p.prev = g.has_values && compares_with_last(*lane.pred) ? g.values.data() : nullptr;
+          p.from_snapshot = g.snap && compares_with_last(*lane.pred);
+          p.to_snapshot = g.snap;
           p.index = lane.index + sp.at;
           p.at = sp.at;
           p.n = 0;
@@ -1014,10 +1378,22 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
       peak_narrow_held_bytes_ = std::max(peak_narrow_held_bytes_, held);
 
       const size_t n = runs[r].end - runs[r].first;
+      // The snapshot's bytes for the run, when a part leans on it: the run's worker alone reads and
+      // replaces them, since runs do not overlap and a snapshot group's places lie within a block.
+      j->held.clear();
+      if (std::any_of(j->parts.begin(), j->parts.end(), [](const Part& p) { return p.to_snapshot; })) {
+        const uint64_t lo = base + runs[r].first, hi = lo + n;
+        snapshot_.each_overlapping(lo, hi, [&](const Snapshot::Piece& piece) {
+          const uint64_t from = std::max(lo, piece.base), to = std::min(hi, piece.base + piece.size);
+          j->held.push_back({static_cast<size_t>(from - lo), static_cast<size_t>(to - lo), piece.data + (from - piece.base)});
+        });
+      }
+      j->held_whole = j->held.size() == 1 && j->held[0].from == 0 && j->held[0].to == n;
       j->arrived.clear();
       const size_t got = read_spans(mem_, base + runs[r].first, j->data.reserve(n), 0, n, j->arrived, &listing);
       j->whole = got == n;
       stats.bytes += got;
+      if (!j->held.empty()) replacing = true;
       comparers.submit(j);
       while (add_next(false)) {
       }
@@ -1040,26 +1416,108 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
 }
 
 // Values a narrowed group gains (it had none, and is now within value_cap) are kept, in request
-// order, only while all storage stays within budget_bytes. Values a group already had only shrink.
+// order, only while all storage stays within budget_bytes. A group that leans on the snapshot gains
+// them from it, which holds the bytes just read at every place the group kept; without them it
+// goes on leaning on the snapshot. Values a group already had only shrink.
 void Engine::fit_gained_values(std::vector<Group>& fresh, const std::vector<size_t>& at) {
-  auto gains = [&](size_t i) { return fresh[i].has_values && !groups_[at[i]].has_values; };
+  auto from_snapshot = [&](size_t i) { return fresh[i].snap && fresh[i].count <= cfg_.value_cap; };
+  auto gains = [&](size_t i) { return from_snapshot(i) || (fresh[i].has_values && !groups_[at[i]].has_values); };
   uint64_t total = storage_bytes();
   for (size_t i = 0; i < fresh.size(); i++)
     total = total - bytes_of(groups_[at[i]]) + (gains(i) ? fresh[i].positions.bytes() : bytes_of(fresh[i]));
   for (size_t i = 0; i < fresh.size(); i++) {
     if (!gains(i)) continue;
-    const uint64_t v = fresh[i].values.bytes();
-    if (total + v <= cfg_.budget_bytes) {
+    const bool snap = from_snapshot(i);
+    const uint64_t v = snap ? fresh[i].count * width_of(fresh[i].spec.type) : fresh[i].values.bytes();
+    if (total + v <= cfg_.budget_bytes && (!snap || take_values_from_snapshot(fresh[i]))) {
       total += v;
       continue;
     }
-    forget_values(fresh[i]);
+    if (!snap) forget_values(fresh[i]);
   }
+}
+
+// Gives a group that leans on the snapshot its values: the snapshot's bytes at its positions. A
+// large group's blocks are shared out among workers_used() threads, each copying into its own part
+// of the values. Returns false, the group still leaning on the snapshot, if there is no memory for
+// them or no thread could be started.
+bool Engine::take_values_from_snapshot(Group& g) {
+  const std::vector<PositionSet::Block>& blocks = g.positions.blocks();
+  bool held = true;
+  try {
+    uint8_t* const out = g.values.extend(g.count);
+    const size_t w = width_of(g.spec.type);
+    auto take = [&](TakeJob& t) {
+      switch (w) {
+        case 1: take_values<1>(snapshot_, t, g.spec.align); break;
+        case 2: take_values<2>(snapshot_, t, g.spec.align); break;
+        case 4: take_values<4>(snapshot_, t, g.spec.align); break;
+        default: take_values<8>(snapshot_, t, g.spec.align); break;
+      }
+    };
+    std::optional<Workers<TakeJob>> takers;
+    if (workers_ > 1 && g.count > kTakeShare) takers.emplace(workers_, [&](TakeJob& t, unsigned) { take(t); });
+    auto collect = [&](bool wait) {
+      TakeJob* t = takers->take(wait);
+      if (t == nullptr) return false;
+      held = held && t->held;
+      takers->release(t);
+      return true;
+    };
+    uint64_t index = 0;  // of the share's first value
+    for (size_t b = 0; b < blocks.size();) {
+      TakeJob local;
+      if (takers)
+        while (takers->full()) collect(true);
+      TakeJob& t = takers ? *takers->acquire() : local;
+      t.blocks = std::span(blocks).subspan(b);
+      t.out = out + static_cast<size_t>(index) * w;
+      t.held = true;
+      uint64_t n = 0;
+      size_t e = b;
+      while (e < blocks.size() && n < kTakeShare) n += blocks[e++].count;
+      t.blocks = t.blocks.first(e - b);
+      b = e;
+      index += n;
+      if (!takers) {
+        take(t);
+        held = held && t.held;
+        continue;
+      }
+      takers->submit(&t);
+      while (collect(false)) {
+      }
+    }
+    if (takers) {
+      while (collect(true)) {
+      }
+      takers->finish();
+    }
+  } catch (...) {  // no memory, or no thread
+    held = false;
+  }
+  if (!held) {
+    g.values.clear();
+    return false;
+  }
+  g.has_values = true;
+  g.snap = false;
+  return true;
+}
+
+void Engine::forget_snapshot() {
+  snapshot_.clear();
+  for (Group& g : groups_) g.snap = false;
+}
+
+void Engine::release_unused_snapshot() {
+  if (std::none_of(groups_.begin(), groups_.end(), [](const Group& g) { return g.snap; })) snapshot_.clear();
 }
 
 void Engine::drop(const std::vector<std::string>& ids) {
   for (const std::string& id : ids) find(id);  // throws for an unknown id before anything is removed
   std::erase_if(groups_, [&](const Group& g) { return std::find(ids.begin(), ids.end(), g.spec.id) != ids.end(); });
+  release_unused_snapshot();
 }
 
 bool Engine::read_value(uint64_t addr, ValueType type, uint64_t& bits) {
@@ -1082,6 +1540,7 @@ bool Engine::write_value(uint64_t addr, ValueType type, uint64_t bits, uint64_t&
     uint64_t i = 0;
     if (g.has_values && width_of(g.spec.type) == w && g.positions.index_of(addr, i)) g.values.set(i, bits);
   }
+  snapshot_.put(addr, &bits, w);  // little-endian host
   return true;
 }
 
@@ -1098,7 +1557,7 @@ uint64_t Engine::storage_bytes() const {
   return total;
 }
 
-GroupInfo Engine::info(const Group& g) { return {g.spec.id, g.count, g.tracked, g.has_values}; }
+GroupInfo Engine::info(const Group& g) { return {g.spec.id, g.count, g.tracked, g.has_values || g.snap}; }
 
 uint64_t Engine::bytes_of(const Group& g) { return g.positions.bytes() + g.values.bytes(); }
 
@@ -1106,6 +1565,7 @@ void Engine::untrack(Group& g) {
   g.positions = PositionSet(g.spec.align);
   forget_values(g);
   g.tracked = false;
+  g.snap = false;
 }
 
 void Engine::forget_values(Group& g) {

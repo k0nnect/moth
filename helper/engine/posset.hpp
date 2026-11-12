@@ -60,6 +60,9 @@ class PositionSet {
   void add_block(uint64_t base, uint32_t span, std::span<const uint32_t> offsets);
   // Appends a block a Builder made with this set's align, under the same rules.
   void append(Block b);
+  // Appends every aligned offset below span of a block at base, stored as a bitmap, under the same
+  // rules as add_block. A block with no aligned offset is not stored.
+  void add_full_block(uint64_t base, uint32_t span);
 
   uint64_t count() const { return count_; }
   uint64_t bytes() const { return word_bytes_ + blocks_.capacity() * sizeof(Block); }  // heap held

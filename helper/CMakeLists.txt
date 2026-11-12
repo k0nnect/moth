@@ -11,7 +11,7 @@ include_directories(${CMAKE_SOURCE_DIR}/../third_party ${CMAKE_SOURCE_DIR})
 find_package(Threads REQUIRED)
 
 # portable engine sources, no OS headers; scans run on std::thread workers
-add_library(moth_engine STATIC engine/pred.cpp engine/block_scan.cpp engine/posset.cpp engine/engine.cpp)
+add_library(moth_engine STATIC engine/pred.cpp engine/block_scan.cpp engine/posset.cpp engine/snapshot.cpp engine/engine.cpp)
 target_link_libraries(moth_engine PUBLIC Threads::Threads)
 
 # JSON protocol handler, also portable; the Windows helper links it with moth_engine
@@ -35,7 +35,8 @@ if(MINGW)
 else()
   enable_testing()
   add_executable(moth_tests test/test_main.cpp test/test_sanity.cpp test/test_block_scan.cpp
-                 test/test_engine_scan.cpp test/test_engine_narrow.cpp test/test_engine_parallel.cpp test/test_handler.cpp)
+                 test/test_engine_scan.cpp test/test_engine_narrow.cpp test/test_engine_parallel.cpp test/test_engine_snapshot.cpp
+                 test/test_handler.cpp)
   target_link_libraries(moth_tests PRIVATE moth_proto)
   add_test(NAME moth_tests COMMAND moth_tests)
 

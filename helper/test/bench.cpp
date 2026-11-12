@@ -1,9 +1,15 @@
 // Engine speed on this machine: a first scan and one narrow over a seeded 256 MiB FakeMemory, with
 // the twelve groups a search for the whole number 100 makes; then a narrow over a dense group, every
 // aligned 4-byte place of the same memory, by an EqPrev step, on one worker and on the automatic
-// count. Prints the best of three rounds as
+// count; then a snapshot of the same memory with the six groups a snapshot hunt carries, and a
+// first EqPrev step over them, which keeps every place (i64 and f64, at 33.5 million places each,
+// fall under value_cap and take their values from the snapshot); then a step that leaves a u8 group
+// of every byte with about 51 million places, under value_cap, so it gains their values, once from
+// a snapshot and once from a scan. Prints the best of three rounds as
 //   scan: <x> s/GB, narrow: <y> ms
 //   dense narrow: <a> s/GB on 1 worker, <b> s/GB on <n> workers
+//   snapshot: <c> s/GB, first same step: <d> s/GB on <n> workers
+//   51M u8 values gained: <e> s/GB from a snapshot, <f> s/GB from a scan
 // where GB is 2^30 bytes. Optional argument: the worker count for the first line (default 0, auto,
 // as the helper uses). Reading here is a memcpy, so the figures are the engine's own share of a
 // step, not a game's.
@@ -36,6 +42,44 @@ double dense_narrow(FakeMemory& m, unsigned workers, unsigned& used) {
   for (int round = 0; round < 3; round++) {
     std::vector<GroupInfo> out;
     e.narrow({{"all", {Pred::EqPrev}}}, true, out, s);
+    best = std::min(best, s_per_gb(s));
+  }
+  return best;
+}
+
+// The best of three rounds of a snapshot of m with the six groups of a snapshot hunt, then an EqPrev
+// step over them, which nothing changes, on the automatic worker count.
+void snapshot_and_same(FakeMemory& m, double& snapshot, double& same, unsigned& used) {
+  const std::vector<SnapSpec> six = {{"i32", I32, 4}, {"f32", F32, 4}, {"i16", I16, 2},
+                                     {"i64", I64, 8}, {"f64", F64, 8}, {"u8", U8, 1}};
+  std::vector<NarrowItem> items;
+  for (const SnapSpec& sp : six) items.push_back({sp.id, {Pred::EqPrev}});
+  snapshot = same = 1e30;
+  for (int round = 0; round < 3; round++) {
+    Engine e(m, {.workers = 0});
+    used = e.workers_used();
+    ScanStats taken, step;
+    std::vector<GroupInfo> out;
+    e.snapshot(six, taken);
+    e.narrow(items, true, out, step);
+    snapshot = std::min(snapshot, s_per_gb(taken));
+    same = std::min(same, s_per_gb(step));
+  }
+}
+
+// The best of three steps from a u8 group of every byte of m, from a snapshot or a scan, to the
+// bytes 0 to 48, about 51 million places, which gain their values.
+double gain(FakeMemory& m, bool from_snapshot) {
+  double best = 1e30;
+  for (int round = 0; round < 3; round++) {
+    Engine e(m, {.workers = 0});
+    ScanStats s;
+    if (from_snapshot)
+      e.snapshot({{"u8", U8, 1}}, s);
+    else
+      e.scan({G("u8", U8, 1, 0, range(-1, 256))}, false, s);
+    std::vector<GroupInfo> out;
+    e.narrow({{"u8", range(-1, 49)}}, true, out, s);
     best = std::min(best, s_per_gb(s));
   }
   return best;
@@ -76,5 +120,11 @@ int main(int argc, char** argv) {
   unsigned one = 0, many = 0;
   const double dense_one = dense_narrow(m, 1, one), dense_auto = dense_narrow(m, 0, many);
   std::printf("dense narrow: %.3f s/GB on %u worker, %.3f s/GB on %u workers\n", dense_one, one, dense_auto, many);
+
+  double snapshot = 0, same = 0;
+  snapshot_and_same(m, snapshot, same, many);
+  std::printf("snapshot: %.3f s/GB, first same step: %.3f s/GB on %u workers\n", snapshot, same, many);
+  const double from_snapshot = gain(m, true), from_scan = gain(m, false);
+  std::printf("51M u8 values gained: %.3f s/GB from a snapshot, %.3f s/GB from a scan\n", from_snapshot, from_scan);
   return 0;
 }

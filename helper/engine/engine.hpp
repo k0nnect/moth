@@ -10,12 +10,14 @@
 #include "engine/memory.hpp"
 #include "engine/posset.hpp"
 #include "engine/pred.hpp"
+#include "engine/snapshot.hpp"
 
 namespace moth {
 
 // tracked: the group's positions are stored (otherwise only its count is).
-// has_values: its last-seen values are stored too, which happens only while count <= value_cap
-// and the budget has room for them (see Engine::scan and Engine::narrow).
+// has_values: a previous-value predicate can be answered: its last-seen values are stored too,
+// which happens only while count <= value_cap and the budget has room for them (see Engine::scan
+// and Engine::narrow), or it leans on the snapshot (see Engine::snapshot).
 struct GroupInfo {
   std::string id;
   uint64_t count;
@@ -40,6 +42,7 @@ struct EngineConfig {
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
   unsigned workers = 1;                   // threads searching a scan's blocks and comparing a narrow's runs;
                                           // 0: hardware threads - 1, from 1 to 8
+  uint64_t snapshot_cap_bytes = 8ull << 30;  // the most writable memory a snapshot copies (see Engine::snapshot)
 };
 
 struct Item {
@@ -53,6 +56,14 @@ struct NarrowItem {
   Pred pred;
 };
 
+// A group of a snapshot: every place of the type at a multiple of align, which must be a multiple
+// of the type's width.
+struct SnapSpec {
+  std::string id;
+  ValueType type;
+  uint32_t align;
+};
+
 class Engine {
  public:
   explicit Engine(ProcessMemory& mem, EngineConfig cfg = {});
@@ -61,7 +72,8 @@ class Engine {
   // address order, searched on workers_used() threads, and added to the groups in address order,
   // so the result is the same for any worker count. keep=false replaces all groups; keep=true
   // replaces only groups with a listed id, and the listed groups then follow the others in
-  // groups(). Returns the listed groups in request order.
+  // groups(). Returns the listed groups in request order. The groups replaced are released before
+  // anything is read, and so is the snapshot once no group leans on it: always with keep=false.
   // After each block of the walk, storage is held within budget_bytes, counting each group's
   // positions and the values it holds: first, listed groups are untracked from the last one
   // backwards until the positions alone fit; then, while positions and values are still over,
@@ -75,6 +87,27 @@ class Engine {
   // listed twice), nothing changed; target_gone (the process is not alive), and the replaced
   // groups are gone.
   std::vector<GroupInfo> scan(const std::vector<GroupSpec>& specs, bool keep, ScanStats& stats);
+
+  // Copies every writable region into a new snapshot, and makes each listed group every place of
+  // its type, at a multiple of its align, whose bytes were copied: tracked, with has_values true,
+  // leaning on the snapshot for its previous values. Returns them in request order; they replace
+  // every group. First the regions' sizes are added up: over snapshot_cap_bytes is refused before
+  // anything is released or read. Then every group and any earlier snapshot are released, so two
+  // snapshots are never held together, and each region is read in blocks on the calling thread,
+  // as a scan reads, into a buffer of its own; only the bytes that arrived are held (bytes not read
+  // are counted in stats.unreadable_bytes, and are no place of any group). A place's bytes lie in
+  // one block of the walk; blocks are block_size rounded down to a multiple of 8, so in a region
+  // that starts and ends at a multiple of 8, as a process's regions do, every aligned place whose
+  // bytes were read is one. stats is filled as by a scan. Groups whose positions do not fit
+  // budget_bytes are untracked from the last one backwards, after each block as in a scan; the
+  // snapshot is not counted in storage_bytes() or the budget. If no listed group is left tracked,
+  // the snapshot is released.
+  // Throws EngineError, with nothing changed: bad_request (align 0 or not a multiple of the type's
+  // width, an id listed twice), too_big "<bytes> to snapshot, limit <bytes>" (both plain decimal
+  // byte counts), target_gone (the process is not alive). With every group and the snapshot
+  // released: too_big "could not get memory for the snapshot", target_gone (the process closed
+  // during the walk), or what a read threw.
+  std::vector<GroupInfo> snapshot(const std::vector<SnapSpec>& specs, ScanStats& stats);
 
   // Positions [offset, offset + limit) of a group in address order, with their values read now.
   // Positions that cannot be read are left out, so a page may be short; with holes, each is given
@@ -100,13 +133,27 @@ class Engine {
   // group has more values copied than value_cap allows. After an applied narrow
   // a group with at most value_cap positions stores the values just read, unless values it did not
   // have before would take storage over budget_bytes.
+  // A group that leans on the snapshot takes each place's previous value from the snapshot's bytes
+  // there. The worker comparing a run reads them and, once every listed group in the run is
+  // compared, replaces in place the snapshot's bytes at each place such a group kept with the bytes
+  // just read, so its next relation compares with this step; it copies none of their values. Places
+  // no group keeps are left as they were, and are no longer candidates. A step that is not applied
+  // kept nothing, so it replaced nothing. After an applied step, such a group with at most
+  // value_cap positions takes its values from the snapshot, which are the bytes just read, unless
+  // they would take storage over budget_bytes, and no longer leans on it; the snapshot is released
+  // once no group does. A group leaning on it that a narrow does not list still compares with the
+  // snapshot, which by then may hold newer bytes at places other groups kept.
   // Throws EngineError, with nothing changed: no_such_group (an unknown id, or an untracked
   // group, which has no positions to narrow), bad_request (an id listed twice), no_values (a
   // previous-value predicate or a moved range on a group without values), target_gone (the
-  // process is not alive before or after the reads).
+  // process is not alive before or after the reads). If a narrow that has handed out a run
+  // leaning on the snapshot then throws (target_gone after the reads, or what a read or a worker
+  // threw), the snapshot is released instead and no group leans on it any more: their positions
+  // are unchanged and they have no values, so they never compare with bytes from two moments.
   bool narrow(const std::vector<NarrowItem>& items, bool atomic, std::vector<GroupInfo>& out, ScanStats& stats);
 
-  // Removes the listed groups. Throws EngineError no_such_group, removing nothing, if one is unknown.
+  // Removes the listed groups, and the snapshot once no group leans on it. Throws EngineError
+  // no_such_group, removing nothing, if one is unknown.
   void drop(const std::vector<std::string>& ids);
 
   // Reads one value of the type into the low bytes of bits. Returns false if it cannot be read.
@@ -115,12 +162,17 @@ class Engine {
   // Writes the low bytes of bits as one value of the type, after reading the value there into
   // prev_bits. Returns false if that value cannot be read (nothing is written) or written.
   // After a write, every group with stored values that holds addr as a position of the same
-  // width stores the written value there, so its next relation compares with it.
+  // width stores the written value there, so its next relation compares with it, and the
+  // snapshot holds the written bytes wherever it holds those addresses.
   // Throws EngineError target_gone.
   bool write_value(uint64_t addr, ValueType type, uint64_t bits, uint64_t& prev_bits);
 
   std::vector<GroupInfo> groups() const;
-  uint64_t storage_bytes() const;  // heap bytes held by every group's positions and values
+  uint64_t storage_bytes() const;  // heap bytes held by every group's positions and values, not the snapshot
+  uint64_t snapshot_bytes() const { return snapshot_.bytes(); }  // heap bytes the snapshot holds; 0 when none
+  const Snapshot& held_snapshot() const { return snapshot_; }  // its bytes as they stand, for checks
+  // Changes the snapshot limit for later snapshots.
+  void set_snapshot_cap_bytes(uint64_t b) { cfg_.snapshot_cap_bytes = b; }
   // Changes the candidate storage budget for later scans and narrows.
   void set_budget_bytes(uint64_t b) { cfg_.budget_bytes = b; }
   uint64_t budget_bytes() const { return cfg_.budget_bytes; }
@@ -156,6 +208,7 @@ class Engine {
     void set(uint64_t i, uint64_t bits);  // stores bits' low bytes as value i
     void append(const uint8_t* p);        // appends the value whose bytes start at p
     void append(const uint8_t* p, uint64_t n);  // appends n values packed the same way from p
+    uint8_t* extend(uint64_t n);          // appends n values, 0 until written at the pointer returned
     void clear();                         // removes every value and frees their memory
     void shrink_to_fit();                 // gives back the room beyond the values
     uint64_t bytes() const { return bytes_.capacity(); }  // heap held, room to grow included
@@ -177,6 +230,7 @@ class Engine {
     uint64_t count = 0;
     bool tracked = true;
     bool has_values = true;
+    bool snap = false;  // no values of its own: its previous values are the snapshot's bytes at its positions
     explicit Group(GroupSpec s) : spec(std::move(s)), positions(spec.align), values(width_of(spec.type)) {}
   };
 
@@ -184,11 +238,17 @@ class Engine {
   static uint64_t bytes_of(const Group& g);
   static void untrack(Group& g);
   static void forget_values(Group& g);
+  std::vector<Group> copy_regions(const std::vector<Region>& regions, const std::vector<SnapSpec>& specs,
+                                  ScanStats& stats);
+  bool take_values_from_snapshot(Group& g);
+  void forget_snapshot();
+  void release_unused_snapshot();
   size_t index_of(const std::string& id) const;
   const Group& find(const std::string& id) const;
   void add_found(Group& g, PositionSet::Block b, const uint8_t* data);
   void fit_budget(std::vector<Group>& fresh, uint64_t kept);
-  std::vector<Group> narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items, ScanStats& stats);
+  std::vector<Group> narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items, ScanStats& stats,
+                              bool& replacing);
   void fit_gained_values(std::vector<Group>& fresh, const std::vector<size_t>& at);
 
   ProcessMemory& mem_;
@@ -199,6 +259,7 @@ class Engine {
   unsigned narrow_threads_used_ = 0;
   uint64_t peak_narrow_held_bytes_ = 0;
   std::vector<Group> groups_;
+  Snapshot snapshot_;
 };
 
 }  // namespace moth
