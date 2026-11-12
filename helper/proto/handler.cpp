@@ -317,12 +317,17 @@ struct Handler::Impl {
     } else if (op == "peek") {
       need_attached();
       const std::string& id = get_str(req, "group");
-      const uint64_t offset = get_uint(req, "offset");
+      // positions from an index (offset) or from an address (from)
+      const auto from = req.find("from");
+      if (from != req.end() && req.contains("offset")) bad("give \"offset\" or \"from\", not both");
+      if (from == req.end() && !req.contains("offset")) bad("missing field \"offset\" or \"from\"");
+      const uint64_t start = from != req.end() ? parse_addr(str_of(*from, "from")) : get_uint(req, "offset");
       uint64_t limit = get_uint(req, "limit");
       if (limit > kPeekCap) limit = kPeekCap;
       const ValueType t = type_of(id);
       json items = json::array();
-      for (const Item& it : eng->peek(id, offset, limit)) items.push_back(json{{"addr", hex_addr(it.addr)}, {"v", format_value(t, it.bits)}});
+      const std::vector<Item> got = from != req.end() ? eng->peek_from(id, start, limit) : eng->peek(id, start, limit);
+      for (const Item& it : got) items.push_back(json{{"addr", hex_addr(it.addr)}, {"v", format_value(t, it.bits)}});
       r["items"] = items;
     } else if (op == "read") {
       need_attached();

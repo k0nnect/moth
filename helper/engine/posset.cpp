@@ -69,6 +69,28 @@ bool PositionSet::index_of(uint64_t addr, uint64_t& index) const {
   return false;
 }
 
+uint64_t PositionSet::lower_bound(uint64_t addr) const {
+  uint64_t before = 0;  // positions in the blocks wholly below addr
+  for (const Block& b : blocks_) {
+    if (addr <= b.base) return before;
+    if (addr >= b.base + b.span) {
+      before += b.count;
+      continue;
+    }
+    const uint32_t o = static_cast<uint32_t>(addr - b.base);
+    if (!b.bitmap)
+      return before + static_cast<uint64_t>(std::lower_bound(b.words.begin(), b.words.end(), o) - b.words.begin());
+    // the first slot whose offset is at or above o
+    const uint32_t first = first_offset(b.base);
+    const uint64_t slot = o <= first ? 0 : (uint64_t{o} - first + align_ - 1) / align_;
+    if (slot >= static_cast<uint64_t>(b.words.size()) * 32) return before + b.count;
+    const size_t word = static_cast<size_t>(slot / 32);
+    for (size_t w = 0; w < word; w++) before += static_cast<uint64_t>(std::popcount(b.words[w]));
+    return before + static_cast<uint64_t>(std::popcount(b.words[word] & ((1u << (slot % 32)) - 1)));
+  }
+  return before;
+}
+
 std::vector<uint64_t> PositionSet::addresses(uint64_t from, uint64_t n) const {
   std::vector<uint64_t> out;
   if (from >= count_ || n == 0) return out;

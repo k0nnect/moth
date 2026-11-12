@@ -87,6 +87,9 @@ class PositionSet {
   // Sets index to addr's place among the positions, in ascending order; false if addr is not one.
   bool index_of(uint64_t addr, uint64_t& index) const;
 
+  // The index of the first position at or above addr, in ascending order; count() if there is none.
+  uint64_t lower_bound(uint64_t addr) const;
+
  private:
   // the first offset in a block at base whose absolute address is a multiple of align
   static uint32_t first_offset(uint32_t align, uint64_t base) { return static_cast<uint32_t>((align - base % align) % align); }

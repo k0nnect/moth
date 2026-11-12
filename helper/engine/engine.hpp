@@ -26,7 +26,8 @@ struct GroupInfo {
 // those regions that could not be read. lost: candidates dropped because their memory went away.
 // ms: wall-clock time of the step. A narrow walks no regions: its regions and unreadable_bytes are 0.
 // A read that fails or comes back short is read again in smaller parts, down to single pages, so
-// only bytes that really cannot be read are left out (see read_spans in engine.cpp).
+// only bytes that really cannot be read are left out (see read_spans in engine.cpp). After a failed
+// read a step lists the writable regions once, and bytes no longer in any are left out unread.
 struct ScanStats {
   uint64_t regions = 0, bytes = 0, unreadable_bytes = 0, lost = 0;
   double ms = 0;
@@ -68,6 +69,8 @@ class Engine {
   // Positions that cannot be read are left out, so a page may be short. An untracked group
   // gives none. Throws EngineError no_such_group, or target_gone when the process is not alive.
   std::vector<Item> peek(const std::string& id, uint64_t offset, uint64_t limit);
+  // As peek, from the group's first position at or above addr.
+  std::vector<Item> peek_from(const std::string& id, uint64_t addr, uint64_t limit);
 
   // Keeps, in each listed group, the positions whose value now matches its predicate. A
   // previous-value predicate compares with the values stored at the group's last applied step.

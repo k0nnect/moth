@@ -22,6 +22,17 @@ template <class F> std::string error_code(F&& f) {
   return "";
 }
 
+// FakeMemory whose game frees the region at freed just after the scan lists the regions.
+struct FreeingMemory : FakeMemory {
+  uint64_t freed = 0;
+  int listings = 0;
+  std::vector<Region> writable_regions() override {
+    std::vector<Region> out = FakeMemory::writable_regions();
+    if (listings++ == 0) remove_region(freed);
+    return out;
+  }
+};
+
 }  // namespace
 
 TEST_CASE("finds values across regions in address order") {
@@ -66,6 +77,16 @@ TEST_CASE("a readable block is read with one call") {
   FakeMemory m; m.set_all_or_nothing(true); m.add_region(0x10000000, 4u << 20);
   Engine e(m); ScanStats s; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
   CHECK(m.read_calls == 1); CHECK(s.unreadable_bytes == 0);
+}
+TEST_CASE("a region freed after the scan listed it costs no read per page") {
+  // four 4 MiB blocks that all fail; the regions are listed again once, not once per block
+  const uint64_t big = 16u << 20;
+  FreeingMemory m; m.set_all_or_nothing(true); m.freed = 0x100000;
+  m.add_region(0x100000, big); m.add_region(0x100000 + big, 4096); m.poke<int32_t>(0x100000 + big, 7);
+  Engine e(m, {.block_size = 4u << 20}); ScanStats s;
+  CHECK(e.scan({G("a", I32, 4, 0, eq(7))}, false, s)[0].count == 1);
+  CHECK(s.unreadable_bytes == big); CHECK(s.bytes == 4096);
+  CHECK(m.read_calls == 5); CHECK(m.listings == 2);
 }
 TEST_CASE("values are kept only up to value_cap") {
   FakeMemory m; m.add_region(0x10000, 4096); for (int i = 0; i < 5; i++) m.poke<int32_t>(0x10000 + i * 4, 100);
@@ -130,6 +151,23 @@ TEST_CASE("a position's index is found in offset and bitmap blocks") {
   CHECK(s.index_of(0x11000 + 4088, i)); CHECK(i == 2 + 511);
   CHECK_FALSE(s.index_of(0x1000c, i)); CHECK_FALSE(s.index_of(0x11004, i)); CHECK_FALSE(s.index_of(0x11002, i));
   CHECK_FALSE(s.index_of(0xf000, i)); CHECK_FALSE(s.index_of(0x12000, i));
+}
+TEST_CASE("lower_bound finds the first position at or after an address") {
+  PositionSet s(4); s.add_block(0x1000, 4096, V{0, 8, 100}); s.add_block(0x9000, 4096, V{4});
+  CHECK(s.lower_bound(0) == 0); CHECK(s.lower_bound(0x1008) == 1); CHECK(s.lower_bound(0x1009) == 2);
+  CHECK(s.lower_bound(0x1065) == 3); CHECK(s.lower_bound(0x9004) == 3); CHECK(s.lower_bound(0x9005) == 4);
+}
+TEST_CASE("lower_bound in a bitmap block, between blocks and past the end") {
+  // base 0x1000e is 2 past a multiple of 4: every aligned offset, 2 to 998, is a position
+  std::vector<uint32_t> all;
+  for (uint32_t o = 2; o < 1000; o += 4) all.push_back(o);
+  PositionSet s(4); s.add_block(0x1000e, 1000, all); s.add_block(0x20000, 4096, V{8});
+  REQUIRE(s.blocks()[0].bitmap);
+  CHECK(s.lower_bound(0x10014) == 1); CHECK(s.lower_bound(0x10011) == 1);   // aligned, and not
+  CHECK(s.lower_bound(0x1000f) == 0);                                       // in the block, before its first slot
+  CHECK(s.lower_bound(0x1000e + 998) == 249); CHECK(s.lower_bound(0x1000e + 999) == 250);
+  CHECK(s.lower_bound(0x10000) == 0); CHECK(s.lower_bound(0x18000) == 250);  // below the set, between blocks
+  CHECK(s.lower_bound(0x20009) == 251); CHECK(PositionSet(4).lower_bound(0x10000) == 0);
 }
 TEST_CASE("peek pages by index across blocks and reads current values") {
   FakeMemory m; m.add_region(0x10000, 3 * 4096); m.poke<uint8_t>(0x11000, 9);   // second block's first byte

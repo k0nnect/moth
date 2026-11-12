@@ -47,13 +47,53 @@ void add_span(Spans& spans, size_t from, size_t to) {
     spans.push_back({from, to});
 }
 
+// The writable regions as one step (a scan or a narrow) finds them when it first needs them, after
+// a read failed: listed at most once per step, ascending, with touching regions joined.
+class Listing {
+ public:
+  explicit Listing(ProcessMemory& mem) : mem_(mem) {}
+
+  // The regions that overlap [addr, end), ascending.
+  std::span<const Region> overlapping(uint64_t addr, uint64_t end) {
+    if (!listed_) list();
+    auto from = std::partition_point(regions_.begin(), regions_.end(),
+                                     [&](const Region& r) { return r.base + r.size <= addr; });
+    auto to = std::partition_point(from, regions_.end(), [&](const Region& r) { return r.base < end; });
+    return {from, to};
+  }
+
+ private:
+  void list() {
+    listed_ = true;
+    std::vector<Region> rs = mem_.writable_regions();
+    std::sort(rs.begin(), rs.end(), [](const Region& a, const Region& b) { return a.base < b.base; });
+    for (const Region& r : rs) {
+      if (r.size == 0) continue;
+      if (!regions_.empty() && r.base <= regions_.back().base + regions_.back().size) {
+        Region& last = regions_.back();
+        last.size = std::max(last.base + last.size, r.base + r.size) - last.base;
+      } else {
+        regions_.push_back(r);
+      }
+    }
+  }
+
+  ProcessMemory& mem_;
+  bool listed_ = false;
+  std::vector<Region> regions_;
+};
+
 // Reads n bytes at addr into buf + at and appends the offsets that arrived to spans. Everything
 // readable costs one read. A read that comes back short is continued from where it stopped; one
 // that gets nothing and covers more than one page is split in two at a page boundary near its
 // middle, and each half read the same way. So with a read that gets all or nothing (as
 // ReadProcessMemory does), an unreadable page loses only its own bytes, at about two reads per
-// halving. Splitting stops once the process has closed. Returns the bytes read.
-size_t read_spans(ProcessMemory& mem, uint64_t addr, uint8_t* buf, size_t at, size_t n, Spans& spans) {
+// halving. Given a listing, such a read first asks it for the writable regions: what lies outside
+// all of them (memory the game has freed since it was listed) is not read again, and each part
+// inside one is read as above, split only if it fails too. Splitting stops once the process has
+// closed. Returns the bytes read.
+size_t read_spans(ProcessMemory& mem, uint64_t addr, uint8_t* buf, size_t at, size_t n, Spans& spans,
+                  Listing* listing = nullptr) {
   size_t total = 0;
   while (n > 0) {
     const size_t got = std::min(mem.read(addr, buf + at, n), n);
@@ -68,6 +108,16 @@ size_t read_spans(ProcessMemory& mem, uint64_t addr, uint8_t* buf, size_t at, si
   const uint64_t first = addr - addr % kPage + kPage;  // the first page boundary after addr
   const uint64_t last = (addr + n - 1) - (addr + n - 1) % kPage;  // the last one before the end
   if (first > last || !mem.alive()) return total;      // one page, or the game is gone
+  if (listing != nullptr) {
+    const std::span<const Region> in = listing->overlapping(addr, addr + n);
+    if (in.size() != 1 || in[0].base > addr || in[0].base + in[0].size < addr + n) {
+      for (const Region& r : in) {  // only the parts still listed
+        const uint64_t lo = std::max(addr, r.base), hi = std::min(addr + n, r.base + r.size);
+        total += read_spans(mem, lo, buf, at + static_cast<size_t>(lo - addr), static_cast<size_t>(hi - lo), spans);
+      }
+      return total;
+    }
+  }
   const uint64_t mid = std::clamp<uint64_t>((addr + n / 2) - (addr + n / 2) % kPage, first, last);
   const size_t left = static_cast<size_t>(mid - addr);
   total += read_spans(mem, addr, buf, at, left, spans);
@@ -310,6 +360,7 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
 
   std::vector<Region> regions = mem_.writable_regions();
   std::sort(regions.begin(), regions.end(), [](const Region& a, const Region& b) { return a.base < b.base; });
+  Listing listing(mem_);  // the regions listed again, once, if a read fails during the walk
 
   peak_raw_offsets_ = 0;
   Searchers searchers(specs, workers_, cfg_.block_size + kOverlap);
@@ -335,7 +386,7 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
       j->span = static_cast<uint32_t>(std::min<uint64_t>(cfg_.block_size, left));
       const size_t want = static_cast<size_t>(std::min<uint64_t>(j->span + kOverlap, left));
       j->parts.clear();
-      read_spans(mem_, j->base, j->data.data(), 0, want, j->parts);  // only what arrived is searched
+      read_spans(mem_, j->base, j->data.data(), 0, want, j->parts, &listing);  // only what arrived is searched
       const uint64_t got = block_bytes(*j);
       stats.bytes += got;
       stats.unreadable_bytes += j->span - got;
@@ -413,6 +464,10 @@ std::vector<Item> Engine::peek(const std::string& id, uint64_t offset, uint64_t 
   return items;
 }
 
+std::vector<Item> Engine::peek_from(const std::string& id, uint64_t addr, uint64_t limit) {
+  return peek(id, find(id).positions.lower_bound(addr), limit);
+}
+
 bool Engine::narrow(const std::vector<NarrowItem>& items, bool atomic, std::vector<GroupInfo>& out,
                     ScanStats& stats) {
   const auto start = std::chrono::steady_clock::now();
@@ -482,6 +537,7 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
   std::vector<Run> spans, runs;
   Spans arrived;            // the buffer bytes that were read, run after run
   Bytes buf;
+  Listing listing(mem_);    // the regions listed, once, if a read fails
   for (;;) {
     // the lowest next block among the lanes, and every lane whose next block is the same
     const PositionSet::Block* head = nullptr;
@@ -537,7 +593,7 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
     uint8_t* data = buf.reserve(need);
     arrived.clear();
     for (Run& r : runs) {
-      const size_t got = read_spans(mem_, base + r.first, data, r.at, r.end - r.first, arrived);
+      const size_t got = read_spans(mem_, base + r.first, data, r.at, r.end - r.first, arrived, &listing);
       r.whole = got == r.end - r.first;
       stats.bytes += got;
     }

@@ -131,6 +131,24 @@ TEST_CASE("peek limit is capped at 1000") {
   CHECK(pk["items"][999]["addr"] == "0x10f9c");
 }
 
+TEST_CASE("peek from an address") {
+  FakePlatform p; p.add(1, "t.exe", 64); auto& m = p.mem(1); m.add_region(0x10000, 16384);
+  for (int i = 0; i < 3; i++) m.poke<int32_t>(0x10000 + i * 16, 100);
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  h.handle_line(R"({"op":"scan","keep":false,"groups":[
+     {"id":"i32","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"100"}},
+     {"id":"z","type":"i32","align":4,"exclude_align":0,"pred":{"op":"eq","v":"0"}}]})");
+  auto pk = J(h.handle_line(R"({"op":"peek","group":"i32","from":"0x10004","limit":5})"));
+  REQUIRE(pk["items"].size() == 2); CHECK(pk["items"][0]["addr"] == "0x10010"); CHECK(pk["items"][0]["v"] == "100");
+  CHECK(code(h, R"({"op":"peek","group":"i32","offset":0,"from":"0x10004","limit":5})") == "bad_request");
+  CHECK(code(h, R"({"op":"peek","group":"i32","limit":5})") == "bad_request");               // neither
+  CHECK(code(h, R"({"op":"peek","group":"i32","from":"10004","limit":5})") == "bad_request");
+  CHECK(code(h, R"({"op":"peek","group":"i32","from":4,"limit":5})") == "bad_request");
+  CHECK(code(h, R"({"op":"peek","group":"nope","from":"0x10004","limit":5})") == "no_such_group");
+  pk = J(h.handle_line(R"({"op":"peek","group":"z","from":"0x10000","limit":5000})"));      // the cap holds
+  CHECK(pk["items"].size() == 1000); CHECK(pk["items"][0]["addr"] == "0x10004");
+}
+
 TEST_CASE("attach, detach, status and target_gone") {
   FakePlatform p;
   p.add(1, "a.exe", 64); p.mem(1).add_region(0x10000, 4096);

@@ -59,6 +59,18 @@ TEST_CASE("freed memory loses candidates instead of failing") {
   Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
   m.remove_region(0x50000); CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(g[0].count == 3); CHECK(s.lost == 1);
 }
+TEST_CASE("a freed range is skipped without a read for every page") {
+  const uint64_t big = 16u << 20;
+  FakeMemory m; m.set_all_or_nothing(true);
+  m.add_region(0x100000, big); m.add_region(0x100000 + big, 4096);
+  for (uint64_t a = 0x100000; a < 0x100000 + big; a += 4096) m.poke<int32_t>(a, 7);
+  m.poke<int32_t>(0x100000 + big, 7);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g;
+  e.scan({G("a", I32, 4, 0, eq(7))}, false, s); CHECK(e.groups()[0].count == 4097);
+  m.remove_region(0x100000);   // the game frees the whole 16 MiB
+  m.read_calls = 0;
+  CHECK(e.narrow({{"a", eq(7)}}, true, g, s)); CHECK(g[0].count == 1); CHECK(s.lost == 4096); CHECK(m.read_calls <= 16);
+}
 TEST_CASE("sparse candidates are read in runs, not whole blocks") {
   FakeMemory m; m.add_region(0x1000000, 12u << 20);
   m.poke<int32_t>(0x1000000, 100); m.poke<int32_t>(0x1000064, 100); m.poke<int32_t>(0x1000000 + (10u << 20), 100);
@@ -77,6 +89,12 @@ TEST_CASE("read, write and peek paging") {
   CHECK(e.peek("a", 1, 1).size() == 1); CHECK(e.peek("a", 1, 1)[0].addr == 0x10010);
   m.set_readonly(0x10000, true); CHECK_FALSE(e.write_value(0x10000, ValueType::I32, 1, prev));
   e.drop({"a"}); CHECK(e.groups().empty());
+}
+TEST_CASE("peek_from starts at an address") {
+  FakeMemory m; three(m); Engine e(m); ScanStats s;
+  e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  auto items = e.peek_from("a", 0x10004, 9); CHECK(items.size() == 2); CHECK(items[0].addr == 0x10010);
+  CHECK(e.peek_from("a", 0x20000, 9).empty());
 }
 
 // Beyond the brief: the error format, and the choices the brief leaves to the engine.
@@ -177,6 +195,19 @@ TEST_CASE("a candidate whose bytes run into a freed page is lost") {
   CHECK(e.narrow({{"u", eq(100)}}, true, g, s)); CHECK(s.lost == 1); CHECK(g[0].count == 2);
   CHECK(e.peek("u", 0, 9)[1].addr == 0x12000);
 }
+TEST_CASE("a region that lost its middle pages keeps the candidates still listed, one read per part") {
+  // reads get all or nothing; the run over four pages fails, then the first and last pages, which
+  // are still listed, are read with one call each
+  FakeMemory m; m.set_all_or_nothing(true); m.add_region(0x10000, 4 * 4096);
+  for (int i = 0; i < 4; i++) m.poke<int32_t>(0x10040 + i * 4096, 100);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  m.remove_region(0x10000); m.add_region(0x10000, 4096); m.add_region(0x13000, 4096);
+  m.poke<int32_t>(0x10040, 100); m.poke<int32_t>(0x13040, 100);
+  m.read_calls = 0;
+  CHECK(e.narrow({{"a", eq(100)}}, true, g, s)); CHECK(g[0].count == 2); CHECK(s.lost == 2);
+  CHECK(s.bytes == (4096 - 0x40) + 0x44); CHECK(m.read_calls == 3);
+  auto p = e.peek("a", 0, 9); REQUIRE(p.size() == 2); CHECK(p[1].addr == 0x13040);
+}
 TEST_CASE("the game closing in the middle of a narrow changes nothing") {
   DyingMemory m; three(m); m.add_region(0x50000, 4096); m.poke<int32_t>(0x50000, 100);
   Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
@@ -225,6 +256,17 @@ TEST_CASE("peek reports a closed game") {
   m.set_alive(false);
   CHECK_THROWS_WITH_AS(e.peek("a", 0, 9), doctest::Contains("target_gone"), EngineError);
   CHECK_THROWS_WITH_AS(e.peek("nope", 0, 9), doctest::Contains("no_such_group"), EngineError);
+}
+TEST_CASE("peek_from pages, and fails as peek does") {
+  FakeMemory m; three(m); Engine e(m, {.budget_bytes = 1000}); ScanStats s;
+  auto sc = e.scan({G("a", I32, 4, 0, eq(100)), G("z", U8, 1, 0, eq(0))}, false, s);   // z's values do not fit
+  REQUIRE(sc[0].tracked); REQUIRE_FALSE(sc[1].tracked);
+  auto p = e.peek_from("a", 0x10000, 2); REQUIRE(p.size() == 2); CHECK(p[1].addr == 0x10010);
+  CHECK(e.peek_from("a", 0x10011, 1)[0].addr == 0x10020);
+  CHECK(e.peek_from("a", 0x10000, 0).empty()); CHECK(e.peek_from("z", 0x10000, 9).empty());   // untracked
+  CHECK_THROWS_WITH_AS(e.peek_from("nope", 0x10000, 9), doctest::Contains("no_such_group"), EngineError);
+  m.set_alive(false);
+  CHECK_THROWS_WITH_AS(e.peek_from("a", 0x10000, 9), doctest::Contains("target_gone"), EngineError);
 }
 TEST_CASE("drop refuses an unknown id and then removes nothing") {
   FakeMemory m; three(m); Engine e(m); ScanStats s;
