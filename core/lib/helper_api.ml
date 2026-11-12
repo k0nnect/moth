@@ -19,6 +19,7 @@ type helper = {
   modules : int -> (string list, err) result;
   attach : int -> (attached, err) result;
   scan : keep:bool -> budget_mb:int option -> group_spec list -> (group_info list * stats, err) result;
+  snapshot : cap_mb:int option -> budget_mb:int option -> (string * string * int) list -> (group_info list * stats, err) result;
   narrow : atomic:bool -> (string * pred) list -> (bool * group_info list * stats, err) result;
   drop : string list -> (unit, err) result;
   peek : id:string -> vtype:string -> offset:int -> limit:int -> (item list, err) result;

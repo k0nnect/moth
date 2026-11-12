@@ -6,6 +6,7 @@ open Helper_api
 
 type call =
   | Scan of { keep : bool; budget_mb : int option; specs : group_spec list }
+  | Snapshot of { cap_mb : int option; budget_mb : int option; groups : (string * string * int) list }
   | Narrow of { atomic : bool; items : (string * pred) list }
   | Drop of string list
   | Peek of { id : string; vtype : string; offset : int; limit : int }
@@ -16,6 +17,7 @@ type call =
 type script = {
   mutable calls : call list; (* newest first *)
   scans : (group_info list * stats, err) result Queue.t;
+  snapshots : (group_info list * stats, err) result Queue.t;
   narrows : (bool * group_info list * stats, err) result Queue.t;
   drops : (unit, err) result Queue.t;
   peeks : (string, (item list, err) result Queue.t) Hashtbl.t; (* by group; "" answers any group *)
@@ -46,7 +48,7 @@ let unscripted op = failwith (Printf.sprintf "fake helper: %s is not scripted" o
 
 let create () =
   let f =
-    { calls = []; scans = Queue.create (); narrows = Queue.create (); drops = Queue.create (); peeks = Hashtbl.create 8; peek_froms = Hashtbl.create 8; reads = Queue.create (); writes = Queue.create () }
+    { calls = []; scans = Queue.create (); snapshots = Queue.create (); narrows = Queue.create (); drops = Queue.create (); peeks = Hashtbl.create 8; peek_froms = Hashtbl.create 8; reads = Queue.create (); writes = Queue.create () }
   in
   let record c = f.calls <- c :: f.calls in
   let helper =
@@ -58,6 +60,10 @@ let create () =
         (fun ~keep ~budget_mb specs ->
           record (Scan { keep; budget_mb; specs });
           next "scan" f.scans);
+      snapshot =
+        (fun ~cap_mb ~budget_mb groups ->
+          record (Snapshot { cap_mb; budget_mb; groups });
+          next "snapshot" f.snapshots);
       narrow =
         (fun ~atomic items ->
           record (Narrow { atomic; items });
@@ -90,6 +96,7 @@ let create () =
   (helper, f)
 
 let queue_scan ?(stats = zero_stats) f infos = Queue.push (Ok (infos, stats)) f.scans
+let queue_snapshot ?(stats = zero_stats) f infos = Queue.push (Ok (infos, stats)) f.snapshots
 let queue_narrow ?(stats = zero_stats) f ~applied infos = Queue.push (Ok (applied, infos, stats)) f.narrows
 let queue_peek f id items = Queue.push (Ok items) (peek_queue f id)
 let queue_peek_from f id items = Queue.push (Ok items) (peek_from_queue f id)
@@ -99,6 +106,7 @@ let queue_write ?(prev_bits = 0L) f ~prev = Queue.push (Ok { prev; prev_bits }) 
 let queue_error f op (e : err) =
   match op with
   | "scan" -> Queue.push (Error e) f.scans
+  | "snapshot" -> Queue.push (Error e) f.snapshots
   | "narrow" -> Queue.push (Error e) f.narrows
   | "drop" -> Queue.push (Error e) f.drops
   | "peek" -> Queue.push (Error e) (peek_queue f "")
@@ -118,6 +126,10 @@ let last_scan_ids f = List.map (fun (s : group_spec) -> s.id) (snd (last_scan f)
 let last_scan_budget = newest "scan" (function Scan s -> Some s.budget_mb | _ -> None)
 let last_scan_keep f = fst (last_scan f)
 let last_scan_spec f id = List.find (fun (s : group_spec) -> s.id = id) (snd (last_scan f))
+let last_snapshot = newest "snapshot" (function Snapshot s -> Some (s.cap_mb, s.budget_mb, s.groups) | _ -> None)
+let last_snapshot_groups f = let _, _, g = last_snapshot f in g
+let last_snapshot_cap f = let c, _, _ = last_snapshot f in c
+let last_snapshot_budget f = let _, b, _ = last_snapshot f in b
 let last_narrow = newest "narrow" (function Narrow n -> Some (n.atomic, n.items) | _ -> None)
 let last_narrow_atomic f = fst (last_narrow f)
 let last_narrow_ids f = List.map fst (snd (last_narrow f))
@@ -129,6 +141,7 @@ let last_narrow_pred f id =
 
 let count pick f = List.length (List.filter pick f.calls)
 let scan_calls = count (function Scan _ -> true | _ -> false)
+let snapshot_calls = count (function Snapshot _ -> true | _ -> false)
 let narrow_calls = count (function Narrow _ -> true | _ -> false)
 let write_calls = count (function Write _ -> true | _ -> false)
 let dropped f = List.concat_map (function Drop ids -> ids | _ -> []) (calls f)

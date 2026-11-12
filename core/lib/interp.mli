@@ -5,6 +5,10 @@ type t = { id : string; vtype : string; align : int; exclude_align : int; tier :
 (** priority order; also the order sent to the helper *)
 val plan : Value.t -> t list
 
+(** what a snapshot hunt carries, in priority order: the interpretations of [plan] that need no
+    number, each the same value [plan] gives for its id (no scaled, percent or unaligned ones) *)
+val blind_plan : t list
+
 (** [None] when the number can't be held: too big, a decimal for a whole number, or more decimal
     places than a scaled form keeps (99.25 in tenths) *)
 val pred_for : t -> Value.t -> Helper_api.pred option

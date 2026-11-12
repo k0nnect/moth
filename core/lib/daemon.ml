@@ -103,6 +103,7 @@ let watch st (h : Helper_api.helper) : Helper_api.helper =
     modules = (fun pid -> see (h.modules pid));
     attach = (fun pid -> see (h.attach pid));
     scan = (fun ~keep ~budget_mb specs -> see (h.scan ~keep ~budget_mb specs));
+    snapshot = (fun ~cap_mb ~budget_mb groups -> see (h.snapshot ~cap_mb ~budget_mb groups));
     narrow = (fun ~atomic items -> see (h.narrow ~atomic items));
     drop = (fun ids -> see (h.drop ids));
     peek = (fun ~id ~vtype ~offset ~limit -> see (h.peek ~id ~vtype ~offset ~limit));

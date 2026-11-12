@@ -116,6 +116,13 @@ let make c =
           ([ ("groups", `List (List.map Wire.group_spec_to_json specs)); ("keep", `Bool keep) ]
           @ match budget_mb with Some n -> [ ("budget_mb", `Int n) ] | None -> [])
           (fun r -> (Wire.group_infos (field "groups" r), Wire.stats (field "stats" r))));
+    snapshot =
+      (fun ~cap_mb ~budget_mb groups ->
+        let group (id, vtype, align) = `Assoc [ ("id", `String id); ("type", `String vtype); ("align", `Int align) ] in
+        let opt name = function Some n -> [ (name, `Int n) ] | None -> [] in
+        req ~timeout:long "snapshot"
+          ([ ("groups", `List (List.map group groups)) ] @ opt "cap_mb" cap_mb @ opt "budget_mb" budget_mb)
+          (fun r -> (Wire.group_infos (field "groups" r), Wire.stats (field "stats" r))));
     narrow =
       (fun ~atomic items ->
         let groups = List.map (fun (id, pred) -> `Assoc [ ("id", `String id); ("pred", Wire.pred_to_json pred) ]) items in

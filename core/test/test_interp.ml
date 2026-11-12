@@ -138,6 +138,18 @@ let holds () =
   b "no pred" (not (Interp.holds (interp "i32" "15") (v "15.5") (Vint 15L)));
   b "cents" (Interp.holds (interp "i32x100" "5.32") (v "5.32") (Vint 532L))
 
+let blind_plan () =
+  let ids = List.map (fun (i : Interp.t) -> (i.id, i.vtype, i.align, i.tier = Interp.Main)) Interp.blind_plan in
+  Alcotest.(check bool) "plan" true
+    (ids = [ ("i32", "i32", 4, true); ("f32", "f32", 4, true); ("i16", "i16", 2, true); ("i64", "i64", 8, true); ("f64", "f64", 8, true); ("u8", "u8", 1, false) ]);
+  check_str "tags as in a number hunt" "whole number (2-byte)" (Interp.describe (List.nth Interp.blind_plan 2));
+  (* a number typed later narrows each of them *)
+  Alcotest.(check bool) "i32 takes 97" true (Interp.pred_for (List.hd Interp.blind_plan) (v "97") = Some (Eq 97L));
+  (* each equals what a number hunt gives for the same id *)
+  List.iter
+    (fun (b : Interp.t) -> Alcotest.(check bool) ("as in plan: " ^ b.id) true (b = interp b.id "97"))
+    Interp.blind_plan
+
 let () =
   Alcotest.run "interp"
     [
@@ -149,5 +161,6 @@ let () =
           Alcotest.test_case "eight-byte scaled" `Quick eight_byte_scaled;
           Alcotest.test_case "floor on float readings" `Quick floor_on_float_readings;
           Alcotest.test_case "holds" `Quick holds;
+          Alcotest.test_case "blind plan" `Quick blind_plan;
         ] );
     ]

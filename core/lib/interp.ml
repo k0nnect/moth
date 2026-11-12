@@ -48,6 +48,9 @@ let eps_of = function Value.Int _ -> 1. | Value.Dec d -> 10. ** float_of_int (-d
 
 let mk id vtype align exclude_align tier encoding = { id; vtype; align; exclude_align; tier; encoding }
 
+let blind_plan =
+  [ mk "i32" "i32" 4 0 Main Plain; mk "f32" "f32" 4 0 Main Plain; mk "i16" "i16" 2 0 Main Plain; mk "i64" "i64" 8 0 Main Plain; mk "f64" "f64" 8 0 Main Plain; mk "u8" "u8" 1 0 Wide Plain ]
+
 let plan (v : Value.t) =
   match v with
   | Value.Int n ->

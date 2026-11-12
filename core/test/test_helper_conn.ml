@@ -37,6 +37,10 @@ let serve ?(on_ps = `Answer) (ic, oc) =
             | `Lose -> raise Exit
             | `Error_wrong_id -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"x"}}|} (id + 5)))
         | "scan" -> send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"not_attached","message":"attach first"}}|} id)
+        | "snapshot" when (match j with `Assoc l -> List.mem_assoc "cap_mb" l | _ -> false) ->
+            send oc (Printf.sprintf {|{"id":%d,"ok":true,"groups":[{"id":"i32","count":5,"tracked":true,"has_values":false}],"stats":{"regions":2,"bytes":4096,"unreadable_bytes":0,"lost":0,"ms":1.5}}|} id)
+        | "snapshot" ->
+            send oc (Printf.sprintf {|{"id":%d,"ok":false,"error":{"code":"too_big","message":"9000000000 to snapshot, limit 8589934592"}}|} id)
         | "peek" when field "group" j = `String "h" ->
             send oc (Printf.sprintf {|{"id":%d,"ok":true,"items":[{"addr":"0x10","v":null},{"addr":"0x14","v":"7"}]}|} id)
         | "peek" when field "group" j = `String "f" ->
@@ -79,6 +83,24 @@ let scan_budget_and_peek_from () =
     (match sent () with
     | `Assoc l -> List.assoc_opt "from" l = Some (`String "0x6c551000") && not (List.mem_assoc "offset" l)
     | _ -> false);
+  h.close ()
+
+let snapshot_request () =
+  let h = ok (start ()) in
+  let r = h.snapshot ~cap_mb:(Some 8192) ~budget_mb:None [ ("i32", "i32", 4) ] in
+  check_bool "request" true
+    (match Yojson.Safe.from_string !last_request with
+    | `Assoc l ->
+        List.filter (fun (k, _) -> k <> "id") l
+        = [ ("op", `String "snapshot"); ("groups", `List [ `Assoc [ ("id", `String "i32"); ("type", `String "i32"); ("align", `Int 4) ] ]); ("cap_mb", `Int 8192) ]
+    | _ -> false);
+  check_bool "reply" true
+    (r = Ok ([ { id = "i32"; count = 5; tracked = true; has_values = false } ], { regions = 2; bytes = 4096; unreadable_bytes = 0; lost = 0; ms = 1.5 }));
+  let r = h.snapshot ~cap_mb:None ~budget_mb:(Some 64) [ ("i32", "i32", 4) ] in
+  check_bool "budget only" true
+    (match Yojson.Safe.from_string !last_request with `Assoc l -> List.mem_assoc "budget_mb" l && not (List.mem_assoc "cap_mb" l) | _ -> false);
+  check_bool "too_big comes back unchanged" true
+    (r = Error { code = "too_big"; message = "9000000000 to snapshot, limit 8589934592" });
   h.close ()
 
 (* the core always asks for holes, and a position that can't be read comes back as None *)
@@ -184,6 +206,7 @@ let () =
           Alcotest.test_case "requests" `Quick basics;
           Alcotest.test_case "scan budget, peek from" `Quick scan_budget_and_peek_from;
           Alcotest.test_case "peek asks for holes" `Quick peek_asks_for_holes;
+          Alcotest.test_case "snapshot request and reply" `Quick snapshot_request;
           Alcotest.test_case "values by type, writes by value or bytes" `Quick typed_values;
           Alcotest.test_case "wrong token" `Quick wrong_token;
           Alcotest.test_case "never connects" `Quick never_connects;
