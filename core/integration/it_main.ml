@@ -278,7 +278,14 @@ let fallback () =
       let o = next "77" in
       check (List.mem "fell_back_down" (notes o)) "next 77 did not fall back to went down: %s" (show o);
       let v = Target_ctl.var t "health_copy" and rows = results () in
-      check (List.exists (fun r -> r.addr = v.addr) rows) "no result at health_copy's address 0x%Lx. results: %s" v.addr (show_rows rows))
+      check (List.exists (fun r -> r.addr = v.addr) rows) "no result at health_copy's address 0x%Lx. results: %s" v.addr (show_rows rows);
+      (* 77 was a slip for the 80 the game shows. Set again and typed, 80 still finds health, a
+         decimal whose stored value is already 80: after a fallback it need not have moved *)
+      Target_ctl.set t "health" "80";
+      ignore (next "80");
+      let rows = results () in
+      ignore (need_row rows (Target_ctl.var t "health") "decimal");
+      ignore (need_row rows v "whole number"))
 
 (* the counts and groups a find, a next or status reports, to compare two of them *)
 let counts o = (to_int (member "main" o), to_int (member "wide" o), to_list (member "groups" o))
