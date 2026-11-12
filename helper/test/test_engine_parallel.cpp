@@ -40,6 +40,97 @@ TEST_CASE("worker count does not change results") {
   Engine e0(m, {.workers = 0}); CHECK(e0.workers_used() >= 1); CHECK(e0.workers_used() <= 8);
 }
 
+namespace {
+
+// Each group's items as (address, value) pairs, in order.
+std::vector<std::vector<std::pair<uint64_t, uint64_t>>> rows(const std::vector<std::vector<Item>>& groups) {
+  std::vector<std::vector<std::pair<uint64_t, uint64_t>>> out;
+  for (const auto& items : groups) {
+    out.emplace_back();
+    for (const Item& it : items) out.back().emplace_back(it.addr, it.bits);
+  }
+  return out;
+}
+
+constexpr uint64_t kMixed[3][2] = {{0x10000000, 24u << 20}, {0x12000000, 16u << 20}, {0x14000000, 24u << 20}};
+
+// 64 MiB in three regions, read all or nothing: random bytes; in the middle quarter of each region,
+// small whole numbers (0 to 7 at every 4-byte place), which are all f32 near 0; and every 3 MiB a
+// 96 KiB stretch of 0xff, which no group below matches, so runs also end inside 1 MiB blocks.
+void mixed(FakeMemory& m) {
+  m.set_all_or_nothing(true);
+  std::vector<int32_t> small(1u << 18);
+  const std::vector<uint8_t> ff(96u << 10, 0xff);
+  for (int r = 0; r < 3; r++) {
+    const auto [base, size] = std::pair{kMixed[r][0], kMixed[r][1]};
+    m.add_region(base, size); fill_xorshift(m, base, size, 0x6d6f7468 + r);
+    for (uint64_t at = base + size / 8 * 3; at < base + size / 8 * 5; at += small.size() * 4) {
+      for (size_t i = 0; i < small.size(); i++) small[i] = static_cast<int32_t>(((at + i * 4) * 2654435761u >> 29) & 7);
+      REQUIRE(m.write(at, small.data(), small.size() * 4));
+    }
+    for (uint64_t at = base + 0x48000; at + ff.size() <= base + size; at += 3u << 20) REQUIRE(m.write(at, ff.data(), ff.size()));
+  }
+}
+
+// Writes v every stride bytes from skip into each region, the middle one only if middle.
+void spread(FakeMemory& m, uint64_t stride, uint64_t skip, int32_t v, bool middle) {
+  for (int r = 0; r < 3; r++)
+    for (uint64_t at = kMixed[r][0] + skip; (middle || r != 1) && at + 4 <= kMixed[r][0] + kMixed[r][1]; at += stride)
+      m.poke<int32_t>(at, v);
+}
+
+struct Step {
+  std::vector<std::tuple<std::string, uint64_t, bool, bool>> infos;
+  uint64_t lost = 0, storage = 0;
+  std::vector<std::vector<std::pair<uint64_t, uint64_t>>> rows;
+  unsigned threads = 0;
+};
+
+}  // namespace
+
+TEST_CASE("a narrow leaves the same groups, values and losses on any worker count") {
+  const Pred tiny = range(-1e-30, 1e-30);
+  const std::vector<GroupSpec> gs = {G("i", I32, 4, 0, eq(3)), G("f", F32, 4, 0, tiny), G("b", U8, 1, 0, eq(0x5a))};
+  auto step = [&](Engine& e, const std::vector<NarrowItem>& items) {
+    Step st; ScanStats s; std::vector<GroupInfo> g;
+    CHECK(e.narrow(items, true, g, s));
+    for (const GroupInfo& i : g) st.infos.emplace_back(i.id, i.count, i.tracked, i.has_values);
+    st.lost = s.lost; st.storage = e.storage_bytes(); st.threads = e.narrow_threads_used();
+    std::vector<std::vector<Item>> items_now;
+    for (const GroupSpec& sp : gs) items_now.push_back(e.peek(sp.id, 0, 1u << 30));
+    st.rows = rows(items_now);
+    return st;
+  };
+  auto run = [&](unsigned w) {
+    FakeMemory m; mixed(m);
+    Engine e(m, {.value_cap = 2'000'000, .block_size = 1u << 20, .workers = w}); ScanStats s;
+    const auto sc = e.scan(gs, false, s);
+    REQUIRE(sc[1].count > 4'000'000); REQUIRE(sc[1].tracked); REQUIRE_FALSE(sc[1].has_values);
+    REQUIRE(sc[0].has_values); REQUIRE(sc[2].has_values);                // two groups with values beside one without
+    spread(m, 8191 * 4, 0, 5, true); spread(m, 4093 * 4, 2, 0x3f000000, true);   // 5, and bytes off the 4-byte places
+    m.remove_region(kMixed[1][0]);                                      // the middle region is freed
+    m.free_page(kMixed[0][0] + (9u << 20) + 0x3000);                    // and one page of a run that is read in parts
+    Pred moved = range(-10, 10); moved.moved = true;
+    std::vector<Step> steps{step(e, {{"i", moved}, {"f", tiny}, {"b", {Pred::EqPrev}}})};
+    spread(m, 8191 * 4, 0, 4, false);                                   // down from the 5 just stored
+    steps.push_back(step(e, {{"b", {Pred::EqPrev}}, {"i", {Pred::LtPrev}}, {"f", eq(0)}}));   // f gains values
+    return steps;
+  };
+  const std::vector<Step> one = run(1);
+  REQUIRE(one.size() == 2);
+  CHECK(one[0].lost > 0); CHECK(one[0].threads == 1); CHECK(std::get<3>(one[1].infos[2]));
+  for (const Step& st : one) for (const auto& r : st.rows) CHECK(!r.empty());
+  for (unsigned w : {2u, 4u, 8u}) {
+    const std::vector<Step> other = run(w);
+    for (size_t i = 0; i < one.size(); i++) {
+      CHECK(other[i].infos == one[i].infos); CHECK(other[i].lost == one[i].lost);
+      CHECK(other[i].storage == one[i].storage); CHECK(other[i].rows == one[i].rows);
+      CHECK(other[i].threads <= w);
+    }
+    if (w == 4) CHECK(other[0].threads > 1);
+  }
+}
+
 // Beyond the brief: the budget, bounded memory, merged narrow reads, and the reading thread.
 
 namespace {
@@ -139,6 +230,37 @@ TEST_CASE("candidates of every listed group count toward the run gap") {
   CHECK(m.read_calls == 1); CHECK(s.bytes == (96u << 10) + 4);
   REQUIRE(g.size() == 2); CHECK(g[0].id == "b"); CHECK(g[0].count == 1); CHECK(g[1].count == 2);
 }
+TEST_CASE("a run ends inside a bitmap word, and each run's positions compare with their own values") {
+  // i32 places every 32 KiB of 2 MiB, each holding its number, held as a bitmap of 64 bits; places
+  // 10 to 12 are out of range, so 9 and 13 are 128 KiB apart and the narrow reads two runs. Every
+  // value then goes down by one but place 40's, which goes up.
+  FakeMemory m; m.add_region(0x100000, 2u << 20);
+  auto place = [](uint64_t i) { return 0x100000 + i * 32768; };
+  for (unsigned w : {1u, 4u}) {
+    for (uint64_t i = 0; i < 64; i++) m.poke<int32_t>(place(i), i >= 10 && i <= 12 ? 1000 : static_cast<int32_t>(i));
+    Engine e(m, {.workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    REQUIRE(e.scan({G("a", I32, 32768, 0, range(-10, 100))}, false, s)[0].count == 61);
+    for (uint64_t i = 0; i < 64; i++) m.poke<int32_t>(place(i), m.peek<int32_t>(place(i)) + (i == 40 ? 1 : -1));
+    m.read_calls = 0;
+    CHECK(e.narrow({{"a", {Pred::LtPrev}}}, true, g, s)); CHECK(g[0].count == 60);
+    CHECK(m.read_calls == 2); CHECK(s.bytes == (9u * 32768 + 4) + (50u * 32768 + 4));
+    auto p = e.peek("a", 36, 2); REQUIRE(p.size() == 2); CHECK(p[0].addr == place(39)); CHECK(p[1].addr == place(41));
+  }
+}
+TEST_CASE("each run of a list block compares its positions with their own values") {
+  // 10, 20, 30, 40 at 128 KiB steps of one block: four runs; all go down by one but the third
+  FakeMemory m; m.add_region(0x100000, 1u << 20);
+  auto place = [](uint64_t i) { return 0x100000 + i * (128u << 10); };
+  for (unsigned w : {1u, 4u}) {
+    for (int i = 0; i < 4; i++) m.poke<int32_t>(place(i), 10 * (i + 1));
+    Engine e(m, {.workers = w}); ScanStats s; std::vector<GroupInfo> g;
+    REQUIRE(e.scan({G("a", I32, 4, 0, range(5, 45))}, false, s)[0].count == 4);
+    for (int i = 0; i < 4; i++) m.poke<int32_t>(place(i), 10 * (i + 1) + (i == 2 ? 1 : -1));
+    m.read_calls = 0;
+    CHECK(e.narrow({{"a", {Pred::LtPrev}}}, true, g, s)); CHECK(m.read_calls == 4); CHECK(g[0].count == 3);
+    auto p = e.peek("a", 0, 9); REQUIRE(p.size() == 3); CHECK(p[2].addr == place(3));
+  }
+}
 TEST_CASE("groups whose blocks do not line up narrow correctly together") {
   // a is scanned in 4 KiB blocks from 0x10000; the region is then remapped from 0xf800, so b's
   // blocks start 2 KiB earlier. Both hold 0x10000 and 0x11800.
@@ -169,4 +291,19 @@ TEST_CASE("a read that throws stops the workers and leaves the engine usable") {
   CHECK_THROWS_AS(e.scan({G("z", U8, 1, 0, eq(0))}, false, s), std::runtime_error);
   m.reads_left = 1 << 30;
   CHECK(e.scan({G("z", U8, 1, 0, eq(0))}, false, s)[0].count == (16u << 20));
+}
+TEST_CASE("a narrow on several workers that is refused, or whose read throws, changes nothing") {
+  ThrowingMemory m; m.add_region(0x10000000, 16u << 20);              // zeros: every place matches
+  Engine e(m, {.block_size = 1u << 20, .workers = 4}); ScanStats s; std::vector<GroupInfo> g;
+  e.scan({G("i", I32, 4, 0, eq(0)), G("b", U8, 1, 0, eq(0))}, false, s);
+  const uint64_t storage = e.storage_bytes();
+  auto unchanged = [&] {
+    REQUIRE(e.groups().size() == 2); CHECK(e.groups()[0].count == (4u << 20)); CHECK(e.groups()[1].count == (16u << 20));
+    CHECK(e.groups()[0].has_values); CHECK(e.groups()[1].has_values); CHECK(e.storage_bytes() == storage);
+  };
+  CHECK_FALSE(e.narrow({{"i", eq(1)}, {"b", eq(1)}}, true, g, s)); CHECK(s.lost == 0); unchanged();
+  m.reads_left = 5;                                                   // a read part way through throws
+  CHECK_THROWS_AS(e.narrow({{"i", {Pred::EqPrev}}, {"b", eq(1)}}, false, g, s), std::runtime_error); unchanged();
+  m.reads_left = 1 << 30; m.poke<int32_t>(0x10000000 + 0x123450, 9);
+  CHECK(e.narrow({{"i", {Pred::EqPrev}}}, true, g, s)); CHECK(g[0].count == (4u << 20) - 1);
 }

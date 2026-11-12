@@ -38,7 +38,8 @@ struct EngineConfig {
   uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed (see Engine::scan and Engine::narrow)
   uint64_t value_cap = 64'000'000;        // a group keeps values only while it has at most this many positions
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
-  unsigned workers = 1;                   // threads searching a scan's blocks; 0: hardware threads - 1, from 1 to 8
+  unsigned workers = 1;                   // threads searching a scan's blocks and comparing a narrow's runs;
+                                          // 0: hardware threads - 1, from 1 to 8
 };
 
 struct Item {
@@ -91,7 +92,11 @@ class Engine {
   // listed groups in request order, as they stand afterwards.
   // Positions are read in runs shared by the listed groups (see engine.cpp), so groups from one
   // scan read the memory they share once; a position whose memory can no longer be read is
-  // dropped and counted in stats.lost, which stays 0 when nothing changes. After an applied narrow
+  // dropped and counted in stats.lost, which stays 0 when nothing changes. Runs are read on the
+  // calling thread in address order, compared on workers_used() threads, and added to the groups
+  // in address order, so the result is the same for any worker count. A worker holds one run's
+  // bytes at a time, and only a few more runs than workers are held at once, as a scan holds its
+  // blocks. After an applied narrow
   // a group with at most value_cap positions stores the values just read, unless values it did not
   // have before would take storage over budget_bytes.
   // Throws EngineError, with nothing changed: no_such_group (an unknown id, or an untracked
@@ -129,6 +134,8 @@ class Engine {
   // over it. The memory really held can be higher, by the value buffers' room to grow, and while
   // a block is being added by that block's matches.
   uint64_t peak_walk_bytes() const { return peak_walk_bytes_; }
+  // The most threads that were comparing runs at once during the last narrow; 0 if it threw.
+  unsigned narrow_threads_used() const { return narrow_threads_used_; }
 
  private:
   // Values in position order, each in as many bytes as its type is wide, packed one after
@@ -141,13 +148,15 @@ class Engine {
     uint64_t get(uint64_t i) const;       // value i in the low bytes, the rest 0
     void set(uint64_t i, uint64_t bits);  // stores bits' low bytes as value i
     void append(const uint8_t* p);        // appends the value whose bytes start at p
+    void append(const uint8_t* p, uint64_t n);  // appends n values packed the same way from p
     void clear();                         // removes every value and frees their memory
     void shrink_to_fit();                 // gives back the room beyond the values
     uint64_t bytes() const { return bytes_.capacity(); }  // heap held, room to grow included
     uint64_t used_bytes() const { return used_; }         // what the values themselves take
+    const uint8_t* data() const { return bytes_.data(); }  // value i starts i * width bytes in
 
    private:
-    void grow();  // doubles the room
+    void grow(size_t need);  // doubles the room, or more if that is less than need bytes past the values
 
     size_t width_;
     size_t used_ = 0;              // the values are bytes_[0, used_); the rest is room to append
@@ -180,6 +189,7 @@ class Engine {
   unsigned workers_;
   uint64_t peak_raw_offsets_ = 0;
   uint64_t peak_walk_bytes_ = 0;
+  unsigned narrow_threads_used_ = 0;
   std::vector<Group> groups_;
 };
 
