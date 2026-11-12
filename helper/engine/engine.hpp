@@ -14,7 +14,8 @@
 namespace moth {
 
 // tracked: the group's positions are stored (otherwise only its count is).
-// has_values: its last-seen values are stored too, which happens only while count <= value_cap.
+// has_values: its last-seen values are stored too, which happens only while count <= value_cap
+// and the budget has room for them (see Engine::scan and Engine::narrow).
 struct GroupInfo {
   std::string id;
   uint64_t count;
@@ -34,7 +35,7 @@ struct ScanStats {
 };
 
 struct EngineConfig {
-  uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed once a scan ends
+  uint64_t budget_bytes = 1536ull << 20;  // candidate storage allowed; values give way first (see Engine::scan)
   uint64_t value_cap = 64'000'000;        // a group keeps values only while it has at most this many positions
   size_t block_size = 16u << 20;          // bytes searched per read; at most 1 GiB
   unsigned workers = 1;                   // threads searching a scan's blocks; 0: hardware threads - 1, from 1 to 8
@@ -59,8 +60,11 @@ class Engine {
   // address order, searched on workers_used() threads, and added to the groups in address order,
   // so the result is the same for any worker count. keep=false replaces all groups; keep=true
   // replaces only groups with a listed id, and the listed groups then follow the others in
-  // groups(). Returns the listed groups in request order. If the storage is then over
-  // budget_bytes, listed groups are untracked from the last one backwards until it fits.
+  // groups(). Returns the listed groups in request order.
+  // Storage is held within budget_bytes during the walk (after each block) and at its end (after
+  // each listed group's values are shrunk to what they hold): while it is over, the listed groups'
+  // values are dropped from the last group backwards, each group staying tracked without values;
+  // only if it is still over are listed groups untracked from the last one backwards.
   // Throws EngineError: bad_request (a previous-value predicate or a moved range, align 0, an id
   // listed twice), nothing changed; target_gone (the process is not alive), and the replaced
   // groups are gone.
@@ -114,6 +118,11 @@ class Engine {
   // workers had room for at once. A worker compacts each 256 KiB slice of a block before the
   // next, so this stays within one slice's worth per worker.
   uint64_t peak_raw_offsets() const { return peak_raw_offsets_; }
+  // The most bytes the last scan's listed groups held, positions and values, after any block of
+  // its walk was added and the storage held within the budget. With the groups kept from before,
+  // that is within budget_bytes unless those alone are over it. While a block is being added it
+  // can be higher, by that block's matches and by a value buffer doubling its room.
+  uint64_t peak_walk_bytes() const { return peak_walk_bytes_; }
 
  private:
   // Values in position order, each in as many bytes as its type is wide, packed one after
@@ -151,10 +160,11 @@ class Engine {
   static GroupInfo info(const Group& g);
   static uint64_t bytes_of(const Group& g);
   static void untrack(Group& g);
+  static void forget_values(Group& g);
   size_t index_of(const std::string& id) const;
   const Group& find(const std::string& id) const;
   void add_found(Group& g, PositionSet::Block b, const uint8_t* data);
-  void fit_budget(std::vector<Group>& fresh, uint64_t kept, bool with_values);
+  void fit_budget(std::vector<Group>& fresh, uint64_t kept);
   std::vector<Group> narrowed(const std::vector<size_t>& at, const std::vector<NarrowItem>& items, ScanStats& stats);
   void fit_gained_values(std::vector<Group>& fresh, const std::vector<size_t>& at);
 
@@ -162,6 +172,7 @@ class Engine {
   EngineConfig cfg_;
   unsigned workers_;
   uint64_t peak_raw_offsets_ = 0;
+  uint64_t peak_walk_bytes_ = 0;
   std::vector<Group> groups_;
 };
 

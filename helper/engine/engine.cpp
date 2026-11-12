@@ -413,6 +413,7 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
   Listing listing(mem_);  // the readable regions, listed once if a read fails during the walk
 
   peak_raw_offsets_ = 0;
+  peak_walk_bytes_ = 0;
   Searchers searchers(specs, workers_, cfg_.block_size + kOverlap);
   // Adds the oldest searched block's matches to the groups, in address order whatever the
   // worker count. Returns false when no block is out, or wait is false and it is not searched yet.
@@ -420,9 +421,14 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
     Job* j = searchers.take(wait);
     if (j == nullptr) return false;
     for (size_t i = 0; i < fresh.size(); i++) add_found(fresh[i], std::move(j->found[i]), j->data.data());
-    // Positions alone never shrink, so untracking on them now matches what the final check
-    // would decide, and keeps memory near the budget during the walk instead of after it.
-    fit_budget(fresh, kept, false);
+    // Holding the storage within the budget after every block keeps memory near it during the
+    // walk instead of only after it. Positions and values only grow while they are held, so what
+    // goes here would go at the end too, except when a group later passes value_cap and frees its
+    // own values, or when the room a value buffer keeps to grow into is what passes the budget.
+    fit_budget(fresh, kept);
+    uint64_t held = 0;
+    for (const Group& g : fresh) held += bytes_of(g);
+    peak_walk_bytes_ = std::max(peak_walk_bytes_, held);
     searchers.release(j);
     return true;
   };
@@ -453,7 +459,8 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
   }
   peak_raw_offsets_ = searchers.finish();
   if (!mem_.alive()) throw EngineError("target_gone", "the game has closed");
-  fit_budget(fresh, kept, true);
+  for (Group& g : fresh) g.values.shrink_to_fit();  // the room to grow into is no longer needed
+  fit_budget(fresh, kept);
 
   std::vector<GroupInfo> out;
   out.reserve(fresh.size());
@@ -470,23 +477,25 @@ std::vector<GroupInfo> Engine::scan(const std::vector<GroupSpec>& specs, bool ke
 void Engine::add_found(Group& g, PositionSet::Block b, const uint8_t* data) {
   g.count += b.count;
   if (!g.tracked) return;
-  if (g.has_values && g.count > cfg_.value_cap) {
-    g.values.clear();
-    g.has_values = false;
-  }
+  if (g.has_values && g.count > cfg_.value_cap) forget_values(g);
   if (g.has_values) g.positions.for_each_in(b, [&](uint32_t o) { g.values.append(data + o); });
   g.positions.append(std::move(b));
 }
 
-// Untracks fresh groups from the last one backwards until kept plus their storage fits the
-// budget. Without values the storage counted is a lower bound of the final one.
-void Engine::fit_budget(std::vector<Group>& fresh, uint64_t kept, bool with_values) {
-  auto size = [&](const Group& g) { return with_values ? bytes_of(g) : g.positions.bytes(); };
+// While kept plus the fresh groups' storage is over the budget: drops the fresh groups' values
+// from the last group backwards, each group staying tracked; then, if that is not enough, untracks
+// fresh groups from the last one backwards.
+void Engine::fit_budget(std::vector<Group>& fresh, uint64_t kept) {
   uint64_t total = kept;
-  for (const Group& g : fresh) total += size(g);
+  for (const Group& g : fresh) total += bytes_of(g);
+  for (size_t i = fresh.size(); i-- > 0 && total > cfg_.budget_bytes;) {
+    if (!fresh[i].has_values) continue;
+    total -= fresh[i].values.bytes();
+    forget_values(fresh[i]);
+  }
   for (size_t i = fresh.size(); i-- > 0 && total > cfg_.budget_bytes;) {
     if (!fresh[i].tracked) continue;
-    total -= size(fresh[i]);
+    total -= bytes_of(fresh[i]);
     untrack(fresh[i]);
   }
 }
@@ -677,8 +686,7 @@ std::vector<Engine::Group> Engine::narrowed(const std::vector<size_t>& at, const
         out.count++;
         if (!out.has_values) return;
         if (out.count > cfg_.value_cap) {
-          out.values.clear();
-          out.has_values = false;
+          forget_values(out);
           return;
         }
         out.values.append(data + x);
@@ -709,8 +717,7 @@ void Engine::fit_gained_values(std::vector<Group>& fresh, const std::vector<size
       total += v;
       continue;
     }
-    fresh[i].values.clear();
-    fresh[i].has_values = false;
+    forget_values(fresh[i]);
   }
 }
 
@@ -761,8 +768,12 @@ uint64_t Engine::bytes_of(const Group& g) { return g.positions.bytes() + g.value
 
 void Engine::untrack(Group& g) {
   g.positions = PositionSet(g.spec.align);
-  g.values.clear();
+  forget_values(g);
   g.tracked = false;
+}
+
+void Engine::forget_values(Group& g) {
+  g.values.clear();
   g.has_values = false;
 }
 

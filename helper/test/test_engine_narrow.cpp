@@ -179,8 +179,8 @@ TEST_CASE("only the listed groups change, and out lists them in request order") 
   CHECK(e.peek("b", 0, 9)[0].addr == 0x10010);
 }
 TEST_CASE("a refused narrow changes nothing") {
-  FakeMemory m; three(m); Engine e(m, {.budget_bytes = 1000}); ScanStats s; std::vector<GroupInfo> g;
-  auto sc = e.scan({G("a", I32, 4, 0, eq(100)), G("z", U8, 1, 0, eq(0))}, false, s);   // z's values do not fit
+  FakeMemory m; three(m); Engine e(m, {.budget_bytes = 500}); ScanStats s; std::vector<GroupInfo> g;
+  auto sc = e.scan({G("a", I32, 4, 0, eq(100)), G("z", U8, 1, 0, eq(0))}, false, s);   // z's positions do not fit
   REQUIRE(sc[0].tracked); REQUIRE_FALSE(sc[1].tracked);
   m.poke<int32_t>(0x10000, 85);
   CHECK_THROWS_WITH_AS(e.narrow({{"a", eq(85)}, {"z", eq(0)}}, true, g, s),          // z is untracked
@@ -319,8 +319,8 @@ TEST_CASE("peek reports a closed game") {
   CHECK_THROWS_WITH_AS(e.peek("nope", 0, 9), doctest::Contains("no_such_group"), EngineError);
 }
 TEST_CASE("peek_from pages, and fails as peek does") {
-  FakeMemory m; three(m); Engine e(m, {.budget_bytes = 1000}); ScanStats s;
-  auto sc = e.scan({G("a", I32, 4, 0, eq(100)), G("z", U8, 1, 0, eq(0))}, false, s);   // z's values do not fit
+  FakeMemory m; three(m); Engine e(m, {.budget_bytes = 500}); ScanStats s;
+  auto sc = e.scan({G("a", I32, 4, 0, eq(100)), G("z", U8, 1, 0, eq(0))}, false, s);   // z's positions do not fit
   REQUIRE(sc[0].tracked); REQUIRE_FALSE(sc[1].tracked);
   auto p = e.peek_from("a", 0x10000, 2); REQUIRE(p.size() == 2); CHECK(p[1].addr == 0x10010);
   CHECK(e.peek_from("a", 0x10011, 1)[0].addr == 0x10020);

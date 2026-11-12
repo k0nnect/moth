@@ -242,14 +242,59 @@ TEST_CASE("stored values count toward the budget") {
   ScanStats s;
   Engine with(m, {.budget_bytes = 4096});                               // values alone take all 4 KiB
   auto g = with.scan({G("a", I32, 4, 0, eq(0))}, false, s);
-  CHECK_FALSE(g[0].tracked); CHECK_FALSE(g[0].has_values); CHECK(g[0].count == 1024);
-  CHECK(with.storage_bytes() == 0); CHECK(with.peek("a", 0, 10).empty());
+  CHECK(g[0].tracked); CHECK_FALSE(g[0].has_values); CHECK(g[0].count == 1024);   // the values go, the positions stay
+  CHECK(with.storage_bytes() > 0); CHECK(with.storage_bytes() <= 4096); CHECK(with.peek("a", 0, 10).size() == 10);
   Engine without(m, {.budget_bytes = 4096, .value_cap = 0});
   CHECK(without.scan({G("a", I32, 4, 0, eq(0))}, false, s)[0].tracked);
 }
+TEST_CASE("an over-budget scan drops values before it untracks a group") {
+  // 64 MiB of i32 values cycling 0..7, so one in eight is 3: 2,097,152 positions, whose 2 MiB
+  // of bitmaps fit 3 MiB and whose 8 MiB of values do not
+  const uint64_t base = 0x10000000; const size_t size = size_t{64} << 20;
+  FakeMemory m; m.add_region(base, size);
+  std::vector<int32_t> chunk(size_t{1} << 18);                          // 1 MiB
+  for (size_t i = 0; i < chunk.size(); i++) chunk[i] = static_cast<int32_t>(i % 8);
+  for (size_t done = 0; done < size; done += size_t{1} << 20) REQUIRE(m.write(base + done, chunk.data(), size_t{1} << 20));
+  Engine e(m, {.budget_bytes = 3u << 20}); ScanStats s;
+  auto g = e.scan({G("a", I32, 4, 0, eq(3))}, false, s);
+  CHECK(g[0].count == 2097152); REQUIRE(g[0].tracked); CHECK_FALSE(g[0].has_values);
+  CHECK(e.storage_bytes() <= (3u << 20)); CHECK(e.peek("a", 0, 1)[0].addr == base + 12);
+}
+TEST_CASE("over budget, values go from the last group backwards and both groups stay tracked") {
+  // 4096 zeros: each group's values take 4 KiB and its positions a few hundred bytes, so 6000
+  // bytes hold both groups' positions and one group's values
+  FakeMemory m; m.add_region(0x10000, 4096); ScanStats s;
+  for (bool swapped : {false, true}) {
+    CAPTURE(swapped);
+    std::vector<GroupSpec> gs = {G("a", I32, 4, 0, eq(0)), G("b", I16, 2, 0, eq(0))};
+    if (swapped) std::swap(gs[0], gs[1]);
+    Engine e(m, {.budget_bytes = 6000});
+    auto g = e.scan(gs, false, s);
+    CHECK(g[0].tracked); CHECK(g[0].has_values); CHECK(g[1].tracked); CHECK_FALSE(g[1].has_values);
+    CHECK(e.storage_bytes() <= 6000);
+  }
+}
+TEST_CASE("a scan keeps its storage within the budget during the walk, values going first") {
+  // 4 MiB of zeros in 64 KiB blocks: an i32 group's positions take about 130 KiB, and its values
+  // would reach 4 MiB by the end of the walk
+  FakeMemory m; m.add_region(0x10000000, 4u << 20);
+  Engine e(m, {.budget_bytes = 1u << 20, .block_size = 64u << 10}); ScanStats s;
+  auto g = e.scan({G("a", I32, 4, 0, eq(0))}, false, s);
+  CHECK(g[0].count == (1u << 20)); CHECK(g[0].tracked); CHECK_FALSE(g[0].has_values);
+  CHECK(e.peak_walk_bytes() <= (1u << 20));
+  CHECK(e.peak_walk_bytes() > e.storage_bytes());                       // values were held for part of the walk
+}
+TEST_CASE("after a scan, values keep no room to grow: each takes its width") {
+  FakeMemory m; m.add_region(0x10000, 4096); for (int i = 0; i < 3; i++) m.poke<int32_t>(0x10000 + i * 16, 100);
+  const std::vector<GroupSpec> gs = {G("b", U8, 1, 0, eq(100)), G("h", I16, 2, 0, eq(100)),
+                                     G("a", I32, 4, 0, eq(100)), G("q", I64, 8, 0, eq(100))};
+  Engine e(m), none(m, {.value_cap = 0}); ScanStats s;
+  e.scan(gs, false, s); none.scan(gs, false, s);
+  CHECK(e.storage_bytes() - none.storage_bytes() == 3 * (1 + 2 + 4 + 8));   // three values in each group
+}
 TEST_CASE("values dropped later in the scan do not untrack a group early") {
-  // block one: 800 zeros, enough values (3200 bytes) to pass the budget; block two takes the
-  // count past value_cap, the values go, and the group fits again
+  // block one: 800 zeros, enough values (3200 bytes) to pass the budget, so the values go and the
+  // group stays tracked; block two takes the count past value_cap
   FakeMemory m; m.add_region(0x10000, 8192);
   for (int i = 800; i < 1024; i++) m.poke<int32_t>(0x10000 + i * 4, 1);
   for (int i = 300; i < 1024; i++) m.poke<int32_t>(0x11000 + i * 4, 1);
