@@ -4,7 +4,8 @@
     the last number typed, the last results listing, the writes that can still be undone and the
     values kept by name. One hunt at a time: a [find] or a [snapshot] replaces the hunt there
     was. Losing the game or the helper ends the hunt and drops the writes and the kept values; a
-    lost group ends only the hunt. *)
+    lost group ends only the hunt. The helper running out of memory part-way through a step, or
+    no longer holding the values a step compares with, leaves the hunt as it was. *)
 
 type t
 type relation = Down | Up | Same | Changed
