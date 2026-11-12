@@ -503,7 +503,7 @@ git add core docs/dev.md && git commit -m "moth: snapshot, and kept shows what t
 | # | name | steps and checks |
 | --- | --- | --- |
 | 25 | a value with no number | `snapshot`; set `stamina` to 50; `next down`; set it to 55; `next up`; `next same`; `results --all -n 200`: `stamina`'s address is listed with tag `decimal`. `set` that row to 99 and the target reports `stamina` 99. |
-| 26 | same first | `snapshot`; `next same` (nothing was changed); set `stamina` to 40; `next down`; `results --all -n 200` lists `stamina`'s address. |
+| 26 | same first | `snapshot`; `next same` (nothing was changed); set `stamina` to 40; `next down`; set it to 45; `next up`; `results --all -n 200` lists `stamina`'s address. |
 | 27 | snapshot speed | target with `--filler-mb 1024`. Print `snapshot: <x> s/GB` and `next same: <y> s/GB` from the helper's own times; both must be under 3.0. |
 | 28 | a snapshot over the limit | daemon started with `MOTH_SNAPSHOT_MB=16`, target with `--filler-mb 64`. `find 3` first; `snapshot` exits 1 with a text starting `the game has` and containing `more than moth's limit of 16 mb`; `status --json` still shows the `find 3` hunt. |
 | 29 | zero and one, fast | target with `--filler-half-mb 64` (about 16.7 million floats of 0.5). `find 1`: the `f32` group counts over 16,000,000 and `has_values` is true. Set `points` to 0; `next 0`: under 3 seconds end to end, the `f32` group counts under 1,000 afterwards (the unchanged halves were dropped because they had not moved), and `results --near <points addr>` has `points`' own address first. |
