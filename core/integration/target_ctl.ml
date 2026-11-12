@@ -86,7 +86,7 @@ let connect_timeout = 180.
 
 (* Launches [exe] with the given filler sizes in MiB (0: none) and waits for its manifest. It
    needs WINE and MOTH_TEST_BOTTLE. [log] gets wine's output. *)
-let start ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) ?(log = "/dev/null") ~exe ~filler_mb () =
+let start ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) ?(filler_half_mb = 0) ?(log = "/dev/null") ~exe ~filler_mb () =
   if not (Sys.file_exists exe) then failwith (exe ^ " not found. run make helper.");
   let listener = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
   Fun.protect
@@ -99,7 +99,8 @@ let start ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) ?(log = "/dev/null") ~exe
       let argv =
         Array.of_list
           ([ env "WINE"; "--bottle"; env "MOTH_TEST_BOTTLE"; "--workdir"; Filename.dirname exe; exe; string_of_int port ]
-          @ filler "--filler-mb" filler_mb @ filler "--filler-small-mb" filler_small_mb @ filler "--filler-tiny-mb" filler_tiny_mb)
+          @ filler "--filler-mb" filler_mb @ filler "--filler-small-mb" filler_small_mb @ filler "--filler-tiny-mb" filler_tiny_mb
+          @ filler "--filler-half-mb" filler_half_mb)
       in
       let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
       let out = Unix.openfile log [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ] 0o644 in

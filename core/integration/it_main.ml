@@ -186,8 +186,8 @@ let target_log () = Filename.concat !home "target.log"
 (* what the latest attach said *)
 let attach_said = ref ""
 
-let with_target ?(name = "moth-target.exe") ?(filler_mb = 0) ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) f =
-  let t = Target_ctl.start ~filler_small_mb ~filler_tiny_mb ~log:(target_log ()) ~exe:(exe name) ~filler_mb () in
+let with_target ?(name = "moth-target.exe") ?(filler_mb = 0) ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) ?(filler_half_mb = 0) f =
+  let t = Target_ctl.start ~filler_small_mb ~filler_tiny_mb ~filler_half_mb ~log:(target_log ()) ~exe:(exe name) ~filler_mb () in
   Fun.protect
     ~finally:(fun () -> Target_ctl.stop t)
     (fun () ->
@@ -561,6 +561,99 @@ let closed_status () =
       let s = moth [ "status" ] in
       check (member "attached" s = `Null && member "closed" s = `String name) "status after %s closed: %s" name (show s))
 
+(* 25: stamina, a decimal whose number is never typed, found by how it moved alone, then written *)
+let no_number () =
+  with_target (fun t ->
+      let stamina = Target_ctl.var t "stamina" in
+      let o = moth [ "snapshot" ] in
+      check (List.mem "snapshot" (notes o)) "snapshot has no snapshot note: %s" (show o);
+      let early = moth_raw [ "results" ] in
+      let said = String.trim early.err and want = "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed." in
+      check (early.code = 1 && said = want) "results before any step gave exit %d and \"%s\", expected exit 1 and \"%s\"" early.code said want;
+      Target_ctl.set t "stamina" "50";
+      ignore (next "down");
+      Target_ctl.set t "stamina" "55";
+      ignore (next "up");
+      ignore (next "same");
+      let r = need_row (page ~all:true ~n:200 ()).rows stamina "decimal" in
+      set_row r "99";
+      expect t "stamina" "99")
+
+(* 26: the first step says nothing moved, which keeps nearly everything; the next one finds it *)
+let same_first () =
+  with_target (fun t ->
+      let stamina = Target_ctl.var t "stamina" in
+      ignore (moth [ "snapshot" ]);
+      ignore (next "same");
+      Target_ctl.set t "stamina" "40";
+      ignore (next "down");
+      let rows = (page ~all:true ~n:200 ()).rows in
+      check (List.exists (fun r -> r.addr = stamina.addr) rows) "stamina (0x%Lx) is not listed. results: %s" stamina.addr (show_rows rows))
+
+(* 27: a snapshot of a 1 GB target and the first step over it, by the helper's own times *)
+let snapshot_speed () =
+  with_target ~filler_mb:1024 (fun _ ->
+      let rate what o =
+        let ms = to_number (member "ms" o) and gb = to_number (member "bytes" o) /. gib in
+        check (gb >= 1.) "%s read only %.3f GB, less than the 1 GB filler" what gb;
+        let s_per_gb = ms /. 1000. /. gb in
+        Printf.printf "%s: %.2f s/GB (%.2f GB in %.0f ms)\n%!" what s_per_gb gb ms;
+        s_per_gb
+      in
+      let snap = rate "snapshot" (moth [ "snapshot" ]) in
+      let same = rate "next same" (next "same") in
+      check (snap < max_s_per_gb) "the snapshot took %.2f s/GB, over the %.1f s/GB bar" snap max_s_per_gb;
+      check (same < max_s_per_gb) "next same took %.2f s/GB, over the %.1f s/GB bar" same max_s_per_gb)
+
+(* 28: a snapshot bigger than MOTH_SNAPSHOT_MB is refused, and the hunt there was goes on *)
+let snapshot_over_limit () =
+  with_daemon_env
+    [ ("MOTH_SNAPSHOT_MB", "16") ]
+    (fun () ->
+      with_target ~filler_mb:64 (fun _ ->
+          let f = find "3" in
+          let r = moth_raw [ "snapshot" ] in
+          let said = String.trim r.err in
+          check
+            (r.code = 1 && String.starts_with ~prefix:"the game has" said && contains said "more than moth's limit of 16 mb")
+            "snapshot gave exit %d and \"%s\", expected exit 1 and the game having more than moth's limit of 16 mb" r.code said;
+          let hunt = member "hunt" (moth [ "status" ]) in
+          check (hunt <> `Null && counts hunt = counts f) "status after the refused snapshot is not the find 3 hunt. find: %s. status: %s" (show f) (show hunt)))
+
+(* 29: 64 MiB of floats of 0.5, all within 1 as a decimal reads it. They keep their values, so
+   at 0 the ones that never moved go at once, and the next number is quick *)
+let zero_and_one () =
+  with_target ~filler_half_mb:64 (fun t ->
+      let points = Target_ctl.var t "points" in
+      let f = find "1" in
+      let f32 = match List.find_opt (fun g -> to_string (member "id" g) = "f32") (to_list (member "groups" f)) with Some g -> g | None -> failf "no f32 group in %s" (show f) in
+      check
+        (to_int (member "count" f32) > 16_000_000 && to_bool (member "has_values" f32))
+        "find 1's f32 group is %s, expected over 16,000,000 matches with their values" (show f32);
+      Target_ctl.set t "points" "0";
+      let t0 = now () in
+      let o = next "0" in
+      let took = now () -. t0 in
+      Printf.printf "next 0: %.0f ms in the helper, %.0f ms end to end\n%!" (to_number (member "ms" o)) (took *. 1000.);
+      check (took < 3.) "next 0 took %.1f s end to end, expected under 3" took;
+      let c = group_count o "f32" in
+      check (c < 1000) "next 0 left %d f32 matches, expected under 1,000" c;
+      match (page ~near:(hex points.addr) ()).rows with
+      | first :: _ as rows -> check (first.addr = points.addr && first.away = Some 0) "the first row near points (0x%Lx) is not points' own, away 0. results: %s" points.addr (show_rows rows)
+      | [] -> failf "no rows near points")
+
+(* 30: a kept value the game works out again: the set does not hold, and kept says the game put
+   it back *)
+let put_back () =
+  with_target (fun t ->
+      let total = Target_ctl.var t "total" in
+      ignore (moth [ "keep"; hex total.addr; "6"; "total" ]);
+      let o = moth [ "set"; "total"; "9" ] in
+      check (member "held" o = `Bool false) "set total 9 did not say held false: %s" (show o);
+      await t "total" "6";
+      let k = kept_one "total" in
+      check (member "set_to" k = `String "9" && member "put_back" k = `Bool true) "kept shows total as %s, expected set_to \"9\" and put_back true" (show k))
+
 let scenarios =
   [
     (1, "decimal found from a whole number", decimal_from_whole);
@@ -587,6 +680,12 @@ let scenarios =
     (22, "pages", pages);
     (23, "over budget", over_budget);
     (24, "status after the game closes", closed_status);
+    (25, "a value with no number", no_number);
+    (26, "same first", same_first);
+    (27, "snapshot speed", snapshot_speed);
+    (28, "a snapshot over the limit", snapshot_over_limit);
+    (29, "zero and one, fast", zero_and_one);
+    (30, "put back", put_back);
   ]
 
 let rec rm p =

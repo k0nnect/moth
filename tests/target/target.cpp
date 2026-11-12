@@ -1,8 +1,8 @@
 // Stand-in "game" for automated tests: holds known values in memory and lets the test harness
 // read or change them over a TCP control port, so scans can be checked against ground truth.
-//   moth-target.exe <port> [--filler-mb N] [--filler-small-mb N] [--filler-tiny-mb N]
+//   moth-target.exe <port> [--filler-mb N] [--filler-small-mb N] [--filler-tiny-mb N] [--filler-half-mb N]
 // Fillers, N MiB each: random bytes; int32 values 0 to 7 at random (small); int32 values cycling
-// 1 to 4096 (tiny), which read as floats are all too small to be anything.
+// 1 to 4096 (tiny), which read as floats are all too small to be anything; floats of 0.5 (half).
 // Control lines: "get <name>", "set <name> <value>", "free <page>" (decommits that page of the
 // small filler, or of the large one when there is no small one, as a game freeing memory would),
 // "quit". Replies: the value, "ok" or "error".
@@ -51,6 +51,7 @@ struct Vars {
   int32_t total;  // base + bonus, rewritten by the recalc thread
   float charge;
   float drift;
+  float stamina;  // a value whose number is never typed: found by how it moves
   char tail[4096];
 };
 
@@ -111,7 +112,7 @@ struct XorShift {
   }
 };
 
-enum Filler { kRandom, kSmall, kTiny, kFillers };
+enum Filler { kRandom, kSmall, kTiny, kHalf, kFillers };
 
 // One committed read-write block of mb MiB; the pointer is kept so the block stays live.
 void* make_filler(size_t mb, Filler kind) {
@@ -125,6 +126,9 @@ void* make_filler(size_t mb, Filler kind) {
   } else if (kind == kTiny) {
     auto* w = static_cast<uint32_t*>(p);
     for (size_t i = 0; i < bytes / 4; i++) w[i] = static_cast<uint32_t>(i % 4096 + 1);
+  } else if (kind == kHalf) {
+    auto* f = static_cast<float*>(p);
+    for (size_t i = 0; i < bytes / 4; i++) f[i] = 0.5f;
   } else {
     auto* w = static_cast<uint64_t*>(p);
     for (size_t i = 0; i < bytes / 8; i++) w[i] = g.next();
@@ -173,7 +177,7 @@ bool send_all(SOCKET s, const std::string& data) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: moth-target <port> [--filler-mb N] [--filler-small-mb N] [--filler-tiny-mb N]\n");
+    std::fprintf(stderr, "usage: moth-target <port> [--filler-mb N] [--filler-small-mb N] [--filler-tiny-mb N] [--filler-half-mb N]\n");
     return 2;
   }
   int port = std::atoi(argv[1]);
@@ -185,6 +189,8 @@ int main(int argc, char** argv) {
       kind = kSmall;
     else if (std::strcmp(argv[i], "--filler-tiny-mb") == 0)
       kind = kTiny;
+    else if (std::strcmp(argv[i], "--filler-half-mb") == 0)
+      kind = kHalf;
     else
       continue;
     size_t mb = static_cast<size_t>(std::atoll(argv[i + 1]));
@@ -219,6 +225,7 @@ int main(int argc, char** argv) {
   vars->total = vars->base + vars->bonus;
   vars->charge = 5.0f;
   vars->drift = 5.5f;
+  vars->stamina = 62.5f;
 
   Var table[] = {
       {"health", Kind::F32, &vars->health},
@@ -239,6 +246,7 @@ int main(int argc, char** argv) {
       {"total", Kind::I32, &vars->total},
       {"charge", Kind::F32, &vars->charge},
       {"drift", Kind::F32, &vars->drift},
+      {"stamina", Kind::F32, &vars->stamina},
   };
 
   HANDLE recalc_thread = CreateThread(nullptr, 0, recalc, vars, 0, nullptr);

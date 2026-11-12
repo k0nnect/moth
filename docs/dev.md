@@ -63,4 +63,4 @@ Measured on 2026-11-11 on an Apple M5 (10 cores) with CrossOver 26.3, a 64-bit t
 | `find 100` (scan, about 1.00 GB read) | 0.60 to 0.87 s/GB, the budget is 3.0 |
 | `next 100` (narrow, the same groups) | 450 to 590 ms in the helper, about 4 ms more end to end |
 
-The whole suite takes about 10 seconds once the bottle is up.
+The whole suite, scenarios 1 to 30, takes about 30 seconds once the bottle is up (30 and 31 seconds over two runs on 2026-11-12).
