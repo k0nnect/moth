@@ -1,7 +1,6 @@
 (* A scripted Helper_api.helper for tests: queue the replies each operation should give, then
    read back the calls the code under test made. An operation with nothing queued fails the
-   test, except drop, which answers Ok () by default, and read, which answers read_failed by
-   default (a set's read-back a test does not script is one that could not be made). *)
+   test, except drop, which answers Ok () by default. *)
 open Moth_core
 open Helper_api
 
@@ -73,7 +72,7 @@ let create () =
       read =
         (fun ~addr ~vtype ->
           record (Read { addr; vtype });
-          match Queue.take_opt f.reads with Some r -> r | None -> Error { code = "read_failed"; message = "fake helper: no read reply queued" });
+          next "read" f.reads);
       write =
         (fun ~addr ~vtype v ->
           record (Write { addr; vtype; v });

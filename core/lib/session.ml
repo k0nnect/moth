@@ -285,12 +285,12 @@ let set t ~row text =
                   forget_last t;
                   let w = { where = l.laddr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
                   let text = Printf.sprintf "set #%d to %s (was %s)" row (Interp.decode l.li next) (Interp.decode l.li r.prev) in
-                  (* a moment later, the raw bytes there say whether the game kept the write; a
-                     read that fails says nothing, unless the game or the helper is gone *)
+                  (* a moment later, the raw bytes there say whether the game kept the write. A
+                     read that fails says nothing: the write landed and stays recorded, and the
+                     next command reports a closed game or a lost helper. *)
                   t.settle ();
                   let why =
                     match t.h.read ~addr:l.laddr ~vtype with
-                    | Error ({ code = "target_gone" | "helper_lost"; _ } as e) -> raise (Helper_failed e)
                     | Error _ -> None
                     | Ok v ->
                         let bits = Wire.bits_of_value ~vtype v in

@@ -237,6 +237,7 @@ let results_set_undo () =
   check_bool "row" true (rows = [ { n = 1; addr = 0x10008L; interp_id = "i32"; tag = "whole number"; shown = "85" } ]);
   check_bool "one page of 10" true (peeks f = [ ("i32", 0, 10) ]);
   queue_write f ~prev:(Vint 85L) ~prev_bits:0x55L;
+  queue_read f (Vint 999L);
   check_str "set" "set #1 to 999 (was 85)" (set_text (Session.set s ~row:1 "999"));
   check_bool "wrote" true (last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
   check_bool "recorded" true (Session.writes s = [ (0x10008L, "i32", Vint 85L, Vint 999L) ]);
@@ -262,8 +263,10 @@ let undo_order () =
   queue_peek f "i32x100" [ it 0x5000L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
+  queue_read f (Vint 250L);
   check_str "first" "set #1 to 2.50 (was 1.00)" (set_text (Session.set s ~row:1 "2.5"));
   queue_write f ~prev:(Vint 250L) ~prev_bits:250L;
+  queue_read f (Vint 900L);
   check_str "second" "set #1 to 9.00 (was 2.50)" (set_text (Session.set s ~row:1 "9"));
   check_bool "newest first" true (Session.writes s = [ (0x5000L, "i32", Vint 250L, Vint 900L); (0x5000L, "i32", Vint 100L, Vint 250L) ]);
   queue_write f ~prev:(Vint 900L);
@@ -280,6 +283,7 @@ let undo_puts_bytes_back () =
   check_str "a nan is shown" "nan" (List.hd (ok (Session.results s ~all:false))).shown;
   check_bool "peeked as its type" true (peek_vtypes f = [ ("f32", "f32") ]);
   queue_write f ~prev:(Vfloat Float.nan) ~prev_bits:0x7fc00001L;
+  queue_read f (Vfloat 5.);
   let d = ok (Session.set s ~row:1 "5") in
   check_str "set" "set #1 to 5 (was nan)" d.text;
   check_bool "the write" true (d.w = { where = 0x7000L; wtype = "f32"; bits_before = 0x7fc00001L; bits_after = 0x40a00000L });
@@ -300,6 +304,7 @@ let listing_follows_hunt () =
   queue_narrow f ~applied:false [];
   check_bool "dead end" true (ok (Session.next_number s "5")).dead_end;
   queue_write f ~prev:(Vint 100L);
+  queue_read f (Vint 7L);
   check_str "a dead end keeps the listing" "set #2 to 7 (was 100)" (set_text (Session.set s ~row:2 "7"));
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   ignore (ok (Session.next_number s "100"));
@@ -392,6 +397,7 @@ let failed_find_and_lost_groups () =
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
+  queue_read f (Vint 5L);
   ignore (set_text (Session.set s ~row:1 "5"));
   queue_error f "narrow" { code = "no_such_group"; message = "no group \"i32\"" };
   check_err "lost in a step" hunt_lost (Session.next_number s "5");
@@ -434,6 +440,7 @@ let game_closes () =
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L);
+  queue_read f (Vint 5L);
   ignore (set_text (Session.set s ~row:1 "5"));
   queue_error f "peek" gone;
   check_err "closed during results" closed (Session.results s ~all:false);
@@ -446,6 +453,7 @@ let game_closes () =
   queue_peek f "i32" [ it 0x10008L (Vint 100L) ];
   ignore (ok (Session.results s ~all:false));
   queue_write f ~prev:(Vint 100L);
+  queue_read f (Vint 5L);
   ignore (set_text (Session.set s ~row:1 "5"));
   queue_error f "narrow" { code = "helper_lost"; message = "" };
   check_err "helper lost" "lost contact with moth's helper. attach again." (Session.next_number s "5");
@@ -610,7 +618,8 @@ let scans_carry_the_budget () =
   check_bool "a rescan" true (last_scan_keep f);
   check_bool "keeps no budget" true (last_scan_budget f = None)
 
-(* the wait comes between the write and the read; a failed write waits for nothing *)
+(* the wait comes between the write and the read; a failed write waits for nothing. A write that
+   landed stays recorded even when the game closes before the read-back; the next command says so. *)
 let a_write_check_when_things_fail () =
   let h, f = Fake_helper.create () in
   let settles = ref [] in
@@ -626,8 +635,13 @@ let a_write_check_when_things_fail () =
   check_bool "nothing recorded" true (Session.writes s = []);
   queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
   queue_error f "read" gone;
-  check_err "closed during the check" closed (Session.set s ~row:1 "9");
+  let d = ok (Session.set s ~row:1 "9") in
+  check_bool "held, as far as anyone can tell" true d.held;
+  check_str "one line" "set #1 to 9 (was 6)" d.text;
   check_bool "waited once, after the write" true (!settles = [ "after the write" ]);
+  check_bool "recorded" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ]);
+  queue_error f "narrow" gone;
+  check_err "the next command finds the game closed" closed (Session.next_number s "5");
   check_err "hunt cleared" no_hunt (Session.next_number s "5");
   check_err "undo cleared" "nothing to undo" (Session.undo s)
 

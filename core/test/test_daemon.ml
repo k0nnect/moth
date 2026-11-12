@@ -60,6 +60,11 @@ let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
           fk.attached_to <- Some pid;
           fk.alive <- true;
           Ok { pid; name = List.assoc pid fk.procs; bits = 64 });
+      (* a set's read-back answers read_failed unless a test queues one: the stage 1 single line *)
+      read =
+        (fun ~addr ~vtype ->
+          if Queue.is_empty script.reads then Fake_helper.queue_error script "read" { code = "read_failed"; message = "" };
+          h.read ~addr ~vtype);
       status =
         (fun () ->
           match fk.attached_to with
