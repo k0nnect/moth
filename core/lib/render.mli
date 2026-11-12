@@ -10,8 +10,16 @@ val size : int -> string
 (** the counts line alone: the total shown (the wide tier's under [Showing_wide]) and its tags *)
 val counts : Session.outcome -> string
 
-(** one line per row: number, value, address, tag *)
+(** one line per row: number, value, address, tag; rows near a value also have their distance
+    from it, as ["+16"], ["-8"] or ["0"], before the tag *)
 val rows : Session.row list -> string
+
+(** a page of results: its rows, then, when rows remain, the line saying which rows these are
+    and the command for the next page, which repeats [--all] and [--near <target>] when given *)
+val listing : ?near:string -> all:bool -> Session.listing -> string
+
+(** one line per kept value: name, value, address, tag *)
+val kept : Session.kept list -> string
 
 (** [1234567] is ["1,234,567"] *)
 val commas : int -> string

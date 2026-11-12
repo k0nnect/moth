@@ -24,6 +24,7 @@ val call :
 
 type invocation = { cmd : string; args : string list; opts : (string * string) list; json : bool }
 
-(** [moth <cmd> [args] [--bottle <b>] [--all] [--json] [-n <n>]] without the program name.
-    Options may come anywhere; an argument like [-5] or [-.5] is a number, not an option. *)
+(** [moth <cmd> [args] [--bottle <b>] [--all] [--json] [-n <n>] [--from <row>] [--near <v>]]
+    without the program name. Options may come anywhere; an argument like [-5] or [-.5] is a
+    number, not an option. *)
 val parse_args : string list -> (invocation, string) result

@@ -45,11 +45,35 @@ let outcome (o : Session.outcome) =
     let unread = if o.unreadable > 0 then [ unreadable_line o.unreadable ] else [] in
     String.concat "\n" ((counts o :: unread) @ List.map note_line notes)
 
+(* lines of cells, two spaces apart, each column but the last padded to its widest cell *)
+let table lines =
+  let widths = List.fold_left (fun ws l -> List.map2 (fun w c -> max w (String.length c)) ws l) (List.map (fun _ -> 0) (List.hd lines)) lines in
+  let pad w s = s ^ String.make (w - String.length s) ' ' in
+  let line l =
+    let last = List.length l - 1 in
+    String.concat "  " (List.mapi (fun i (w, c) -> if i = last then c else pad w c) (List.combine widths l))
+  in
+  String.concat "\n" (List.map line lines)
+
+let away = function Some 0 -> "0" | Some d -> Printf.sprintf "%+d" d | None -> ""
+
 let rows = function
   | [] -> "nothing to list yet. narrow it down with your next number."
   | rs ->
-      let cells = List.map (fun (r : Session.row) -> (Printf.sprintf "#%d" r.n, r.shown, Printf.sprintf "0x%Lx" r.addr, r.tag)) rs in
-      let width pick = List.fold_left (fun w c -> max w (String.length (pick c))) 0 cells in
-      let wn = width (fun (n, _, _, _) -> n) and wv = width (fun (_, v, _, _) -> v) and wa = width (fun (_, _, a, _) -> a) in
-      let pad w s = s ^ String.make (w - String.length s) ' ' in
-      String.concat "\n" (List.map (fun (n, v, a, tag) -> String.concat "  " [ pad wn n; pad wv v; pad wa a; tag ]) cells)
+      let near = List.exists (fun (r : Session.row) -> r.away <> None) rs in
+      table
+        (List.map
+           (fun (r : Session.row) -> [ Printf.sprintf "#%d" r.n; r.shown; Printf.sprintf "0x%Lx" r.addr ] @ (if near then [ away r.away ] else []) @ [ r.tag ])
+           rs)
+
+let listing ?near ~all (l : Session.listing) =
+  let text = rows l.rows in
+  match (l.rows, List.rev l.rows) with
+  | (first : Session.row) :: _, (last : Session.row) :: _ when last.n < l.total ->
+      let again = (if all then " --all" else "") ^ Printf.sprintf " --from %d" (last.n + 1) ^ match near with Some t -> " --near " ^ t | None -> "" in
+      Printf.sprintf "%s\nshowing %d-%d of %d. more: moth results%s" text first.n last.n l.total again
+  | _ -> text
+
+let kept = function
+  | [] -> "nothing kept yet. keep a result with: moth keep <#n> [name]"
+  | ks -> table (List.map (fun (k : Session.kept) -> [ k.name; k.kshown; Printf.sprintf "0x%Lx" k.kaddr; k.ktag ]) ks)

@@ -86,6 +86,25 @@ let rows () =
        ]);
   check_str "nothing to list" "nothing to list yet. narrow it down with your next number." (Render.rows [])
 
+let rows_near () =
+  check_str "the distance after the address" "#1  532  0x6c551078  +16  whole number\n#2  2    0x6c551060  -8   whole number\n#3  15   0x6c551068  0    whole number"
+    (Render.rows
+       [
+         { n = 1; addr = 0x6c551078L; interp_id = "i32"; tag = "whole number"; shown = "532"; away = Some 16 };
+         { n = 2; addr = 0x6c551060L; interp_id = "i32"; tag = "whole number"; shown = "2"; away = Some (-8) };
+         { n = 3; addr = 0x6c551068L; interp_id = "i32"; tag = "whole number"; shown = "15"; away = Some 0 };
+       ])
+
+let kept () =
+  check_str "kept" "xp     95    0x6c551068  whole number\ncents  5.32  0x6c551078  whole number ×100\nhp     ?     0x10        decimal"
+    (Render.kept
+       [
+         { name = "xp"; kaddr = 0x6c551068L; ktag = "whole number"; kshown = "95" };
+         { name = "cents"; kaddr = 0x6c551078L; ktag = "whole number ×100"; kshown = "5.32" };
+         { name = "hp"; kaddr = 0x10L; ktag = "decimal"; kshown = "?" };
+       ]);
+  check_str "none" "nothing kept yet. keep a result with: moth keep <#n> [name]" (Render.kept [])
+
 let () =
   Alcotest.run "render"
     [
@@ -95,6 +114,8 @@ let () =
           Alcotest.test_case "counts" `Quick counts;
           Alcotest.test_case "commas" `Quick commas;
           Alcotest.test_case "rows" `Quick rows;
+          Alcotest.test_case "rows near a value" `Quick rows_near;
+          Alcotest.test_case "kept" `Quick kept;
           Alcotest.test_case "sizes" `Quick sizes;
         ] );
     ]

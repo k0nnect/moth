@@ -7,7 +7,11 @@ type start_helper = bottle:string -> (Helper_api.helper, string) result
 
 (** serves until a "stop" request, SIGTERM or SIGINT; on the way out it closes the helper
     connection and removes the socket. Raises [Failure] with the message to show when another
-    daemon already serves [home] or the socket path is too long. *)
+    daemon already serves [home] or the socket path is too long.
+
+    MOTH_BUDGET_MB is read once, here: a whole number from 1 to 65536 is the memory budget, in
+    MiB, that every hunt's [find] sends with its scan; anything else is ignored, with a line in
+    the log (unset or empty, quietly). *)
 val run : home:string -> start_helper:start_helper -> unit
 
 (** the real helper under CrossOver's wine, its output appended to [home]/helper.log *)

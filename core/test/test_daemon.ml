@@ -36,15 +36,29 @@ type fake = {
   mutable closed : int;
   mutable modules_asked : int; (* modules calls *)
   mutable attaches : int; (* attach calls *)
-  mutable attached_to : int option; (* the pid the helper last attached to *)
+  mutable attached_to : attached option; (* what the helper last attached to *)
   mutable alive : bool; (* whether that process is still running *)
+  mutable statuses : int; (* status calls *)
+  mutable status_lost : bool; (* status answers helper_lost *)
   script : Fake_helper.script;
 }
 
 let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
   let h, script = Fake_helper.create () in
   let fk =
-    { procs; modules = Ok [ "UnityPlayer.dll" ]; started = []; closed = 0; modules_asked = 0; attaches = 0; attached_to = None; alive = true; script }
+    {
+      procs;
+      modules = Ok [ "UnityPlayer.dll" ];
+      started = [];
+      closed = 0;
+      modules_asked = 0;
+      attaches = 0;
+      attached_to = None;
+      alive = true;
+      statuses = 0;
+      status_lost = false;
+      script;
+    }
   in
   let helper =
     {
@@ -57,19 +71,21 @@ let fake ?(procs = [ (208, "disco.exe"); (300, "explorer.exe") ]) () =
       attach =
         (fun pid ->
           fk.attaches <- fk.attaches + 1;
-          fk.attached_to <- Some pid;
+          let a = { pid; name = List.assoc pid fk.procs; bits = 64 } in
+          fk.attached_to <- Some a;
           fk.alive <- true;
-          Ok { pid; name = List.assoc pid fk.procs; bits = 64 });
+          Ok a);
       (* a set's read-back answers read_failed unless a test queues one: the stage 1 single line *)
       read =
         (fun ~addr ~vtype ->
           if Queue.is_empty script.reads then Fake_helper.queue_error script "read" { code = "read_failed"; message = "" };
           h.read ~addr ~vtype);
+      (* the game it attached to, whatever is running now *)
       status =
         (fun () ->
-          match fk.attached_to with
-          | Some pid when fk.alive -> Ok (Some { pid; name = List.assoc pid fk.procs; bits = 64 })
-          | _ -> Ok None);
+          fk.statuses <- fk.statuses + 1;
+          if fk.status_lost then Error { code = "helper_lost"; message = "" }
+          else match fk.attached_to with Some a when fk.alive -> Ok (Some a) | _ -> Ok None);
       close = (fun () -> fk.closed <- fk.closed + 1);
     }
   in
@@ -238,21 +254,33 @@ let hunt () =
       Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
       Fake_helper.queue_peek f "u8" [ { addr = 0x2000L; v = Vint 60L } ];
       check_json "results json, all"
-        (`List
+        (`Assoc
           [
-            `Assoc [ ("n", `Int 1); ("addr", `String "0x10008"); ("interp_id", `String "i32"); ("tag", `String "whole number"); ("shown", `String "60") ];
-            `Assoc [ ("n", `Int 2); ("addr", `String "0x2000"); ("interp_id", `String "u8"); ("tag", `String "whole number (1-byte)"); ("shown", `String "60") ];
+            ( "rows",
+              `List
+                [
+                  `Assoc
+                    [ ("n", `Int 1); ("addr", `String "0x10008"); ("interp_id", `String "i32"); ("tag", `String "whole number"); ("shown", `String "60"); ("away", `Null) ];
+                  `Assoc
+                    [
+                      ("n", `Int 2); ("addr", `String "0x2000"); ("interp_id", `String "u8"); ("tag", `String "whole number (1-byte)"); ("shown", `String "60"); ("away", `Null);
+                    ];
+                ] );
+            ("total", `Int 2);
+            ("from", `Int 1);
           ])
         (json (call d "results" [] ~opts:[ ("all", "true") ]));
       Fake_helper.queue_write f ~prev:(Vint 60L);
       check_bool "set accepts #" true (Result.is_ok (call d "set" [ "#1"; "999" ]));
       check_bool "wrote" true (Fake_helper.last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
       Fake_helper.queue_write f ~prev:(Vint 999L);
-      check_json "set without #" (`Assoc [ ("message", `String "set #2 to 5 (was 999)") ]) (json (call d "set" [ "2"; "5" ]));
+      check_json "set without #" (`Assoc [ ("message", `String "set #2 to 5 (was 999)"); ("held", `Bool true) ]) (json (call d "set" [ "2"; "5" ]));
       Fake_helper.queue_write f ~prev:(Vint 5L);
       check_str "undo" "restored #2 to 999" (text (call d "undo" []));
-      check_err "set usage" "set needs a result number and a number: moth set <#n> <number>" (call d "set" [ "x"; "5" ]);
-      check_err "set usage, one argument" "set needs a result number and a number: moth set <#n> <number>" (call d "set" [ "1" ]);
+      let set_usage = "set needs a result number or a kept name, and a number: moth set <#n|name> <number>" in
+      check_err "set usage" set_usage (call d "set" [ "#x"; "5" ]);
+      check_err "set usage, one argument" set_usage (call d "set" [ "1" ]);
+      check_err "not a result number, so a name" "no kept value called x. see: moth kept" (call d "set" [ "x"; "5" ]);
       check_err "find usage" "find needs a number" (call d "find" []);
       check_err "no such row" "no result #7. run: moth results" (call d "set" [ "7"; "1" ]))
 
@@ -516,6 +544,245 @@ let unexpected () =
       | Ok _ -> Alcotest.fail "expected an error");
       check_str "still serving" attached (text (call d "status" [])))
 
+(* ---- stage 1b: pages, near, kept values, checked writes, a closed game, the budget ---- *)
+
+(* [k] items of 3 from [base], 4 bytes apart *)
+let threes ?(base = 0x1000) k = List.init k (fun i -> { addr = Int64.of_int (base + (4 * i)); v = Vint 3L })
+
+let lines s = String.split_on_char '\n' s
+let last_line s = List.nth (lines s) (List.length (lines s) - 1)
+let name_msg = "a name is lowercase letters, digits, - and _, starting with a letter."
+let nothing_kept = "nothing kept yet. keep a result with: moth keep <#n> [name]"
+
+(* a hunt for 3 with [count] matches in one i32 group *)
+let hunt_for_three d (f : Fake_helper.script) count =
+  ignore (text (attach d));
+  Fake_helper.queue_scan f [ gi "i32" count ];
+  ignore (text (call d "find" [ "3" ]))
+
+let pages () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 30;
+      Fake_helper.queue_peek f "i32" (threes ~base:0x1050 5);
+      let r = call d "results" [] ~opts:[ ("from", "21"); ("n", "5") ] in
+      check_bool "from 21, 5 rows" true (Fake_helper.last_peek f "i32" = (20, 5));
+      let open Yojson.Safe.Util in
+      let j = json r in
+      check_strs "fields" [ "rows"; "total"; "from" ] (keys j);
+      check_int "total" 30 (member "total" j |> to_int);
+      check_int "from" 21 (member "from" j |> to_int);
+      check_json "a row"
+        (`Assoc [ ("n", `Int 21); ("addr", `String "0x1050"); ("interp_id", `String "i32"); ("tag", `String "whole number"); ("shown", `String "3"); ("away", `Null) ])
+        (index 0 (member "rows" j));
+      Alcotest.(check (list int)) "numbered" [ 21; 22; 23; 24; 25 ] (List.map (fun r -> member "n" r |> to_int) (to_list (member "rows" j)));
+      check_int "5 rows and a line" 6 (List.length (lines (text r)));
+      check_str "first row" "#21  3  0x1050  whole number" (List.hd (lines (text r)));
+      check_str "more" "showing 21-25 of 30. more: moth results --from 26" (last_line (text r));
+      (* the last page has no such line *)
+      Fake_helper.queue_peek f "i32" (threes ~base:0x1064 5);
+      let t = text (call d "results" [] ~opts:[ ("from", "26"); ("n", "5") ]) in
+      check_int "5 rows alone" 5 (List.length (lines t));
+      check_str "the last row" "#30  3  0x1074  whole number" (last_line t);
+      (* 20 by default; --all is kept for the next page *)
+      Fake_helper.queue_peek f "i32" (threes 20);
+      let t = text (call d "results" [] ~opts:[ ("all", "true") ]) in
+      check_bool "20 rows" true (Fake_helper.last_peek f "i32" = (0, 20));
+      check_str "more, all" "showing 1-20 of 30. more: moth results --all --from 21" (last_line t);
+      check_err "past the end" "no result #31. there are 30." (call d "results" [] ~opts:[ ("from", "31") ]))
+
+let near_pages () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 3;
+      let near = [ { addr = 0x6c551060L; v = Vint 3L }; { addr = 0x6c551068L; v = Vint 3L }; { addr = 0x6c551078L; v = Vint 3L } ] in
+      Fake_helper.queue_peek_from f "i32" near;
+      let r = call d "results" [] ~opts:[ ("near", "0x6c551068"); ("n", "2") ] in
+      check_str "nearest first, a page"
+        "#1  3  0x6c551068  0   whole number\n#2  3  0x6c551060  -8  whole number\nshowing 1-2 of 3. more: moth results --from 3 --near 0x6c551068" (text r);
+      let open Yojson.Safe.Util in
+      Alcotest.(check (list (option int))) "away" [ Some 0; Some (-8) ] (List.map (fun r -> member "away" r |> to_int_option) (to_list (member "rows" (json r))));
+      check_int "total" 3 (member "total" (json r) |> to_int);
+      Fake_helper.queue_peek_from f "i32" near;
+      check_str "the next page" "#3  3  0x6c551078  +16  whole number" (text (call d "results" [] ~opts:[ ("near", "0x6c551068"); ("from", "3") ]));
+      check_err "a name not kept" "no kept value called xp. see: moth kept" (call d "results" [] ~opts:[ ("near", "xp") ]))
+
+let results_usage () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 30;
+      let calls = List.length (Fake_helper.calls f) in
+      let n = "results -n needs a number from 1 to 200" and from = "results --from needs a row number, 1 or more" in
+      List.iter
+        (fun (opts, msg) -> check_err (String.concat " " (List.map (fun (k, v) -> k ^ "=" ^ v) opts)) msg (call d "results" [] ~opts))
+        [
+          ([ ("n", "0") ], n);
+          ([ ("n", "201") ], n);
+          ([ ("n", "99999") ], n);
+          ([ ("n", "abc") ], n);
+          ([ ("n", "-5") ], n);
+          ([ ("n", "") ], n);
+          ([ ("from", "0") ], from);
+          ([ ("from", "x") ], from);
+          ([ ("from", "-1") ], from);
+          ([ ("n", "5"); ("from", "0") ], from);
+        ];
+      check_int "the helper was not asked" calls (List.length (Fake_helper.calls f));
+      let ok n w g = Alcotest.(check (result unit string)) n w g in
+      ok "1 and 200" (Ok ()) (Daemon.check_usage ~cmd:"results" ~args:[] ~opts:[ ("n", "200"); ("from", "1"); ("near", "xp") ]);
+      ok "1" (Ok ()) (Daemon.check_usage ~cmd:"results" ~args:[] ~opts:[ ("n", "1") ]))
+
+let keep_by_name () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 1 ];
+      ignore (text (call d "find" [ "60" ]));
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 60L } ];
+      ignore (text (call d "results" []));
+      let r = call d "keep" [ "#1"; "xp" ] in
+      check_str "keep" "kept #1 as xp (60, whole number)" (text r);
+      check_json "keep json" (`Assoc [ ("message", `String "kept #1 as xp (60, whole number)") ]) (json r);
+      Fake_helper.queue_read f (Vint 60L);
+      Fake_helper.queue_read f (Vint 60L);
+      check_str "kept" "xp  60  0x10008  whole number" (text (call d "kept" []));
+      check_json "kept json"
+        (`List [ `Assoc [ ("name", `String "xp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "60") ] ])
+        (json (call d "kept" []));
+      Fake_helper.queue_write f ~prev:(Vint 60L) ~prev_bits:0x3cL;
+      Fake_helper.queue_read f (Vint 95L);
+      check_json "set by name" (`Assoc [ ("message", `String "set xp to 95 (was 60)"); ("held", `Bool true) ]) (json (call d "set" [ "xp"; "95" ]));
+      check_bool "written at xp" true (Fake_helper.last_write f = (0x10008L, "i32", Put_value (Vint 95L)));
+      Fake_helper.queue_write f ~prev:(Vint 95L) ~prev_bits:0x5fL;
+      check_str "undo" "restored xp to 60" (text (call d "undo" []));
+      (* both events keep their write *)
+      let open Yojson.Safe.Util in
+      let ev = json (call d "log" [] ~opts:[ ("n", "2") ]) in
+      let wrote addr prev_bits new_bits = `Assoc [ ("addr", `String addr); ("type", `String "i32"); ("prev_bits", `String prev_bits); ("new_bits", `String new_bits) ] in
+      check_json "set's write" (wrote "0x10008" "0x0000003c" "0x0000005f") (member "write" (index 1 ev));
+      check_json "undo's write" (wrote "0x10008" "0x0000005f" "0x0000003c") (member "write" (index 0 ev));
+      let r = call d "forget" [ "xp" ] in
+      check_str "forget" "forgot xp" (text r);
+      check_json "forget json" (`Assoc [ ("message", `String "forgot xp") ]) (json r);
+      check_str "nothing kept" nothing_kept (text (call d "kept" []));
+      check_json "nothing kept, json" (`List []) (json (call d "kept" []));
+      check_err "forgotten" "no kept value called xp. see: moth kept" (call d "forget" [ "xp" ]);
+      check_err "set, forgotten" "no kept value called xp. see: moth kept" (call d "set" [ "xp"; "1" ]);
+      check_err "set, a name there can't be" "no kept value called X Y. see: moth kept" (call d "set" [ "X Y"; "1" ]);
+      check_err "forget usage" "forget needs a name: moth forget <name>" (call d "forget" []);
+      check_err "forget usage, two" "forget needs a name: moth forget <name>" (call d "forget" [ "a"; "b" ]);
+      check_err "kept takes nothing" "kept takes no arguments" (call d "kept" [ "xp" ]))
+
+let keep_by_address () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_read f (Vint 15L);
+      check_str "keep at" "kept 0x6c551068 as xp (15, whole number)" (text (call d "keep" [ "0x6c551068"; "15"; "xp" ]));
+      check_bool "read there, as i32" true (Fake_helper.reads f = [ (0x6c551068L, "i32") ]);
+      Fake_helper.queue_read f (Vint 15L);
+      check_str "no name, any case" "kept 0x6c551068 as v1 (15, whole number)" (text (call d "keep" [ "0X6C551068"; "15" ]));
+      (* nothing queued: every read fails *)
+      check_err "nothing there" "nothing at 0x6c551068 reads as 7." (call d "keep" [ "0x6c551068"; "7"; "lvl" ]);
+      Fake_helper.queue_read f (Vint 15L);
+      Fake_helper.queue_read f (Vint 15L);
+      check_str "both" "xp  15  0x6c551068  whole number\nv1  15  0x6c551068  whole number" (text (call d "kept" []));
+      (* nothing queued: neither can be read now *)
+      check_str "unreadable" "xp  ?  0x6c551068  whole number\nv1  ?  0x6c551068  whole number" (text (call d "kept" []));
+      Fake_helper.queue_read f (Vint 15L);
+      check_json "unreadable json"
+        (`List
+          [
+            `Assoc [ ("name", `String "xp"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "15") ];
+            `Assoc [ ("name", `String "v1"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "?") ];
+          ])
+        (json (call d "kept" [])))
+
+let keep_refused () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 2;
+      Fake_helper.queue_peek f "i32" (threes 2);
+      ignore (text (call d "results" []));
+      check_err "a number for a name" name_msg (call d "keep" [ "#2"; "5" ]);
+      check_err "an address for a name" name_msg (call d "keep" [ "#2"; "0x10" ]);
+      let usage = "keep needs a result, or an address and the number it shows: moth keep <#n> [name], or moth keep <0xaddr> <number> [name]" in
+      List.iter
+        (fun args -> check_err (String.concat " " ("keep" :: args)) usage (call d "keep" args))
+        [ [ "15" ]; []; [ "0x10" ]; [ "#1"; "a"; "b" ]; [ "#0" ]; [ "#x" ]; [ "2"; "xp" ]; [ "0x"; "5" ]; [ "0xg1"; "5" ]; [ "0x10"; "5"; "a"; "b" ] ];
+      check_str "nothing kept" nothing_kept (text (call d "kept" [])))
+
+let set_put_back () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 1 ];
+      ignore (text (call d "find" [ "6" ]));
+      Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Vint 6L } ];
+      ignore (text (call d "results" []));
+      Fake_helper.queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
+      Fake_helper.queue_read f (Vint 6L);
+      let r = call d "set" [ "#1"; "9" ] in
+      let two = "set #1 to 9 (was 6)\nthe game put it straight back to 6. it's worked out from something else, so writing here won't stick." in
+      check_str "two lines" two (text r);
+      check_json "held false" (`Assoc [ ("message", `String two); ("held", `Bool false) ]) (json r))
+
+let closed_game () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_read f (Vint 15L);
+      ignore (text (call d "keep" [ "0x6c551068"; "15"; "xp" ]));
+      Fake_helper.queue_scan f [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "100" ]));
+      fk.statuses <- 0;
+      check_str "still there" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
+      check_int "the helper asked once" 1 fk.statuses;
+      fk.alive <- false;
+      let r = call d "status" [] in
+      check_str "closed" "not attached. disco.exe closed." (text r);
+      check_json "closed json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String "disco.exe") ]) (json r);
+      check_err "kept" not_attached (call d "kept" []);
+      check_err "results" not_attached (call d "results" []);
+      check_str "said once" "not attached" (text (call d "status" []));
+      check_int "not asked when nothing is attached" 2 fk.statuses;
+      check_int "the helper kept" 0 fk.closed;
+      (* attached again, nothing of the old game's is left *)
+      ignore (text (attach d));
+      check_str "no hunt" attached (text (call d "status" []));
+      check_str "nothing kept" nothing_kept (text (call d "kept" [])))
+
+let status_helper_lost () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      fk.status_lost <- true;
+      check_err "lost" "lost contact with moth's helper. try again." (call d "status" []);
+      check_int "helper closed" 1 fk.closed;
+      check_str "status" "not attached" (text (call d "status" []));
+      fk.status_lost <- false;
+      ignore (text (attach d));
+      check_strs "a new helper" [ "uhmm"; "uhmm" ] fk.started)
+
+(* MOTH_BUDGET_MB is read when the daemon starts *)
+let budget () =
+  List.iter
+    (fun (v, want) ->
+      let fk, sh = fake () in
+      with_env "MOTH_BUDGET_MB" v (fun () ->
+          with_daemon sh (fun d ->
+              hunt_for_three d fk.script 3;
+              Alcotest.(check (option int)) ("MOTH_BUDGET_MB=" ^ v) want (Fake_helper.last_scan_budget fk.script))))
+    [ ("64", Some 64); ("abc", None); ("1", Some 1); ("65536", Some 65536); ("0", None); ("65537", None); ("", None) ]
+
 let usage () =
   let check n w g = Alcotest.(check (result unit string)) n w g in
   check "unknown" (Error "unknown command: frob. run: moth help") (Daemon.check_usage ~cmd:"frob" ~args:[] ~opts:[]);
@@ -540,6 +807,17 @@ let parse_args () =
   same "unknown option" (Error "unknown option: --frob. run: moth help") (p [ "status"; "--frob" ]);
   same "missing value" (Error "--bottle needs a value") (p [ "ps"; "--bottle" ]);
   same "no command" (Error "no command. run: moth help") (p [ "--json" ])
+
+let parse_results_args () =
+  let p = Client.parse_args in
+  let same n w g = check_bool n true (w = g) in
+  same "from and near"
+    (Ok { Client.cmd = "results"; args = []; opts = [ ("n", "5"); ("from", "21"); ("near", "xp") ]; json = true })
+    (p [ "results"; "-n"; "5"; "--from"; "21"; "--near"; "xp"; "--json" ]);
+  same "near an address" (Ok { Client.cmd = "results"; args = []; opts = [ ("near", "0x6c551068") ]; json = false }) (p [ "results"; "--near"; "0x6c551068" ]);
+  same "from needs a value" (Error "--from needs a value") (p [ "results"; "--from" ]);
+  same "near needs a value" (Error "--near needs a value") (p [ "results"; "--near" ]);
+  same "-n needs a value" (Error "-n needs a value") (p [ "results"; "-n" ])
 
 let home () =
   with_env "MOTH_HOME" "/x/y" (fun () -> check_str "env" "/x/y" (Client.home ()));
@@ -567,6 +845,16 @@ let () =
           t "crossover missing" crossover_missing;
           t "usage" usage;
           t "unexpected error" unexpected;
+          t "results in pages" pages;
+          t "results near a value, in pages" near_pages;
+          t "results usage" results_usage;
+          t "keep, kept, set by name, forget" keep_by_name;
+          t "keep by address" keep_by_address;
+          t "keep refused" keep_refused;
+          t "a set the game put back" set_put_back;
+          t "status notices a closed game" closed_game;
+          t "status, helper lost" status_helper_lost;
+          t "memory budget" budget;
         ] );
       ( "lifecycle",
         [
@@ -578,5 +866,5 @@ let () =
           t "autostart gives up" autostart_gives_up;
           t "signals" signals;
         ] );
-      ("client", [ t "parse args" parse_args; t "home" home ]);
+      ("client", [ t "parse args" parse_args; t "parse args: results options" parse_results_args; t "home" home ]);
     ]

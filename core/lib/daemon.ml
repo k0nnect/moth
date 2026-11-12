@@ -66,6 +66,7 @@ type state = {
   home : string;
   sock : string;
   start_helper : start_helper;
+  budget_mb : int option; (* from MOTH_BUDGET_MB, for every session *)
   mutable conn : (string * Helper_api.helper) option; (* the helper and the bottle it runs in *)
   mutable target : target option; (* always in the helper's bottle *)
   mutable lost : bool; (* the helper said helper_lost during this request *)
@@ -203,7 +204,7 @@ let attach st ~bottle what =
       (* the helper lets go of the old target when it attaches to the new one *)
       st.target <- None;
       let* proc = lift (h.attach pid) in
-      let t = { proc; bottle; session = Session.create h } in
+      let t = { proc; bottle; session = Session.create ?budget_mb:st.budget_mb h } in
       st.gone <- false;
       st.target <- Some t;
       Ok t
@@ -250,14 +251,25 @@ let outcome (o : Session.outcome) =
       ],
     Render.outcome o )
 
-let rows (rs : Session.row list) =
-  ( `List
-      (List.map
-         (fun (r : Session.row) ->
-           `Assoc
-             [ ("n", `Int r.n); ("addr", `String (sprintf "0x%Lx" r.addr)); ("interp_id", `String r.interp_id); ("tag", `String r.tag); ("shown", `String r.shown) ])
-         rs),
-    Render.rows rs )
+let hex a = `String (sprintf "0x%Lx" a)
+
+let listing ?near ~all (l : Session.listing) =
+  let row (r : Session.row) =
+    `Assoc
+      [
+        ("n", `Int r.n);
+        ("addr", hex r.addr);
+        ("interp_id", `String r.interp_id);
+        ("tag", `String r.tag);
+        ("shown", `String r.shown);
+        ("away", match r.away with Some d -> `Int d | None -> `Null);
+      ]
+  in
+  (`Assoc [ ("rows", `List (List.map row l.rows)); ("total", `Int l.total); ("from", `Int l.from) ], Render.listing ?near ~all l)
+
+let kept ks =
+  ( `List (List.map (fun (k : Session.kept) -> `Assoc [ ("name", `String k.name); ("addr", hex k.kaddr); ("tag", `String k.ktag); ("shown", `String k.kshown) ]) ks),
+    Render.kept ks )
 
 let said m = (`Assoc [ ("message", `String m) ], m)
 
@@ -265,22 +277,35 @@ let said m = (`Assoc [ ("message", `String m) ], m)
 let written_json (w : Session.written) =
   `Assoc
     [
-      ("addr", `String (sprintf "0x%Lx" w.where));
+      ("addr", hex w.where);
       ("type", `String w.wtype);
       ("prev_bits", Wire.bits_to_json ~vtype:w.wtype w.bits_before);
       ("new_bits", Wire.bits_to_json ~vtype:w.wtype w.bits_after);
     ]
 
+(* a set: what to say and whether the value held; the write goes in the request's event *)
+let set_done st (d : Session.set_done) =
+  st.wrote <- Some (written_json d.w);
+  (`Assoc [ ("message", `String d.text); ("held", `Bool d.held) ], d.text)
+
+(* Asks the helper whether the game is still there. When it has exited, the target goes, and its
+   hunt, kept values and writes with it; the helper stays. *)
 let status st =
-  match st.target with
-  | None -> (`Assoc [ ("attached", `Null); ("hunt", `Null) ], "not attached")
-  | Some t -> (
-      let attached = `Assoc [ ("pid", `Int t.proc.pid); ("name", `String t.proc.name); ("bits", `Int t.proc.bits); ("bottle", `String t.bottle) ] in
-      match Session.current t.session with
-      | None -> (`Assoc [ ("attached", attached); ("hunt", `Null) ], attached_line t)
-      | Some o ->
-          let hunt = `Assoc [ ("main", `Int o.main); ("wide", `Int o.wide); ("groups", `List (List.map group_json o.groups)) ] in
-          (`Assoc [ ("attached", attached); ("hunt", hunt) ], attached_line t ^ "\n" ^ Render.counts o))
+  match (st.target, st.conn) with
+  | Some t, Some (_, h) -> (
+      match h.status () with
+      | Ok None ->
+          st.target <- None;
+          Ok (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String t.proc.name) ], sprintf "not attached. %s closed." t.proc.name)
+      | Error e -> Error (message e)
+      | Ok (Some _) -> (
+          let attached = `Assoc [ ("pid", `Int t.proc.pid); ("name", `String t.proc.name); ("bits", `Int t.proc.bits); ("bottle", `String t.bottle) ] in
+          match Session.current t.session with
+          | None -> Ok (`Assoc [ ("attached", attached); ("hunt", `Null) ], attached_line t)
+          | Some o ->
+              let hunt = `Assoc [ ("main", `Int o.main); ("wide", `Int o.wide); ("groups", `List (List.map group_json o.groups)) ] in
+              Ok (`Assoc [ ("attached", attached); ("hunt", hunt) ], attached_line t ^ "\n" ^ Render.counts o)))
+  | _ -> Ok (`Assoc [ ("attached", `Null); ("hunt", `Null) ], "not attached")
 
 let bottles () =
   match Crossover.list_bottles () with
@@ -355,25 +380,53 @@ let log st opts =
 
 (* ---- commands ---- *)
 
+(* a result's number, #n or n, from 1 *)
 let row_number s =
   let s = if String.starts_with ~prefix:"#" s then String.sub s 1 (String.length s - 1) else s in
   match int_of_string_opt s with Some n when is_digits s && n > 0 -> Some n | _ -> None
 
+(* a 0x address, any case *)
+let address s =
+  let n = String.length s in
+  let hex_digit = function '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true | _ -> false in
+  if n > 2 && s.[0] = '0' && (s.[1] = 'x' || s.[1] = 'X') && String.for_all hex_digit (String.sub s 2 (n - 2)) then
+    Int64.of_string_opt ("0x" ^ String.sub s 2 (n - 2))
+  else None
+
 let check_usage ~cmd ~args ~opts =
   let need ok msg = if ok then Ok () else Error msg in
   let none = need (args = []) (cmd ^ " takes no arguments") in
+  (* the option, when given, is a whole number that [ok] accepts *)
+  let whole k ok = match List.assoc_opt k opts with None -> true | Some v -> is_digits v && Option.fold ~none:false ~some:ok (int_of_string_opt v) in
   match cmd with
-  | "bottles" | "status" | "results" | "undo" | "detach" | "stop" -> none
+  | "bottles" | "status" | "kept" | "undo" | "detach" | "stop" -> none
   | "ps" ->
       let* () = need (List.mem_assoc "bottle" opts) "ps needs a bottle: moth ps --bottle <bottle>" in
       none
   | "attach" -> need (List.length args = 1 && List.mem_assoc "bottle" opts) "attach needs a bottle and a process: moth attach --bottle <bottle> <game.exe>"
   | "find" -> need (List.length args = 1) "find needs a number"
   | "next" -> need (List.length args = 1) "next needs a number, or one of: down, up, same, changed"
-  | "set" -> need (match args with [ row; _ ] -> row_number row <> None | _ -> false) "set needs a result number and a number: moth set <#n> <number>"
+  | "results" ->
+      let* () = none in
+      let* () = need (whole "n" (fun n -> n >= 1 && n <= 200)) "results -n needs a number from 1 to 200" in
+      need (whole "from" (fun n -> n >= 1)) "results --from needs a row number, 1 or more"
+  | "keep" ->
+      need
+        (match args with
+        | ([ r ] | [ r; _ ]) when String.starts_with ~prefix:"#" r -> row_number r <> None
+        | [ a; _ ] | [ a; _; _ ] -> address a <> None
+        | _ -> false)
+        "keep needs a result, or an address and the number it shows: moth keep <#n> [name], or moth keep <0xaddr> <number> [name]"
+  | "forget" -> need (List.length args = 1) "forget needs a name: moth forget <name>"
+  | "set" ->
+      (* a result's number, or else a kept value's name, which the session checks *)
+      let named s = not (String.starts_with ~prefix:"#" s || is_digits s) in
+      need
+        (match args with [ target; _ ] -> row_number target <> None || named target | _ -> false)
+        "set needs a result number or a kept name, and a number: moth set <#n|name> <number>"
   | "log" ->
       let* () = none in
-      need (match List.assoc_opt "n" opts with None -> true | Some n -> is_digits n && int_of_string_opt n <> None) "log -n needs a whole number"
+      need (whole "n" (fun _ -> true)) "log -n needs a whole number"
   | _ -> Error (sprintf "unknown command: %s. run: moth help" cmd)
 
 let relations = [ ("down", Session.Down); ("up", Session.Up); ("same", Session.Same); ("changed", Session.Changed) ]
@@ -390,7 +443,7 @@ let handle st ~cmd ~args ~opts =
   | "attach", [ what ] ->
       let* t = attach st ~bottle:(bottle ()) what in
       Ok (said (attached_line t))
-  | "status", _ -> Ok (status st)
+  | "status", _ -> status st
   | "find", [ n ] ->
       let* s = session () in
       Result.map outcome (Session.find s n)
@@ -400,12 +453,26 @@ let handle st ~cmd ~args ~opts =
         (match List.assoc_opt (String.lowercase_ascii a) relations with Some r -> Session.next_relation s r | None -> Session.next_number s a)
   | "results", _ ->
       let* s = session () in
-      Result.map (fun (l : Session.listing) -> rows l.rows) (Session.results s ~all:(List.assoc_opt "all" opts = Some "true") ~from:1 ~limit:20 ~near:None)
-  | "set", [ row; v ] ->
+      let all = List.assoc_opt "all" opts = Some "true" and near = List.assoc_opt "near" opts in
+      let given k default = Option.fold ~none:default ~some:int_of_string (List.assoc_opt k opts) in
+      Result.map (listing ?near ~all) (Session.results s ~all ~from:(given "from" 1) ~limit:(given "n" 20) ~near)
+  | "keep", first :: rest ->
       let* s = session () in
-      let* d = Session.set s ~row:(Option.get (row_number row)) v in
-      st.wrote <- Some (written_json d.w);
-      Ok (said d.text)
+      let name = function [ n ] -> Some n | _ -> None in
+      Result.map said
+        (match (address first, rest) with
+        | Some addr, number :: more -> Session.keep_at s ~addr number ~name:(name more)
+        | _ -> Session.keep_row s ~row:(Option.get (row_number first)) ~name:(name rest))
+  | "kept", _ ->
+      let* s = session () in
+      Result.map kept (Session.kept s)
+  | "forget", [ name ] ->
+      let* s = session () in
+      Result.map said (Session.forget s name)
+  | "set", [ target; v ] ->
+      let* s = session () in
+      let* d = match row_number target with Some row -> Session.set s ~row v | None -> Session.set_kept s ~name:target v in
+      Ok (set_done st d)
   | "undo", _ ->
       let* s = session () in
       let* text, w = Session.undo s in
@@ -505,6 +572,17 @@ let rec loop st listener wake =
           loop st listener wake
         end
 
+(* MOTH_BUDGET_MB: a whole number of MiB from 1 to 65536; unset or empty, no budget *)
+let budget_from_env () =
+  match Sys.getenv_opt "MOTH_BUDGET_MB" with
+  | None | Some "" -> None
+  | Some v -> (
+      match int_of_string_opt v with
+      | Some n when is_digits v && n >= 1 && n <= 65536 -> Some n
+      | _ ->
+          say "ignoring MOTH_BUDGET_MB=%S: it must be a whole number from 1 to 65536" v;
+          None)
+
 let run ~home ~start_helper =
   let sock = match socket_path ~home with Ok p -> p | Error m -> failwith m in
   make_home home;
@@ -518,6 +596,7 @@ let run ~home ~start_helper =
       home;
       sock;
       start_helper;
+      budget_mb = budget_from_env ();
       conn = None;
       target = None;
       lost = false;
