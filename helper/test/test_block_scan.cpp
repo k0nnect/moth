@@ -48,10 +48,25 @@ TEST_CASE("matches with previous value") {
   CHECK_FALSE(matches({Pred::GtPrev}, ValueType::F32, bits((float)NAN), bits(1.0f)));
   CHECK(matches({Pred::EqPrev}, ValueType::F64, bits(1.5), bits(1.5)));
   CHECK(matches({Pred::NePrev}, ValueType::U8, 3, 4));
+  Pred moved = range(-1, 10); moved.moved = true;                       // differs as ne_prev decides
+  CHECK(matches(moved, F32, bits(2.0f), bits(1.0f))); CHECK_FALSE(matches(moved, F32, bits(2.0f), bits(2.0f)));
+  CHECK_FALSE(matches(moved, F32, bits(0.0f), bits(-0.0f))); CHECK(matches(moved, F32, bits(2.0f), bits((float)NAN)));
+  CHECK_FALSE(matches(moved, F32, bits(20.0f), bits(1.0f)));            // moved, out of range
+}
+TEST_CASE("a range with a floor skips tiny values and keeps exact zero") {
+  Buf b(64);
+  b.put<float>(0, 1.0f); b.put<int32_t>(4, 7);   // 7 read as a float is about 1e-44
+  b.put<float>(8, 1e-7f); b.put<float>(12, 2e-6f); b.put<float>(16, 0.0f); b.put<float>(20, -0.0f);
+  b.put<float>(24, -1e-7f); b.put<float>(28, -0.5f);
+  CHECK(run(b, 32, 0, {G("f", F32, 4, 0, range_floor(0, 2, 1e-6))})[0] == V{0, 12});
+  CHECK(run(b, 32, 0, {G("f", F32, 4, 0, range_floor(-1, 1, 1e-6))})[0] == V{12, 16, 20, 28});
+  CHECK(run(b, 32, 0, {G("f", F32, 4, 0, range(0, 2))})[0] == V{0, 4, 8, 12});   // no floor: as before
 }
 TEST_CASE("scan_block rejects previous-value predicates") {
   Buf b(8);
   CHECK_THROWS_AS(run(b, 8, 0, {G("p", I32, 4, 0, Pred{Pred::LtPrev})}), EngineError);
+  Pred moved = range(0, 2); moved.moved = true;
+  CHECK_THROWS_AS(run(b, 8, 0, {G("p", F32, 4, 0, moved)}), EngineError);
 }
 TEST_CASE("type helpers") {
   ValueType t;
@@ -123,19 +138,29 @@ TEST_CASE("a range finds exactly the values matches() accepts, for every type") 
       {-INFINITY, -1e300}, {-129, 128}, {-32769, 65536}, {-5, -2}, {1e-45, 1e-44},
       {-2147483648.5, 2147483647.5}, {4294967295.0, 4294967296.5}, {-9.3e18, 9.3e18},
       {1.8446744073709552e19, INFINITY}, {3.4028234663852886e38, INFINITY}};
+  // with a floor: 1e-6 over the first four for floats, and beyond the brief, every type, a floor of
+  // 2.5 and the range (-5, 5) too, so integer floors and a gap inside the range are covered
+  const std::vector<std::pair<double, double>> floored = {{0, 2}, {-1, 1}, {-2, 0}, {5, 7}, {-5, 5}};
+  const double floors[] = {1e-6, 2.5};
   for (ValueType t : {I8, U8, I16, U16, I32, U32, I64, U64, F32, F64}) {
-    const std::vector<uint64_t> ps = patterns(t, ranges);
+    std::vector<std::pair<double, double>> bounds = ranges;
+    bounds.insert(bounds.end(), floored.begin(), floored.end());
+    for (double f : floors) bounds.push_back({-f, f});  // values next to the floor
+    const std::vector<uint64_t> ps = patterns(t, bounds);
     const size_t w = width_of(t);
     Buf b(ps.size() * w);
     for (size_t i = 0; i < ps.size(); i++) std::memcpy(b.d.data() + i * w, &ps[i], w);  // little-endian host
-    for (auto [lo, hi] : ranges) {
+    auto check = [&](const Pred& p) {
       V want;
       for (size_t i = 0; i < ps.size(); i++)
-        if (matches(range(lo, hi), t, ps[i], 0)) want.push_back(static_cast<uint32_t>(i * w));
-      const V got = run(b, b.d.size(), 0, {G("r", t, static_cast<uint32_t>(w), 0, range(lo, hi))})[0];
-      INFO("type ", static_cast<int>(t), ", range (", lo, ", ", hi, ")");
+        if (matches(p, t, ps[i], 0)) want.push_back(static_cast<uint32_t>(i * w));
+      const V got = run(b, b.d.size(), 0, {G("r", t, static_cast<uint32_t>(w), 0, p)})[0];
+      INFO("type ", static_cast<int>(t), ", range (", p.lo, ", ", p.hi, "), floor ", p.floor);
       CHECK(got.size() == want.size());
       CHECK(got == want);
-    }
+    };
+    for (auto [lo, hi] : ranges) check(range(lo, hi));
+    for (double f : floors)
+      for (auto [lo, hi] : floored) check(range_floor(lo, hi, f));
   }
 }

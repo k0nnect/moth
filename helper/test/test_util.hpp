@@ -27,6 +27,7 @@ template <class T> uint64_t bits(T v) {
 
 inline Pred eq(uint64_t b) { Pred p{Pred::Eq}; p.bits = b; return p; }
 inline Pred range(double lo, double hi) { Pred p{Pred::Range}; p.lo = lo; p.hi = hi; return p; }
+inline Pred range_floor(double lo, double hi, double floor) { Pred p = range(lo, hi); p.floor = floor; return p; }
 
 inline GroupSpec G(std::string id, ValueType t, uint32_t align, uint32_t excl, Pred p) {
   return GroupSpec{std::move(id), t, align, excl, p};

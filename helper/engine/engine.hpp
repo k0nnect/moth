@@ -59,8 +59,9 @@ class Engine {
   // replaces only groups with a listed id, and the listed groups then follow the others in
   // groups(). Returns the listed groups in request order. If the storage is then over
   // budget_bytes, listed groups are untracked from the last one backwards until it fits.
-  // Throws EngineError: bad_request (a previous-value predicate, align 0, an id listed twice),
-  // nothing changed; target_gone (the process is not alive), and the replaced groups are gone.
+  // Throws EngineError: bad_request (a previous-value predicate or a moved range, align 0, an id
+  // listed twice), nothing changed; target_gone (the process is not alive), and the replaced
+  // groups are gone.
   std::vector<GroupInfo> scan(const std::vector<GroupSpec>& specs, bool keep, ScanStats& stats);
 
   // Positions [offset, offset + limit) of a group in address order, with their values read now.
@@ -80,8 +81,8 @@ class Engine {
   // have before would take storage over budget_bytes.
   // Throws EngineError, with nothing changed: no_such_group (an unknown id, or an untracked
   // group, which has no positions to narrow), bad_request (an id listed twice), no_values (a
-  // previous-value predicate on a group without values), target_gone (the process is not alive
-  // before or after the reads).
+  // previous-value predicate or a moved range on a group without values), target_gone (the
+  // process is not alive before or after the reads).
   bool narrow(const std::vector<NarrowItem>& items, bool atomic, std::vector<GroupInfo>& out, ScanStats& stats);
 
   // Removes the listed groups. Throws EngineError no_such_group, removing nothing, if one is unknown.

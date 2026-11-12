@@ -1,5 +1,6 @@
 #include "engine/block_scan.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
 #include <limits>
@@ -64,6 +65,9 @@ struct RangeKeys {
     if constexpr (std::is_floating_point_v<T>) return key(std::bit_cast<U>(std::numeric_limits<T>::infinity()));
     else return U(~U{0});
   }
+  // the keys of the values equal to zero: -0 and +0, adjacent, for floats; 0 otherwise
+  static U zero_first() { return std::is_floating_point_v<T> ? key(kSign) : key(0); }
+  static U zero_last() { return key(0); }
 
   // Sets [first, last] to the keys whose values v have lo < v < hi; false if there are none.
   static bool interval(double lo, double hi, U& first, U& last) {
@@ -86,6 +90,10 @@ struct RangeKeys {
   }
 };
 
+// A floor splits the range's interval into at most three: (lo, -floor], the zero keys, and
+// [floor, hi). The loop tests that as the range's interval less the gap (-floor, floor) except
+// the zero keys, so a value outside the range still costs one comparison. A range with no floor,
+// or none of whose values the floor refuses, keeps the single-interval loop.
 template <class T>
 void scan_range(const uint8_t* data, size_t end, uint64_t base, const GroupSpec& g, std::vector<uint32_t>& out) {
   using K = RangeKeys<T>;
@@ -95,6 +103,26 @@ void scan_range(const uint8_t* data, size_t end, uint64_t base, const GroupSpec&
   const U width = U(last - first);
   const size_t step = g.align;
   const uint64_t xa = g.exclude_align;
+  U gap_first, gap_last;
+  if (g.pred.floor > 0 && K::interval(-g.pred.floor, g.pred.floor, gap_first, gap_last)) {
+    // the part of the range the floor refuses, unless it is all zero keys or none at all
+    gap_first = std::max(gap_first, first);
+    gap_last = std::min(gap_last, last);
+    const U zero = K::zero_first(), zero_last = K::zero_last(), zero_width = U(zero_last - zero);
+    if (gap_first <= gap_last && (gap_first < zero || gap_last > zero_last)) {
+      const U gap_width = U(gap_last - gap_first);
+      for (size_t o = first_aligned(base, g.align); o < end; o += step) {
+        U bits;
+        std::memcpy(&bits, data + o, sizeof(U));  // little-endian host
+        const U k = K::key(bits);
+        if (U(k - first) > width) continue;
+        if (U(k - gap_first) <= gap_width && U(k - zero) > zero_width) continue;
+        if (xa != 0 && (base + o) % xa == 0) continue;
+        out.push_back(static_cast<uint32_t>(o));
+      }
+      return;
+    }
+  }
   for (size_t o = first_aligned(base, g.align); o < end; o += step) {
     U bits;
     std::memcpy(&bits, data + o, sizeof(U));  // little-endian host
@@ -133,7 +161,7 @@ void scan_group(const uint8_t* data, size_t end, uint64_t base, const GroupSpec&
 void scan_block(const uint8_t* data, size_t len, size_t limit, uint64_t base,
                 std::span<const GroupSpec> groups, std::vector<std::vector<uint32_t>>& out) {
   for (const auto& g : groups) {
-    if (g.pred.op != Pred::Eq && g.pred.op != Pred::Range)
+    if (g.pred.op != Pred::Eq && (g.pred.op != Pred::Range || g.pred.moved))
       throw EngineError("bad_request", "previous-value predicate cannot scan a single buffer");
     if (g.align == 0) throw EngineError("bad_request", "align must be positive");
   }

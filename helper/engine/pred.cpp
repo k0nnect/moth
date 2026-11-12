@@ -1,5 +1,6 @@
 #include "engine/pred.hpp"
 
+#include <cmath>
 #include <cstring>
 
 namespace moth {
@@ -84,7 +85,9 @@ bool matches(const Pred& p, ValueType t, uint64_t cur, uint64_t prev) {
     case Pred::Eq: return (cur & m) == (p.bits & m);
     case Pred::Range: {
       double v = as_double(t, cur);
-      return v > p.lo && v < p.hi;  // NaN fails both
+      if (!(v > p.lo && v < p.hi)) return false;  // NaN fails both
+      if (p.floor > 0 && v != 0 && std::fabs(v) < p.floor) return false;
+      return !p.moved || compare(t, cur, prev) != 0;
     }
     case Pred::LtPrev: return compare(t, cur, prev) == -1;
     case Pred::GtPrev: return compare(t, cur, prev) == 1;

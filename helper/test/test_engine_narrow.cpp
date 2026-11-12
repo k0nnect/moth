@@ -39,6 +39,21 @@ TEST_CASE("relation without stored values is refused, then allowed once small") 
   CHECK(e.narrow({{"a", eq(85)}}, true, g, s)); CHECK(g[0].has_values);
   m.poke<int32_t>(0x10000, 60); CHECK(e.narrow({{"a", {Pred::LtPrev}}}, true, g, s)); CHECK(g[0].count == 1);
 }
+TEST_CASE("a moved range drops values that pass the range without having changed") {
+  FakeMemory m; m.add_region(0x10000, 4096); m.poke<float>(0x10000, 5.0f); m.poke<float>(0x10010, 5.5f);
+  Engine e(m); ScanStats s; std::vector<GroupInfo> g;
+  e.scan({G("f", F32, 4, 0, range(4, 6))}, false, s); CHECK(e.groups()[0].count == 2);
+  m.poke<float>(0x10000, 6.0f);
+  Pred p = range(5, 7); p.moved = true;
+  CHECK(e.narrow({{"f", p}}, true, g, s)); CHECK(g[0].count == 1); CHECK(e.peek("f", 0, 9)[0].addr == 0x10000);
+}
+TEST_CASE("moved needs stored values and cannot start a scan") {
+  FakeMemory m; three(m); Engine e(m, {.value_cap = 2}); ScanStats s; std::vector<GroupInfo> g;
+  Pred p = range(99, 101); p.moved = true;
+  CHECK_THROWS_WITH_AS(e.scan({G("a", I32, 4, 0, p)}, false, s), doctest::Contains("bad_request"), EngineError);
+  e.scan({G("a", I32, 4, 0, eq(100))}, false, s);
+  CHECK_THROWS_WITH_AS(e.narrow({{"a", p}}, true, g, s), doctest::Contains("no_values"), EngineError);
+}
 TEST_CASE("freed memory loses candidates instead of failing") {
   FakeMemory m; three(m); m.add_region(0x50000, 4096); m.poke<int32_t>(0x50000, 100);
   Engine e(m); ScanStats s; std::vector<GroupInfo> g; e.scan({G("a", I32, 4, 0, eq(100))}, false, s);

@@ -75,13 +75,14 @@ size_t read_spans(ProcessMemory& mem, uint64_t addr, uint8_t* buf, size_t at, si
 }
 
 bool compares_with_last(const Pred& p) {
-  return p.op == Pred::LtPrev || p.op == Pred::GtPrev || p.op == Pred::EqPrev || p.op == Pred::NePrev;
+  return p.op == Pred::LtPrev || p.op == Pred::GtPrev || p.op == Pred::EqPrev || p.op == Pred::NePrev ||
+         (p.op == Pred::Range && p.moved);
 }
 
 void validate(const std::vector<GroupSpec>& specs) {
   for (size_t i = 0; i < specs.size(); i++) {
     const GroupSpec& g = specs[i];
-    if (g.pred.op != Pred::Eq && g.pred.op != Pred::Range)
+    if (compares_with_last(g.pred))
       throw EngineError("bad_request", "a first scan needs a value or a range, not a comparison with the last one");
     if (g.align == 0) throw EngineError("bad_request", "align must be positive");
     for (size_t j = 0; j < i; j++)

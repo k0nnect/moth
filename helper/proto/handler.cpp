@@ -188,7 +188,8 @@ std::string hex_bits(uint64_t bits, ValueType t) {
   return s;
 }
 
-// A predicate for a group of type t. allow_prev: previous-value predicates are accepted (narrow only).
+// A predicate for a group of type t. allow_prev: previous-value predicates, and a range with
+// "moved":true, are accepted (narrow only).
 Pred parse_pred(const json& p, ValueType t, bool allow_prev) {
   if (!p.is_object()) bad("\"pred\" must be an object");
   const std::string& op = get_str(p, "op");
@@ -205,6 +206,16 @@ Pred parse_pred(const json& p, ValueType t, bool allow_prev) {
     out.op = Pred::Range;
     out.lo = lo.get<double>();
     out.hi = hi.get<double>();
+    // optional: a floor on the magnitude, and moved (narrow only)
+    if (auto f = p.find("floor"); f != p.end()) {
+      if (!f->is_number() || !(f->get<double>() > 0)) bad("\"floor\" must be a number above 0");
+      out.floor = f->get<double>();
+    }
+    if (auto m = p.find("moved"); m != p.end()) {
+      if (!m->is_boolean()) bad("\"moved\" must be true or false");
+      out.moved = m->get<bool>();
+      if (out.moved && !allow_prev) bad("\"moved\" is not allowed in a scan: there is no last value yet");
+    }
   } else if (op == "lt_prev" || op == "gt_prev" || op == "eq_prev" || op == "ne_prev") {
     if (!allow_prev) bad("a previous-value predicate is not allowed in a scan");
     out.op = op == "lt_prev" ? Pred::LtPrev : op == "gt_prev" ? Pred::GtPrev : op == "eq_prev" ? Pred::EqPrev : Pred::NePrev;

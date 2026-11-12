@@ -105,6 +105,23 @@ TEST_CASE("scan and narrow validation") {
   CHECK(code(h, R"({"op":"scan","keep":false,"budget_mb":0,"groups":[]})") == "bad_request");
 }
 
+TEST_CASE("range floor and moved on the wire") {
+  FakePlatform p; p.add(1, "t.exe", 64); auto& m = p.mem(1); m.add_region(0x10000, 4096);
+  m.poke<float>(0x10000, 1.0f); m.poke<int32_t>(0x10004, 7);           // 7 read as a float is about 1e-44
+  Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
+  auto scan = [&](const std::string& pred) {
+    return J(h.handle_line(R"({"op":"scan","keep":false,"groups":[{"id":"f","type":"f32","align":4,"exclude_align":0,"pred":)" + pred + "}]}"));
+  };
+  CHECK(scan(R"({"op":"range","lo":0.0,"hi":2.0,"floor":0.000001})")["groups"][0]["count"] == 1);
+  CHECK(scan(R"({"op":"range","lo":0.0,"hi":2.0,"moved":true})")["error"]["code"] == "bad_request");
+  CHECK(scan(R"({"op":"range","lo":0.0,"hi":2.0,"floor":-1})")["error"]["code"] == "bad_request");
+  CHECK(scan(R"({"op":"range","lo":0.0,"hi":2.0,"moved":"yes"})")["error"]["code"] == "bad_request");
+  CHECK(scan(R"({"op":"range","lo":0.0,"hi":2.0})")["groups"][0]["count"] == 2);
+  m.poke<float>(0x10000, 1.5f);                                         // beyond the brief: moved in a narrow
+  auto nr = J(h.handle_line(R"({"op":"narrow","atomic":true,"groups":[{"id":"f","pred":{"op":"range","lo":0.0,"hi":2.0,"moved":true}}]})"));
+  CHECK(nr["applied"] == true); CHECK(nr["groups"][0]["count"] == 1);
+}
+
 TEST_CASE("peek limit is capped at 1000") {
   FakePlatform p; p.add(1, "t.exe", 64); p.mem(1).add_region(0x10000, 16384);  // 4096 zero i32 slots
   Handler h(p); h.handle_line(R"({"op":"attach","pid":1})");
