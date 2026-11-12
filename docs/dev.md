@@ -16,7 +16,7 @@ This runs `opam init --bare --no-setup`, creates the switch in this directory an
 
     make build    # dune build, copies the moth executable to bin/moth
     make test     # native C++ unit tests (build/native), then dune test
-    make helper   # Windows helper, 64-bit and 32-bit, into build/win64 and build/win32 (bin/ later)
+    make helper   # the Windows helper (x86_64 only) and the stand-in game (64-bit and 32-bit), into bin/
     make clean
 
 Variables: `WINE` (path to CrossOver's wine) and `MOTH_TEST_BOTTLE` (default `uhmm`), both overridable on the command line.
@@ -27,15 +27,26 @@ Build output (`_build/`, `_opam/`, `build/`, `bin/`) is gitignored.
 
 `MOTH_BUDGET_MB` is read once, when the daemon starts. A whole number from 1 to 65536 is the most memory, in MiB, the helper may use to hold a hunt's candidates; every `find` sends it with its scan. Past it, the helper stops tracking groups from the end of the hunt's list (the `untracked` note) and searches them again on the next number. Unset or empty, the helper's own budget holds (1536 MiB). Anything else is ignored, with a line in `core.log`. A running daemon keeps the value it started with: `moth stop` first, then run the next command with the new value.
 
-`MOTH_SNAPSHOT_MB` is read the same way, once, when the daemon starts: a whole number from 1 to 1048576 is the most memory, in MiB, that a `snapshot` may take. The default is 8192. A snapshot costs as much memory as the game's writable memory, held by the helper until the hunt has narrowed. While a snapshot hunt narrows, the helper can briefly hold about the snapshot plus twice the budget. Anything else is ignored, with a line in `core.log`.
+`MOTH_SNAPSHOT_MB` is read the same way, once, when the daemon starts: a whole number from 1 to 1048576 is the most memory, in MiB, that a `snapshot` may take. The default is 8192. A snapshot costs as much memory as the game's writable memory, held by the helper until the hunt has narrowed: it is released once every group is at or under 64,000,000 places and its values fit the budget. While a snapshot hunt narrows, the helper can briefly hold about the snapshot plus twice the budget. A snapshot hunt follows aligned values in six forms: 4-byte and 8-byte whole numbers and decimals, 2-byte whole numbers, and 1-byte whole numbers in the wider tier. A value at an odd address is found by typing its number, not by how it moves. Above about 5.3 GiB of writable memory, the 1-byte form is not followed by change at the default budget. Apart from snapshots, a scan with very many matches (a dense scan) can briefly run about 2 to 3.5 GiB over the budget while it stores their values. Anything else in `MOTH_SNAPSHOT_MB` is ignored, with a line in `core.log`.
+
+## kept values
+
+`moth kept --json` gives each kept value's `set_to` and `put_back`. `set_to` is what the value's newest write wrote, shown as the value shows numbers, or null when there is none. Its newest write is the newest that `undo` can still reverse at its address and as its value type, made by row or by name, before or after `keep`. `put_back` is true when the value reads as it did before that write: the bytes there now are the ones the write replaced, not the ones it wrote (never when it can't be read). The text form says `you set it to <set_to>; it is back to what it was before.` after the value's line. Neither says why; the game working the value out again and ordinary play look the same.
 
 ## engine speed
 
     make bench-native   # builds build/native/moth_bench and runs it
 
-It prints `scan: <x> s/GB, narrow: <y> ms` for a first scan and one narrow over a seeded 256 MiB fake memory, using the twelve groups a search for the whole number 100 makes. Each figure is the best of three rounds, and GB means 2^30 bytes. `build/native/moth_bench <workers>` tries another worker count. The default is 0 (auto), which is what the helper uses.
+It prints four lines over a seeded 256 MiB fake memory. Each figure is the best of three rounds, and GB means 2^30 bytes.
 
-The figure is only a relative guide. Here, reading memory is a memcpy, so it measures the engine's own comparison work on Apple Silicon. The real helper is x86_64 code running under Rosetta inside wine. It reads memory through wine on one thread (`make bench`, below, measures the whole of it). Scanning reads on one thread and compares on the workers, so comparisons overlap the reads.
+- `scan: <x> s/GB, narrow: <y> ms`: a first scan and one narrow, using the twelve groups a search for the whole number 100 makes.
+- `dense narrow: <a> s/GB on 1 worker, <b> s/GB on <n> workers`: a `same` step over every aligned 4-byte place, which keeps them all and stores their values again.
+- `snapshot: <c> s/GB, first same step: <d> s/GB on <n> workers`: a snapshot with the six groups a snapshot hunt carries, then a first `same` step over them.
+- `51M u8 values gained: <e> s/GB from a snapshot, <f> s/GB from a scan`: a step that leaves a 1-byte group with about 51 million places, which then take their values, once after a snapshot and once after a scan.
+
+`build/native/moth_bench <workers>` tries another worker count for the first line. The default is 0 (auto), which is what the helper uses.
+
+The figures are only a relative guide. Here, reading memory is a memcpy, so it measures the engine's own comparison work on Apple Silicon. The real helper is x86_64 code running under Rosetta inside wine. It reads memory through wine on one thread (`make bench`, below, measures the whole of it). Scanning reads on one thread and compares on the workers, so comparisons overlap the reads.
 
 Measured on 2026-11-11 on an Apple M5 (10 cores), where auto means 8 workers:
 
