@@ -579,7 +579,8 @@ let no_number () =
       set_row r "99";
       expect t "stamina" "99")
 
-(* 26: the first step says nothing moved, which keeps nearly everything; the next one finds it *)
+(* 26: the first step says nothing moved, which keeps nearly everything; the steps after it,
+   by how stamina moved, find it *)
 let same_first () =
   with_target (fun t ->
       let stamina = Target_ctl.var t "stamina" in
@@ -587,6 +588,8 @@ let same_first () =
       ignore (next "same");
       Target_ctl.set t "stamina" "40";
       ignore (next "down");
+      Target_ctl.set t "stamina" "45";
+      ignore (next "up");
       let rows = (page ~all:true ~n:200 ()).rows in
       check (List.exists (fun r -> r.addr = stamina.addr) rows) "stamina (0x%Lx) is not listed. results: %s" stamina.addr (show_rows rows))
 
