@@ -301,3 +301,55 @@ Skill points were set from 5 to 1 with `moth set points 1` first.
 ## also seen in this session (not part of this proof)
 
 - With the stage 1b build, before the work above: writing a skill's own numbers (value, maximum, rank, in both copies of the character sheet) held, but a dialogue check's tooltip ignored them. Raising the attribute the skill is built from (Psyche) changed the check from 3% to 97%. All fourteen values were put back afterwards.
+
+# disco elysium, stage 2a
+
+Date: 2026-11-13. Done with Chris at the keyboard, on Day 2 of the same playthrough.
+
+## setup
+
+- Game and machine as above. The game had been running since the evening before (Windows pid 204).
+- moth: branch `stage-2a-window` at `e59d0ff`, default `MOTH_HOME`. The service had been attached from a terminal the night before; `bin/moth-app` was opened at 15:56 and came up already attached.
+- Chris worked the window. Commands from "the terminal" below were typed by the assistant in a second terminal on the same service.
+- How things were watched: `moth log` for what was sent and when; from step 3 on, `moth watch --json` with a script that also photographed the moth window (by window id) while a command ran; for the last step a script that waited for the game's macOS process to go and then photographed the window every third of a second. Chris was not asked to report numbers after the first hunt.
+
+## result
+
+| check | bar | seen | verdict |
+| --- | --- | --- | --- |
+| a hunt by clicking, no command typed | done | experience found (32, then 42), kept, typed over to 90, and the game showed 90 | met |
+| a hunt with no number, no command typed | done | six steps by button took 99,365,278 rows to 105,361 on the game clock; Chris stopped there, so no value was found | not finished |
+| during a first scan the window can be moved and the kept panel scrolled | Chris's word | "windows moves while dragging in scan yeh". Scrolling the kept panel was not tried (nothing was kept yet) | moved: met. scrolled: not tried |
+| a command from the terminal shows in the window | within one second | a photograph 1.0 s after `moth set xp 97` showed 97 in the list; one 1.0 s after `moth set 1 98` showed 98 in the list and in the kept panel and the line `set #1 to 98 (was 97)` | met, with the window in view (see problem 1) |
+| while a scan runs, a click starts nothing and the window says what is running | both | during `moth find 1` from the terminal (6.5 s) every button was disabled and the line read `working: find 1 (user)…` in all eight photographs. No click was made | met as far as it was tried |
+| after the game quits, the window says so and nothing can be written | within two seconds | photograph at 0.33 s: unchanged. At 0.66 s: `no game attached`, both lists empty, line `not attached. disco.exe closed.`, every button disabled except `pick a game` and `undo last change` | met (see problem 5) |
+| idle, with a list in view | under 5% of one core | `ps -o %cpu` 0.0, 0.0, 0.0 five seconds apart; `top` 0.0 four times. 48 rows listed, one value kept | met |
+
+## the steps
+
+1. **Pick the game.** `detach` at 15:57:11, then `pick a game`, Disco Elysium, disco.exe: attached at 15:57:22.
+2. **Experience.** `find 32` answered at 15:57:56 with 6,986,637 rows. After a dialogue gave experience, `next 42` left 48 (2 whole number, 8 decimal, 37 two-byte, 1 eight-byte). It was sent three times (16:01:35, 16:02:09, 16:02:11), each with the same answer. Chris selected row 2 (`0x6c55dfb8`, whole number) and pressed `keep`: `kept #2 as xp (42, whole number)`. He typed 90 over it in the kept list: `set xp to 90 (was 42)`. The character sheet showed 90.
+3. **No number.** `no number` at 18:00:17: `snapshot of 4.0 gb taken`. Chris then detached, picked the game again and pressed `no number` again (18:00:42). The steps that followed, on the clock in the corner of the screen (talk until it moves, `went up`; walk without talking, `same`):
+
+| step | time to answer | rows left |
+| --- | --- | --- |
+| `went up` | not timed | 99,365,278 |
+| `same` | 1.72 s | 85,749,676 |
+| `went up` | 0.89 s | 1,799,838 |
+| `same` | 0.27 s | 1,402,630 |
+| `went up` | 0.20 s | 107,678 |
+| `same` | 0.04 s | 105,361 |
+
+   The two photographs taken during the first `same` show every button disabled and the line `working: next same (user)…`.
+4. **Both hands.** From the terminal: `moth set xp 95`, `96`, `95` while the window was covered by another app (see problem 1). With the window in view: `moth set xp 97`, in the window a second later. Then the case the review found: `moth results --near xp` listed `#1  97  0x6c55dfb8`; three seconds later (the window polls every second and its own row 1 is `0x7b746e28`) `moth set 1 98` answered `set #1 to 98 (was 97)`. `moth kept`: `xp  98  0x6c55dfb8`. The window's row 1 still read 32. `moth find 1` from the terminal: 103,551,059 rows in 6.5 s. `moth bottles` was not run.
+5. **The game goes away.** xp had been kept again from the terminal (`moth keep 0x6c55dfb8 98 xp`), because detaching in step 3 had emptied the kept list. Chris quit the game from its menu. The game's process was gone at 18:19:44.22; the service's `not attached. disco.exe closed.` came 0.50 s later. From the terminal afterwards, `moth undo`, `moth set xp 5` and `moth kept` each answered `not attached. run: moth attach --bottle <bottle> <game.exe>`.
+
+## problems found
+
+1. A window that is completely covered by another app could not be shown to follow. Its picture still read 90 half a minute after three changes from the terminal. Whether the window was behind or macOS simply had not redrawn it is not known; when Chris brought it forward it read 95, the current value.
+2. `moth log` typed in a terminal puts its first line of output, a raw history row, in the window's line. Four seconds after the game closed this replaced `not attached. disco.exe closed.` with `95323  2026-11-13 18:19:48  user  status  not attached`.
+3. The line after a row write from the terminal says `set #1 to 98`, and that row is #2 in the window's own list.
+4. The match count is shown twice after a step (under the buttons with its breakdown, and above the list), and the `kind` column cuts off every label longer than "whole number" (`whole numb…`, `decimal (8-…`).
+5. With no game attached `undo last change` stays enabled. The service refuses it, so nothing is written.
+6. Pressing Return again in the number box sends the same `next` again. Three were sent for 42.
+7. After a short no-number hunt the list opens on 200 of 105,361 rows that read 0, as in stage 1c's problem 4: nothing in the window sorts or hides rows by value.
