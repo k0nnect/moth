@@ -79,7 +79,7 @@ type state = {
   mutable seq : int; (* the newest event's number *)
   mutable wrote : Yojson.Safe.t option; (* the write this request made, for its event *)
   mutable held : Yojson.Safe.t option; (* whether this request's set held, for its event *)
-  mutable closed : bool; (* this request found the game closed, so it is recorded however it asked *)
+  mutable closed : bool; (* this request's status found the game closed *)
   mutable owned : (Unix.file_descr * Unix.file_descr) option; (* listener and lock, while serving *)
   mutable watchers : watcher list; (* oldest first *)
 }
@@ -607,15 +607,18 @@ let internal_error st cmd e =
 let reads = [ "bottles"; "ps"; "status"; "results"; "kept"; "log"; "games" ]
 
 (* A recorded request is told to watchers as it starts and again, as its event, once it ends. An
-   unrecorded one takes no seq and tells nobody, unless it is a status that found the game closed. *)
+   unrecorded one takes no seq and tells nobody, unless it made the daemon let go of the game or
+   the helper (the game closed, target_gone, helper_lost): that one is recorded all the same, so
+   watchers learn why the game went, and its event comes with no busy line before it. *)
 let answer st = function
   | Error (rid, msg) -> reply rid (Error msg)
   | Ok r when not (r.record || List.mem r.cmd reads) -> reply r.rid (Error "only commands that change nothing can go unrecorded")
   | Ok r ->
       if r.record then feed st (`Assoc [ ("busy", `Assoc [ ("actor", `String r.actor); ("cmd", `String r.cmd); ("args", `List (List.map (fun a -> `String a) r.args)) ]) ]);
       let result = try handle st ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
+      let lost_the_game = st.closed || st.lost || st.gone in
       settle st;
-      if r.record || st.closed then record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
+      if r.record || lost_the_game then record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
       st.wrote <- None;
       st.held <- None;
       st.closed <- false;

@@ -3,7 +3,8 @@
     time, in arrival order, and appends one line per recorded request to [home]/events.jsonl.
     A [watch] connection stays open: up to 16 watchers are sent a line as each recorded request
     starts and its event once it ends, and one that can't take a line at once is let go. A read
-    sent with [record: false] leaves no line and tells no watcher (see docs/dev.md). *)
+    sent with [record: false] leaves no line and tells no watcher, unless it made the daemon let
+    go of the game or the helper (see docs/dev.md). *)
 
 (** starts a helper inside the named bottle *)
 type start_helper = bottle:string -> (Helper_api.helper, string) result

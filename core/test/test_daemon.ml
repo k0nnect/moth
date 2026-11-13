@@ -1213,6 +1213,42 @@ let a_closed_game_is_recorded () =
       check_int "not recorded" 2 (List.length (stored d));
       unwatch w)
 
+(* An unrecorded read that makes the daemon let go of the game or its helper is recorded all the
+   same, and its event, with no busy line before it, reaches watchers. [lose] makes the helper
+   answer the read that way; [keeping] keeps a value first, for kept to read. *)
+let a_read_that_loses_the_game ?(keeping = false) cmd lose answer () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 2;
+      if keeping then begin
+        Fake_helper.queue_peek f "i32" (threes 2);
+        ignore (text (call d "results" []));
+        ignore (text (call d "keep" [ "1"; "xp" ]))
+      end;
+      let before = List.length (stored d) in
+      let w = watcher d in
+      check_json "the reply" (watching before) (next_line w);
+      lose fk;
+      check_err "the answer" answer (unrecorded d cmd []);
+      let evs = stored d in
+      check_int "recorded all the same" (before + 1) (List.length evs);
+      let ev = List.nth evs before in
+      let open Yojson.Safe.Util in
+      check_str "as the read" cmd (member "cmd" ev |> to_string);
+      check_int "with the next seq" (before + 1) (member "seq" ev |> to_int);
+      check_str "saying why" answer (member "summary" ev |> to_string);
+      check_json "the watcher hears it, with no busy line before it" (event ev) (next_line w);
+      check_str "status, unrecorded" "not attached" (text (unrecorded d "status" []));
+      check_int "which is not recorded" (before + 1) (List.length (stored d));
+      unwatch w)
+
+let game_closed = "the game closed. attach again once it's running."
+let lost_contact = "lost contact with moth's helper. attach again."
+
+(* the helper answers its next [op] (peek or read) with the error [code] *)
+let answers_next op code (fk : fake) = Fake_helper.queue_error fk.script op { code; message = "" }
+
 let sixteen_watchers () =
   let _, sh = fake () in
   with_daemon sh (fun d ->
@@ -1393,6 +1429,11 @@ let () =
           t "reads that leave no trace" reads_that_leave_no_trace;
           t "only reads go unrecorded" only_reads_go_unrecorded;
           t "a closed game is recorded" a_closed_game_is_recorded;
+          t "unrecorded results, target_gone: recorded" (a_read_that_loses_the_game "results" (answers_next "peek" "target_gone") game_closed);
+          t "unrecorded results, helper_lost: recorded" (a_read_that_loses_the_game "results" (answers_next "peek" "helper_lost") lost_contact);
+          t "unrecorded kept, target_gone: recorded" (a_read_that_loses_the_game ~keeping:true "kept" (answers_next "read" "target_gone") game_closed);
+          t "unrecorded kept, helper_lost: recorded" (a_read_that_loses_the_game ~keeping:true "kept" (answers_next "read" "helper_lost") lost_contact);
+          t "unrecorded status, helper_lost: recorded" (a_read_that_loses_the_game "status" (fun fk -> fk.status_lost <- true) lost_contact);
           t "sixteen watchers" sixteen_watchers;
           t "a watcher that never reads" a_watcher_that_never_reads;
           t "Client.watch with no daemon" watch_with_no_daemon;
