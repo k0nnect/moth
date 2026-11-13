@@ -1,7 +1,7 @@
 (* End to end in a bottle: the moth command, its daemon and the helper against the stand-in game
    (tests/target/target.cpp), all running in the test bottle MOTH_TEST_BOTTLE through WINE.
    Scenarios drive [bin/moth --json ...] as a subprocess and check its replies against what the
-   target reports; a few speak to the daemon's socket themselves, and two drive the window
+   target reports; a few speak to the daemon's socket themselves, and four drive the window
    through <dir>/../build/app/it_app. One line per scenario; the exit code is 1 when any
    scenario fails.
 
@@ -884,12 +884,58 @@ let list_follows () =
       let on_line = function
         | "listed" ->
             Target_ctl.set t "points" "4";
-            ignore (next "4");
+            ignore (moth ~timeout:60. [ "next"; "4" ]);
             narrowed := true
         | _ -> ()
       in
       app_ok ~on_line [ "follow"; bottle (); "moth-target.exe"; "3"; hex points.addr; "4" ];
       check !narrowed "it_app never printed listed")
+
+(* 35: two hands on rows. While the window shows a list and polls it, the command line lists near
+   points and writes its row 1: the window's own reads must not change which row that is, so the
+   write lands on points, and the window's list shows it *)
+let two_hands () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      let points = Target_ctl.var t "points" in
+      let wrote = ref false in
+      let on_line = function
+        | "listed" ->
+            Unix.sleepf 2.;
+            let near = (page ~near:(hex points.addr) ()).rows in
+            (match near with
+            | r :: _ -> check (r.n = 1 && r.addr = points.addr) "row 1 near points is %s, not at points' address 0x%Lx" (show_rows [ r ]) points.addr
+            | [] -> failf "nothing listed near points' address 0x%Lx" points.addr);
+            Unix.sleepf 2.;
+            let said = to_string (member "message" (moth ~timeout:60. [ "set"; "1"; "4" ])) in
+            check (String.starts_with ~prefix:"set #1 to 4" said) "moth set 1 4 said: %s" said;
+            expect t "points" "4";
+            wrote := true
+        | _ -> ()
+      in
+      app_ok ~on_line [ "follow"; bottle (); "moth-target.exe"; "3"; hex points.addr; "4" ];
+      check !wrote "it_app never printed listed")
+
+(* 36: the game goes away while the window shows its hunt: the window says so in the core's words,
+   lists and keeps nothing, and a find from the search bar is refused; nothing writes *)
+let game_goes () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      let points = Target_ctl.var t "points" in
+      let events () = to_list (moth [ "log"; "-n"; "1000" ]) in
+      let before = match events () with ev :: _ -> to_int (member "seq" ev) | [] -> 0 in
+      let quit = ref false in
+      let on_line = function
+        | "listed" ->
+            Target_ctl.quit t;
+            quit := true
+        | _ -> ()
+      in
+      app_ok ~on_line [ "gone"; bottle (); "moth-target.exe"; "3"; hex points.addr; "0" ];
+      check !quit "it_app never printed listed";
+      let since = List.filter (fun ev -> to_int (member "seq" ev) > before) (events ()) in
+      let writes = List.filter (fun ev -> List.mem (member "cmd" ev) [ `String "set"; `String "keep"; `String "undo" ]) since in
+      check (writes = []) "something wrote: %s" (show (`List writes)))
 
 let scenarios =
   [
@@ -927,6 +973,8 @@ let scenarios =
     (32, "launch", launched);
     (33, "the window", window);
     (34, "the list follows", list_follows);
+    (35, "two hands on rows", two_hands);
+    (36, "the game goes away", game_goes);
   ]
 
 let rec rm p =

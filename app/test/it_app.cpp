@@ -1,16 +1,23 @@
-// The real window against the real core and a real game, for the end-to-end scenarios 33 and 34
+// The real window against the real core and a real game, for the end-to-end scenarios 33 to 36
 // (core/integration/it_main.ml), which run it. Not a ctest test.
 //
-//   it_app <edit|follow> <bottle> <exe name> <number> <0xaddr> <new number>
+//   it_app <edit|follow|gone> <bottle> <exe name> <number> <0xaddr> <new number>
 //
 // MOTH_HOME and MOTH_BIN come from the environment (it refuses to run without them, so it never
 // touches the default home), and the window is offscreen. It attaches from the game bar, types
 // <number> and Return, and finds the result at <0xaddr> that is a whole number, reading more of
 // the list as needed (the 20,000 rows the list holds at most); then it prints `listed`.
-//   edit:   types <new number> over that row's value, keeps the row as `points`, and waits for
-//           the kept table to show `points` and <new number>.
-//   follow: changes nothing itself, and waits up to 30 seconds for the list to read itself again
-//           (another client changes the hunt) and the row at <0xaddr> to show <new number>.
+//   edit:   types <new number> over that row's value in the cell's own editor and commits it
+//           with Return, keeps the row as `points`, and waits for the kept table to show `points`
+//           and <new number>. After each of the two writes it waits for the list's check after
+//           the write's event to come back before it looks for a reset.
+//   follow: changes nothing itself, and waits up to 30 seconds for an event from another client,
+//           the list read again after it, and the row at <0xaddr> to show <new number>.
+//   gone:   changes nothing itself, and waits up to 30 seconds for the game to be gone (someone
+//           else ends it): the line says the core's words for a closed game, the results list and
+//           the kept table have no rows, the game bar says `no game attached`, and the search box
+//           can't be used. Then it asks the search bar to find <number>, which the core must refuse
+//           as not attached. <new number> is not used.
 // It prints one line per step as it goes, then `ok`, exit 0. A step that does not come true in
 // time prints what it waited for and the window's line, exit 1. Whatever happens, it ends by
 // itself after three minutes.
@@ -22,6 +29,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QTableView>
 #include <QTimer>
 #include <algorithm>
@@ -29,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <utility>
 #include <unistd.h>
 
 #include "board.hpp"
@@ -73,14 +82,25 @@ public:
     line_ = need<QLabel>(&window, "line");
     gameBar_ = need<GameBar>(&window, "gameBar");
     gameLabel_ = need<QLabel>(gameBar_, "game");
-    number_ = need<QLineEdit>(need<SearchBar>(&window, "searchBar"), "number");
+    searchBar_ = need<SearchBar>(&window, "searchBar");
+    number_ = need<QLineEdit>(searchBar_, "number");
+    hunt_ = need<QPushButton>(searchBar_, "hunt");
     panel_ = need<ResultsPanel>(&window, "resultsPanel");
     model_ = panel_->model();
     results_ = need<QTableView>(panel_, "results");
     all_ = need<QCheckBox>(panel_, "all");
     kept_ = need<QTableView>(need<KeptPanel>(&window, "keptPanel"), "kept");
-    QObject::connect(&board, &Board::turned, [this] { ++turns_; });
-    QObject::connect(model_, &QAbstractItemModel::modelReset, [this] { ++resets_; });
+    QObject::connect(&board, &Board::turned, &context_, [this] {
+      ++turns_;
+      readSinceTurn_ = 0;
+    });
+    QObject::connect(model_, &QAbstractItemModel::modelReset, &context_, [this] { ++resets_; });
+    // listChanged comes when a write is answered (writing() turns false), and when anything else
+    // about the list changes, such as a page read coming back
+    QObject::connect(model_, &ResultsModel::listChanged, &context_, [this] {
+      const bool writing = model_->writing();
+      if (std::exchange(writing_, writing) == writing) ++readSinceTurn_;  // not a write starting or ending
+    });
   }
 
   [[noreturn]] void fail(const QString &why) {
@@ -169,41 +189,77 @@ public:
     return row;
   }
 
-  // types `value` over the row's value, then keeps the row as `name`
+  // types `value` over the row's value in the cell's own editor, commits it with Return, then
+  // keeps the row as `name`
   void edit(int row, const QString &address, const QString &value, const QString &name) {
     const quint64 addr = addressOf(address);
     waitFor("moth to be free for a write", 30, [this] { return !board_.working() && !model_->writing(); });
     const int turns = turns_, resets = resets_;
-    if (!model_->setData(model_->index(row, ResultsModel::Value), value, Qt::EditRole))
-      fail("the list would not write " + value + " into row " + cell(row, ResultsModel::Number));
-    print("typed " + value + " over row " + cell(row, ResultsModel::Number));
-    // the write's event has come back and the list was checked after it (R14)
-    waitFor("row " + cell(row, ResultsModel::Number) + " to show " + value, 30, [&] {
-      return turns_ > turns && !board_.working() && !model_->writing() && row < model_->rowCount() &&
+    const QModelIndex at = model_->index(row, ResultsModel::Value);
+    results_->setCurrentIndex(at);
+    results_->edit(at);
+    auto *editor = results_->viewport()->findChild<QLineEdit *>();
+    if (!editor || !editor->isVisible()) fail("no editor opened on row " + cell(row, ResultsModel::Number) + "'s value");
+    print("the editor on row " + cell(row, ResultsModel::Number) + " shows " + editor->text());
+    editor->setText(value);
+    QKeyEvent press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+    QKeyEvent release(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier);
+    QApplication::sendEvent(editor, &press);
+    QApplication::sendEvent(editor, &release);
+    print("typed " + value + " over row " + cell(row, ResultsModel::Number) + ", Return");
+    waitFor("the write of " + value + " to be sent", 10, [&] { return model_->writing() || turns_ > turns; });
+    // the write's event has come back, the row shows the value, and the list's check after that
+    // event (R14) has come back too, so a reset it caused would have happened
+    waitFor("row " + cell(row, ResultsModel::Number) + " to show " + value + " and the list to be checked after the write", 30, [&] {
+      return turns_ > turns && readSinceTurn_ > 0 && !board_.working() && !model_->writing() && row < model_->rowCount() &&
              cell(row, ResultsModel::Value) == value;
     });
     stillSelected(row, addr, resets);
     print("row " + cell(row, ResultsModel::Number) + " shows " + value + ", still selected");
+    const int keptTurns = turns_;
     panel_->keepSelected(name);
     print("keep it as " + name);
-    waitFor("the kept table to show " + name + " " + value, 30, [&] { return keptShows(name, value); });
+    waitFor("the kept table to show " + name + " " + value + " and the list to be checked after the keep", 30, [&] {
+      return keptShows(name, value) && turns_ > keptTurns && readSinceTurn_ > 0 && !model_->writing();
+    });
     print("kept: " + name + " " + value);
     stillSelected(row, addr, resets);
   }
 
-  // waits for the list to be read again from the start and, read as far as needed, to show
-  // `value` at `address`
+  // waits for an event from another client, the list read again after it and, read as far as
+  // needed, `value` at `address`
   void follow(const QString &address, const QString &value) {
     const quint64 addr = addressOf(address);
-    const int resets = resets_;
+    const int turns = turns_;
     int row = -1;
-    waitFor("the list to read itself again and show " + value + " at " + address, 30, [&] {
-      if (resets_ == resets) return false;
+    waitFor("an event, the list read again after it, and " + value + " at " + address, 30, [&] {
+      if (turns_ == turns || readSinceTurn_ == 0) return false;
       row = look(addr);
       return row >= 0 && cell(row, ResultsModel::Value) == value;
     });
     print("the list read itself again: row " + cell(row, ResultsModel::Number) + " is at " + address + ", showing " + value +
           ", of " + QString::number(model_->total()));
+  }
+
+  // waits for the game to be gone, as the window shows it, then asks for a find, which the core
+  // must refuse: with no game nothing can be written
+  void gone(const QString &exe, const QString &number) {
+    const QString closed = "not attached. " + exe + " closed.", lost = "the game closed. attach again once it's running.";
+    waitFor("the line to say " + exe + " closed, with no rows listed or kept and no game in the bar", 30, [&] {
+      const QString line = line_->text();
+      return (line.compare(closed, Qt::CaseInsensitive) == 0 || line == lost) && model_->rowCount() == 0 &&
+             kept_->model()->rowCount() == 0 && gameLabel_->text() == "no game attached";
+    });
+    print("the window says: " + line_->text());
+    print("no rows listed, none kept, and the game bar says " + gameLabel_->text());
+    if (number_->isEnabled() || hunt_->isEnabled()) fail("the search box can still be used with no game");
+    print("the search box can't be used");
+    number_->setText(number);
+    searchBar_->find();
+    const QString refused = "not attached. run: moth attach --bottle <bottle> <game.exe>";
+    waitFor("find " + number + " to be refused: " + refused, 30, [&] { return line_->text() == refused; });
+    if (board_.hunt() || model_->rowCount() != 0 || kept_->model()->rowCount() != 0) fail("something came back after the find");
+    print("find " + number + " was refused: " + line_->text());
   }
 
 private:
@@ -230,15 +286,20 @@ private:
     return false;
   }
 
+  QObject context_;  // the connections above end with the Drive
   Board &board_;
   QLabel *line_ = nullptr, *gameLabel_ = nullptr;
   GameBar *gameBar_ = nullptr;
+  SearchBar *searchBar_ = nullptr;
   QLineEdit *number_ = nullptr;
+  QPushButton *hunt_ = nullptr;
   ResultsPanel *panel_ = nullptr;
   ResultsModel *model_ = nullptr;
   QTableView *results_ = nullptr, *kept_ = nullptr;
   QCheckBox *all_ = nullptr;
   int turns_ = 0, resets_ = 0;
+  int readSinceTurn_ = 0;  // list changes since the latest event's turn, other than a write starting or ending
+  bool writing_ = false;   // the model's writing() as last seen
 };
 
 }  // namespace
@@ -246,8 +307,9 @@ private:
 int main(int argc, char **argv) {
   std::signal(SIGALRM, overran);
   alarm(overallSeconds);
-  const QString usage = "usage: it_app <edit|follow> <bottle> <exe name> <number> <0xaddr> <new number>";
-  if (argc != 7 || (qstrcmp(argv[1], "edit") != 0 && qstrcmp(argv[1], "follow") != 0)) {
+  const QString usage = "usage: it_app <edit|follow|gone> <bottle> <exe name> <number> <0xaddr> <new number>";
+  const QStringList modes{"edit", "follow", "gone"};
+  if (argc != 7 || !modes.contains(QString::fromUtf8(argv[1]))) {
     std::fprintf(stderr, "%s\n", usage.toUtf8().constData());
     return 2;
   }
@@ -274,7 +336,8 @@ int main(int argc, char **argv) {
   const int row = drive.pick(address);
   print("listed");
   if (mode == "edit") drive.edit(row, address, value, "points");
-  else drive.follow(address, value);
+  else if (mode == "follow") drive.follow(address, value);
+  else drive.gone(exe, number);
   print("ok");
   return 0;
 }
