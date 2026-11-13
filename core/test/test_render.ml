@@ -139,6 +139,12 @@ let kept () =
 
 (* R14: a value that reads as it did before its newest write says so after its tag; other lines are
    as before *)
+let kept_note () =
+  let k ?set_to ?(put_back = false) kshown : Session.kept = { name = "xp"; kaddr = 0x10L; ktag = "whole number"; kshown; set_to; put_back } in
+  check_str "back" "you set it to 20; it is back to what it was before." (Render.kept_note (k ~set_to:"20" ~put_back:true "13"));
+  check_str "set, holding" "" (Render.kept_note (k ~set_to:"30" "30"));
+  check_str "never set" "" (Render.kept_note (k "95"))
+
 let kept_put_back () =
   let k ?set_to ?(put_back = false) name kshown : Session.kept = { name; kaddr = 0x10L; ktag = "whole number"; kshown; set_to; put_back } in
   check_str "put back"
@@ -171,6 +177,7 @@ let () =
           Alcotest.test_case "a page of results" `Quick listing;
           Alcotest.test_case "kept" `Quick kept;
           Alcotest.test_case "kept, put back" `Quick kept_put_back;
+          Alcotest.test_case "kept note" `Quick kept_note;
           Alcotest.test_case "snapshot taken" `Quick snapshot_taken;
           Alcotest.test_case "sizes" `Quick sizes;
         ] );

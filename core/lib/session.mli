@@ -110,8 +110,9 @@ val results : t -> all:bool -> from:int -> limit:int -> near:string option -> (l
     read-back that can't happen is [held = None] and a second line saying why; when it lost the
     game or the helper, the hunt, the kept values and the undo list end there, as they would in
     any step. The write landed, so it is the result in every case, and it can be undone unless
-    the undo list ended. *)
-val set : t -> row:int -> string -> (set_done, string) result
+    the undo list ended. With [at], the row must be at that address, or nothing is written and
+    the error says the list changed. *)
+val set : ?at:int64 -> t -> row:int -> string -> (set_done, string) result
 
 (** writes back the exact bytes the newest write replaced *)
 val undo : t -> (string * written, string) result
@@ -127,8 +128,9 @@ type kept = { name : string; kaddr : int64; ktag : string; kshown : string; set_
 (** keeps a row of the latest listing by name, or as the first of [v1], [v2], ... not in use, and
     says how it reads now (as the listing showed it when it can't be read). A name is a lowercase
     letter and up to 23 lowercase letters, digits, [_] or [-]; at most 64 values are kept. Kept
-    values outlast the hunt. *)
-val keep_row : t -> row:int -> name:string option -> (string, string) result
+    values outlast the hunt. With [at], the row must be at that address, or nothing is kept and
+    the error says the list changed. *)
+val keep_row : ?at:int64 -> t -> row:int -> name:string option -> (string, string) result
 
 (** keeps the address as the first interpretation of the number, in plan order, that reads as it
     there *)

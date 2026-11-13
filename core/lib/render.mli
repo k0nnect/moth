@@ -33,5 +33,9 @@ val listing : ?near:string -> all:bool -> Session.listing -> string
     to what it was before *)
 val kept : Session.kept list -> string
 
+(** the words [kept] prints after the tag for one value: that it was set and is back to what it
+    was before, or [""] *)
+val kept_note : Session.kept -> string
+
 (** [1234567] is ["1,234,567"] *)
 val commas : int -> string

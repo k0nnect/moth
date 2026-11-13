@@ -67,6 +67,12 @@ let lost_values =
   "moth lost what it remembered of the last step, so it can't compare by change now. type the number it shows (moth next <number>), or start again: moth snapshot"
 
 let no_row n = Printf.sprintf "no result #%d. run: moth results" n
+
+(* a click names the address its row showed: a row that is anywhere else now is not that row *)
+let moved ~row ~at (l : listed) =
+  match at with
+  | Some a when a <> l.laddr -> Some (Printf.sprintf "row %d is not at 0x%Lx any more: the list changed. look again: moth results" row a)
+  | _ -> None
 let no_kept name = Printf.sprintf "no kept value called %s. see: moth kept" name
 let find_kept t name = List.find_opt (fun k -> k.kname = name) t.named
 
@@ -509,12 +515,13 @@ let write_checked t ~label (i : Interp.t) addr text =
           in
           Ok { text = (match why with Some why -> text ^ "\n" ^ why | None -> text); w; held })
 
-let set t ~row text =
+let set ?at t ~row text =
   match t.hunt with
   | None -> Error no_hunt
   | Some _ -> (
       match List.find_opt (fun l -> l.at = row) t.listing with
       | None -> Error (no_row row)
+      | Some l when moved ~row ~at l <> None -> Error (Option.get (moved ~row ~at l))
       | Some l -> write_checked t ~label:(Printf.sprintf "#%d" row) l.li l.laddr text)
 
 let undo t =
@@ -562,7 +569,7 @@ let read_as t (i : Interp.t) addr =
   | Error { code = "read_failed"; _ } -> None
   | Error e -> raise (Helper_failed e)
 
-let keep_row t ~row ~name =
+let keep_row ?at t ~row ~name =
   match new_name t name with
   | Error e -> Error e
   | Ok name -> (
@@ -571,6 +578,7 @@ let keep_row t ~row ~name =
       | Some _ -> (
           match List.find_opt (fun l -> l.at = row) t.listing with
           | None -> Error (no_row row)
+          | Some l when moved ~row ~at l <> None -> Error (Option.get (moved ~row ~at l))
           | Some l ->
               guard t (fun () ->
                   (* how it reads now, which a write since the listing may have changed; as listed

@@ -287,6 +287,7 @@ let kept ks =
              ("shown", `String k.kshown);
              ("set_to", match k.set_to with Some v -> `String v | None -> `Null);
              ("put_back", `Bool k.put_back);
+             ("note", `String (Render.kept_note k));
            ])
          ks),
     Render.kept ks )
@@ -333,7 +334,15 @@ let status st =
               (* a snapshot no step has narrowed: every aligned place counts, and nothing lists yet *)
               let blind = Session.blind t.session in
               let hunt =
-                `Assoc [ ("main", `Int o.main); ("wide", `Int o.wide); ("groups", `List (List.map group_json o.groups)); ("blind", `Bool blind) ]
+                `Assoc
+                  [
+                    ("main", `Int o.main);
+                    ("wide", `Int o.wide);
+                    ("by_tag", `List (List.map (fun (tag, c) -> `List [ `String tag; `Int c ]) o.by_tag));
+                    ("can_compare", `Bool (Session.can_compare o));
+                    ("groups", `List (List.map group_json o.groups));
+                    ("blind", `Bool blind);
+                  ]
               in
               Ok (`Assoc [ ("attached", attached); ("hunt", hunt) ], attached_line t ^ "\n" ^ if blind then Render.no_step_yet else Render.counts o)))
   | _ -> Ok (`Assoc [ ("attached", `Null); ("hunt", `Null) ], "not attached")
@@ -473,6 +482,17 @@ let check_usage ~cmd ~args ~opts =
   let none = need (args = []) (cmd ^ " takes no arguments") in
   (* the option, when given, is a whole number that [ok] accepts *)
   let whole k ok = match List.assoc_opt k opts with None -> true | Some v -> is_digits v && Option.fold ~none:false ~some:ok (int_of_string_opt v) in
+  (* --at pins a row to the address it showed; it is checked here, before anything runs *)
+  let at_ok =
+    match List.assoc_opt "at" opts with
+    | None -> Ok ()
+    | Some a ->
+        let row_form = match (cmd, args) with ("keep", ([ r ] | [ r; _ ])) | ("set", [ r; _ ]) -> row_number r <> None | _ -> false in
+        if cmd <> "keep" && cmd <> "set" then Error "--at goes with keep and set"
+        else if not row_form then Error "--at goes with a row number"
+        else need (address a <> None) "--at needs an address like 0x7ffe1234"
+  in
+  let* () = at_ok in
   match cmd with
   | "bottles" | "status" | "kept" | "undo" | "detach" | "stop" -> none
   | "ps" ->
@@ -515,6 +535,7 @@ let relations = [ ("down", Session.Down); ("up", Session.Up); ("same", Session.S
 let handle st ~cmd ~args ~opts =
   let* () = check_usage ~cmd ~args ~opts in
   let bottle () = List.assoc "bottle" opts in
+  let at = Option.bind (List.assoc_opt "at" opts) address in
   let session () = match st.target with Some t -> Ok t.session | None -> Error not_attached in
   match (cmd, args) with
   | "bottles", _ -> Ok (bottles ())
@@ -546,7 +567,7 @@ let handle st ~cmd ~args ~opts =
       Result.map said
         (match (address first, rest) with
         | Some addr, number :: more -> Session.keep_at s ~addr number ~name:(name more)
-        | _ -> Session.keep_row s ~row:(Option.get (row_number first)) ~name:(name rest))
+        | _ -> Session.keep_row ?at s ~row:(Option.get (row_number first)) ~name:(name rest))
   | "kept", _ ->
       let* s = session () in
       Result.map kept (Session.kept s)
@@ -555,7 +576,7 @@ let handle st ~cmd ~args ~opts =
       Result.map said (Session.forget s name)
   | "set", [ target; v ] ->
       let* s = session () in
-      let* d = match row_number target with Some row -> Session.set s ~row v | None -> Session.set_kept s ~name:target v in
+      let* d = match row_number target with Some row -> Session.set ?at s ~row v | None -> Session.set_kept s ~name:target v in
       Ok (set_done st d)
   | "undo", _ ->
       let* s = session () in

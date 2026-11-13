@@ -243,7 +243,15 @@ let hunt () =
         (text (call d "find" [ "100" ]));
       check_str "status with a hunt" (attached ^ "\n3 matches (3 whole number)") (text (call d "status" []));
       check_json "status json hunt"
-        (`Assoc [ ("main", `Int 3); ("wide", `Int 7); ("groups", `List [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ]); ("blind", `Bool false) ])
+        (`Assoc
+          [
+            ("main", `Int 3);
+            ("wide", `Int 7);
+            ("by_tag", `List [ `List [ `String "whole number"; `Int 3 ] ]);
+            ("can_compare", `Bool true);
+            ("groups", `List [ group_json "i32" 3; group_json ~tier:"wide" "u8" 7 ]);
+            ("blind", `Bool false);
+          ])
         Yojson.Safe.Util.(member "hunt" (json (call d "status" [])));
       check_err "usage" "next needs a number, or one of: down, up, same, changed" (call d "next" []);
       check_err "bad number" "'abc' isn't a number" (call d "next" [ "abc" ]);
@@ -664,7 +672,7 @@ let keep_by_name () =
         (`List
            [
              `Assoc
-               [ ("name", `String "xp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "60"); ("set_to", `Null); ("put_back", `Bool false) ];
+               [ ("name", `String "xp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "60"); ("set_to", `Null); ("put_back", `Bool false); ("note", `String "") ];
            ])
         (json (call d "kept" []));
       Fake_helper.queue_write f ~prev:(Vint 60L) ~prev_bits:0x3cL;
@@ -716,8 +724,8 @@ let keep_by_address () =
       check_json "unreadable json"
         (`List
           [
-            `Assoc [ ("name", `String "xp"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "15"); ("set_to", `Null); ("put_back", `Bool false) ];
-            `Assoc [ ("name", `String "v1"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "?"); ("set_to", `Null); ("put_back", `Bool false) ];
+            `Assoc [ ("name", `String "xp"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "15"); ("set_to", `Null); ("put_back", `Bool false); ("note", `String "") ];
+            `Assoc [ ("name", `String "v1"); ("addr", `String "0x6c551068"); ("tag", `String "whole number"); ("shown", `String "?"); ("set_to", `Null); ("put_back", `Bool false); ("note", `String "") ];
           ])
         (json (call d "kept" [])))
 
@@ -997,7 +1005,7 @@ let kept_put_back () =
         (`List
            [
              `Assoc
-               [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `Null); ("put_back", `Bool false) ];
+               [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `Null); ("put_back", `Bool false); ("note", `String "") ];
            ])
         (json (call d "kept" []));
       Fake_helper.queue_write f ~prev:(Vint 10L) ~prev_bits:10L;
@@ -1010,10 +1018,75 @@ let kept_put_back () =
         (`List
            [
              `Assoc
-               [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `String "20"); ("put_back", `Bool true) ];
+               [ ("name", `String "hp"); ("addr", `String "0x10008"); ("tag", `String "whole number"); ("shown", `String "10"); ("set_to", `String "20"); ("put_back", `Bool true); ("note", `String "you set it to 20; it is back to what it was before.") ];
            ])
         (json (call d "kept" []));
       check_bool "the text line" true (String.ends_with ~suffix:"you set it to 20; it is back to what it was before." (text (call d "kept" []))))
+
+(* the panels read what a hunt holds from status, and a value's note from kept *)
+let status_for_panels () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 100 ];
+      let found = json (call d "find" [ "100" ]) in
+      let hunt = Yojson.Safe.Util.(member "hunt" (json (call d "status" []))) in
+      check_json "by_tag as the find gave it" Yojson.Safe.Util.(member "by_tag" found) Yojson.Safe.Util.(member "by_tag" hunt);
+      check_json "can compare" (`Bool true) Yojson.Safe.Util.(member "can_compare" hunt);
+      Fake_helper.queue_scan f [ { (gi "i32" 100) with has_values = false } ];
+      ignore (text (call d "find" [ "100" ]));
+      let hunt = Yojson.Safe.Util.(member "hunt" (json (call d "status" []))) in
+      check_json "cannot compare" (`Bool false) Yojson.Safe.Util.(member "can_compare" hunt))
+
+let kept_says_its_note () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 1;
+      Fake_helper.queue_peek f "i32" (threes 1);
+      ignore (text (call d "results" []));
+      ignore (text (call d "keep" [ "1"; "hp" ]));
+      Fake_helper.queue_read f (Vint 3L);
+      check_json "never set" (`String "") Yojson.Safe.Util.(index 0 (json (call d "kept" [])) |> member "note");
+      Fake_helper.queue_write f ~prev:(Vint 3L) ~prev_bits:3L;
+      Fake_helper.queue_read f (Vint 20L);
+      ignore (text (call d "set" [ "hp"; "20" ]));
+      Fake_helper.queue_read f (Vint 3L);
+      Fake_helper.queue_read f (Vint 3L);
+      check_json "set and back" (`String "you set it to 20; it is back to what it was before.") Yojson.Safe.Util.(index 0 (json (call d "kept" [])) |> member "note"))
+
+(* --at pins a click to the address its row showed *)
+let at_guards_a_row () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 3;
+      let list () =
+        Fake_helper.queue_peek f "i32" (threes 3);
+        ignore (text (call d "results" []))
+      in
+      list ();
+      let at a = [ ("at", a) ] in
+      let moved n a = Printf.sprintf "row %d is not at %s any more: the list changed. look again: moth results" n a in
+      (* row 3 is at 0x1008 *)
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "set at its address" "set #3 to 9 (was 3)" (text (call d "set" [ "3"; "9" ] ~opts:(at "0x1008")));
+      check_bool "wrote" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
+      check_err "set elsewhere" (moved 3 "0x1000") (call d "set" [ "3"; "7" ] ~opts:(at "0x1000"));
+      check_bool "no write" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
+      check_err "keep elsewhere" (moved 3 "0x1000") (call d "keep" [ "3"; "hp" ] ~opts:(at "0x1000"));
+      check_str "nothing kept" nothing_kept (text (call d "kept" []));
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "keep at its address" "kept #3 as hp (9, whole number)" (text (call d "keep" [ "3"; "hp" ] ~opts:(at "0x1008")));
+      let row_only = "--at goes with a row number" in
+      check_err "set by name" row_only (call d "set" [ "hp"; "9" ] ~opts:(at "0x10"));
+      check_err "keep by address" row_only (call d "keep" [ "0x1008"; "9" ] ~opts:(at "0x1008"));
+      let not_address = "--at needs an address like 0x7ffe1234" in
+      check_err "set, not an address" not_address (call d "set" [ "3"; "9" ] ~opts:(at "12"));
+      check_err "keep, not an address" not_address (call d "keep" [ "3" ] ~opts:(at "0x"));
+      check_err "another command" "--at goes with keep and set" (call d "results" [] ~opts:(at "0x10")))
 
 (* MOTH_SNAPSHOT_MB is read when the daemon starts *)
 let snapshot_cap () =
@@ -1352,6 +1425,8 @@ let parse_args () =
   same "missing value" (Error "--bottle needs a value") (p [ "ps"; "--bottle" ]);
   same "after" (inv "watch" [] [ ("after", "12") ] true) (p [ "watch"; "--after"; "12"; "--json" ]);
   same "after needs a value" (Error "--after needs a value") (p [ "watch"; "--after" ]);
+  same "at" (inv "set" [ "3"; "9" ] [ ("at", "0x10") ] false) (p [ "set"; "3"; "9"; "--at"; "0x10" ]);
+  same "at needs a value" (Error "--at needs a value") (p [ "keep"; "3"; "--at" ]);
   same "no command" (Error "no command. run: moth help") (p [ "--json" ])
 
 let parse_results_args () =
@@ -1381,6 +1456,9 @@ let () =
           t "attach" attaching;
           t "anti-cheat" anticheat;
           t "the hunt" hunt;
+          t "status for the panels" status_for_panels;
+          t "kept says its note" kept_says_its_note;
+          t "at guards a row" at_guards_a_row;
           t "helper lost" helper_lost;
           t "target gone" target_gone;
           t "ps" ps;

@@ -138,7 +138,7 @@ let parse_args argv =
     | [] -> ( match List.rev words with [] -> Error "no command. run: moth help" | cmd :: args -> Ok { cmd; args; opts; json })
     | "--json" :: rest -> go words opts true rest
     | "--all" :: rest -> go words (set "all" "true" opts) json rest
-    | (("--bottle" | "-n" | "--from" | "--near" | "--after") as o) :: rest -> (
+    | (("--bottle" | "-n" | "--from" | "--near" | "--after" | "--at") as o) :: rest -> (
         match rest with
         | v :: rest -> go words (set (if o = "-n" then "n" else String.sub o 2 (String.length o - 2)) v opts) json rest
         | [] -> Error (o ^ " needs a value"))

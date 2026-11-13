@@ -12,11 +12,11 @@ let usage =
   next <number>                        narrow the hunt to the number it shows now
   next down|up|same|changed            narrow the hunt by how the number moved
   results [--all] [-n <rows>] [--from <row>] [--near <name|0xaddr>]  list the matches left (-n from 1 to 200, default 20)
-  keep <#n> [name]                     keep a result
+  keep <#n> [name] [--at <0xaddr>]     keep a result
   keep <0xaddr> <number> [name]        keep an address that shows a number
   kept                                 the kept values, read now
   forget <name>                        drop a kept value
-  set <#n|name> <number>               write a number into result #n, or into a kept value
+  set <#n|name> <number> [--at <0xaddr>]  write a number into result #n, or into a kept value
   undo                                 put back what the last set replaced
   detach                               let go of the game
   log [-n <count>]                     recent commands, newest first
