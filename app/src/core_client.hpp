@@ -24,10 +24,15 @@ class CoreClient : public QObject {
 public:
   CoreClient(QString home, QString mothBin, QObject *parent = nullptr);
   // one request on its own connection, actor "user"; `done` runs once, on the caller's thread, and
-  // never before call() returns. When no service answers, `mothBin status` is run once to start
-  // one, and the request is tried again when it ends (10 seconds at most).
+  // never before call() returns. When no service answers, a recorded request (the user's own
+  // action) runs `mothBin status` once to start one and is tried again when that ends (10 seconds
+  // at most). An unrecorded one (a poll) never starts it: it fails at once.
   void call(const QString &cmd, const QStringList &args, const Opts &opts, bool record,
             std::function<void(const Reply &)> done);
+  // the app's start of the service, once, at launch: when nothing answers at the socket, runs
+  // `mothBin status` (10 seconds at most); a running service is asked nothing. Then `then`, on the
+  // caller's thread, never before this returns.
+  void startService(std::function<void()> then);
   void startFeed();  // `watch`; when it drops, tries again every second with `after` = the last seq seen
 signals:
   void busy(const QJsonObject &what);   // a recorded request started
@@ -41,7 +46,7 @@ signals:
 private:
   struct Exchange;
   void attempt(const std::shared_ptr<Exchange> &x);
-  void startService(std::function<void()> then);
+  void runMoth(std::function<void()> then);
   void watch();
   void heard(QLocalSocket *feed, bool &answered);
   void dropFeed(QLocalSocket *feed);
@@ -50,7 +55,7 @@ private:
 
   QString home_, mothBin_;
   QProcess *starting_ = nullptr;               // `moth status`, while it runs
-  QList<std::function<void()>> waiting_;       // requests to try again once it has
+  QList<std::function<void()>> waiting_;       // what goes on once it has ended
   bool feedStarted_ = false, feedUp_ = false;
   qint64 lastSeq_ = -1;                         // the newest event seen; -1 before the first watch
 };

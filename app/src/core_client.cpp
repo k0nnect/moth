@@ -37,6 +37,7 @@ Reply replyOf(const QByteArray &line) {
 struct CoreClient::Exchange {
   QByteArray request;
   std::function<void(const Reply &)> done;
+  bool mayStart;         // recorded: the user's own action, which may start the service
   bool retried = false;  // the service has been started once for it
 };
 
@@ -51,7 +52,7 @@ void CoreClient::call(const QString &cmd, const QStringList &args, const Opts &o
   for (const auto &[k, v] : opts) o.insert(k, v);
   QJsonObject request{{"id", 1}, {"actor", "user"}, {"cmd", cmd}, {"args", QJsonArray::fromStringList(args)}, {"opts", o}};
   if (!record) request.insert("record", false);
-  auto x = std::make_shared<Exchange>(Exchange{lineOf(request), std::move(done)});
+  auto x = std::make_shared<Exchange>(Exchange{lineOf(request), std::move(done), record});
   QTimer::singleShot(0, this, [this, x] { attempt(x); });
 }
 
@@ -76,13 +77,13 @@ void CoreClient::attempt(const std::shared_ptr<Exchange> &x) {
       finish(replyOf(s->readLine()));
     } else if (*reached) {
       finish(failure("lost contact with moth's background service. see " + home_ + "/core.log"));
-    } else if (x->retried) {
+    } else if (x->retried || !x->mayStart) {
       finish(failure("moth's background service is not answering. see " + home_ + "/core.log"));
     } else {
       x->retried = true;
       QObject::disconnect(s, nullptr, this, nullptr);
       s->deleteLater();
-      startService([this, x] { attempt(x); });
+      runMoth([this, x] { attempt(x); });
     }
   };
   connect(s, &QLocalSocket::errorOccurred, this, ended);
@@ -90,9 +91,26 @@ void CoreClient::attempt(const std::shared_ptr<Exchange> &x) {
   s->connectToServer(socketPath());
 }
 
-// `moth status` starts the service when it isn't running. One runs at a time; every request that
-// found no service waits for it to end (10 seconds at most), then tries once more.
 void CoreClient::startService(std::function<void()> then) {
+  QTimer::singleShot(0, this, [this, then = std::move(then)] {
+    // a bare connection asks nothing: the service closes it unanswered and logs nothing
+    auto *probe = new QLocalSocket(this);
+    auto over = [this, probe, then](bool answered) {
+      QObject::disconnect(probe, nullptr, this, nullptr);
+      probe->abort();
+      probe->deleteLater();
+      if (!answered) runMoth(then);
+      else if (then) then();
+    };
+    connect(probe, &QLocalSocket::connected, this, [over] { over(true); });
+    connect(probe, &QLocalSocket::errorOccurred, this, [over] { over(false); });
+    probe->connectToServer(socketPath());
+  });
+}
+
+// `moth status` starts the service when it isn't running. One runs at a time; whoever needs the
+// service waits for it to end (10 seconds at most), then goes on.
+void CoreClient::runMoth(std::function<void()> then) {
   waiting_.append(std::move(then));
   if (starting_) return;
   auto *p = new QProcess(this);
@@ -112,7 +130,8 @@ void CoreClient::startService(std::function<void()> then) {
       p->waitForFinished(1000);
     }
     p->deleteLater();
-    for (const auto &retry : std::exchange(waiting_, {})) retry();
+    for (const auto &next : std::exchange(waiting_, {}))
+      if (next) next();
   };
   connect(p, &QProcess::finished, this, over);
   connect(

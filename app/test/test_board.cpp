@@ -13,7 +13,10 @@ private slots:
   void anAgentsEventIsSaidAndReadsStatus();
   void theGameClosing();
   void theServiceStoppingAndComingBack();
-  void aFailedRunSaysItsError();
+  void theLaunchAndTheUsersOwnRequestsStartTheService();
+  void pollingNeverStartsTheService();
+  void aFailedActionKeepsItsWholeError();
+  void anEventAlwaysBringsFreshStatus();
   void ticksDoNotPileUp();
   void huntFromStatus();
 };
@@ -26,9 +29,14 @@ QJsonObject busyLine(const QString &actor, const QString &cmd, const QStringList
   return {{"busy", QJsonObject{{"actor", actor}, {"cmd", cmd}, {"args", QJsonArray::fromStringList(args)}}}};
 }
 
-QJsonObject eventLine(qint64 seq, const QString &actor, const QString &cmd, const QStringList &args, const QString &summary) {
+QJsonObject eventLine(qint64 seq, const QString &actor, const QString &cmd, const QStringList &args, const QString &summary,
+                      bool ok = true) {
   return {{"event", QJsonObject{{"seq", seq}, {"ts", 1794518854.4}, {"actor", actor}, {"cmd", cmd},
-                                {"args", QJsonArray::fromStringList(args)}, {"ok", true}, {"summary", summary}}}};
+                                {"args", QJsonArray::fromStringList(args)}, {"ok", ok}, {"summary", summary}}}};
+}
+
+QString notAnswering(const QTemporaryDir &home) {
+  return "moth's background service is not answering. see " + home.path() + "/core.log";
 }
 
 const QJsonObject disco{{"pid", 4242}, {"name", "disco.exe"}, {"bits", 64}, {"bottle", "uhmm"}};
@@ -119,16 +127,120 @@ void TestBoard::theServiceStoppingAndComingBack() {
   QVERIFY(std::any_of(seen.begin(), seen.end(), [](const FakeCore::Seen &s) { return s.cmd == "status" && s.record; }));
 }
 
-void TestBoard::aFailedRunSaysItsError() {
-  // no service at all, and starting one does nothing: the client's own error is the line
+// R7: with no service, the app starts it once at launch, and after that only the user's own
+// requests start it, once each
+void TestBoard::theLaunchAndTheUsersOwnRequestsStartTheService() {
   QTemporaryDir home("/tmp/moth-app-XXXXXX");
-  CoreClient core(home.path(), "/usr/bin/true");
+  FakeMoth moth(home.path());  // starts nothing, so no service ever answers
+  CoreClient core(home.path(), moth.path);
   Board board(&core);
+  QTRY_COMPARE(board.line(), notAnswering(home));  // the start at launch failed, and says so
+  QCOMPARE(moth.runs(), QStringList{"status " + home.path()});
+
+  board.tick();
+  QTest::qWait(200);
+  QCOMPARE(moth.runs().size(), 1);
+
   std::optional<Reply> got;
   board.run("find", {"100"}, {}, [&](const Reply &r) { got = r; });
   QTRY_VERIFY(got.has_value());
   QVERIFY(!got->ok);
-  QCOMPARE(board.line(), "moth's background service is not answering. see " + home.path() + "/core.log");
+  QCOMPARE(got->error, notAnswering(home));
+  QCOMPARE(moth.runs().size(), 2);
+  QCOMPARE(board.line(), notAnswering(home));
+}
+
+// R7: after the service went away, polls never start it again; the user's next action does, once
+void TestBoard::pollingNeverStartsTheService() {
+  QTemporaryDir home("/tmp/moth-app-XXXXXX");
+  FakeMoth moth(home.path());
+  FakeCore fake(home.path());
+  CoreClient core(home.path(), moth.path);
+  Board board(&core);
+  QVERIFY(QTest::qWaitFor([&] { return board.connected() && !board.line().isEmpty(); }));
+  QCOMPARE(moth.runs(), QStringList());  // the service answered at launch: nothing to start
+
+  fake.stop();
+  QTRY_VERIFY(!board.connected());
+  for (int i = 0; i < 3; ++i) {
+    board.tick();
+    QTest::qWait(150);
+  }
+  QCOMPARE(moth.runs(), QStringList());
+  QCOMPARE(board.line(), lost);  // a poll that finds no service leaves that said
+
+  std::optional<Reply> got;
+  board.run("find", {"100"}, {}, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(moth.runs(), QStringList{"status " + home.path()});
+  QCOMPARE(board.line(), notAnswering(home));
+}
+
+// R8: the user's own failed action shows its whole error, whether its event (whose summary is the
+// error's first line) comes before the reply or after it
+void TestBoard::aFailedActionKeepsItsWholeError() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.feedRequests(false);  // this test sends the events itself, in the order it wants
+  const QString first = "row 3 is not at 0x7ffe1234 any more: the list changed.";
+  const QString whole = first + "\nlook again: moth results";
+  rig.fake.on("set", [&](const QStringList &, const Opts &) { return Reply{false, {}, {}, whole}; });
+  QSignalSpy turned(&rig.board, &Board::turned);
+
+  // the event, then the reply
+  rig.fake.hold("set");
+  std::optional<Reply> got;
+  rig.board.run("set", {"3", "9"}, {{"at", "0x7ffe1234"}}, [&](const Reply &r) { got = r; });
+  QTRY_COMPARE(timesSeen(rig.fake, "set"), 1);
+  rig.fake.push(eventLine(1, "user", "set", {"3", "9"}, first, false));
+  QTRY_COMPARE(rig.board.line(), first);
+  rig.fake.release("set");
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(rig.board.line(), whole);
+
+  // the reply, then the event
+  rig.board.say("something else");
+  got.reset();
+  rig.board.run("set", {"3", "9"}, {{"at", "0x7ffe1234"}}, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(rig.board.line(), whole);
+  const int turns = turned.count();
+  rig.fake.push(eventLine(2, "user", "set", {"3", "9"}, first, false));
+  QTRY_COMPARE(turned.count(), turns + 1);  // the event has been taken
+  QCOMPARE(rig.board.line(), whole);
+}
+
+// R9: an event always brings a status read sent after it, and `turned` once that is in
+void TestBoard::anEventAlwaysBringsFreshStatus() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  int answered = 0;
+  rig.fake.on("status", [&](const QStringList &, const Opts &) {
+    // the read sent before the event sees the game as it was; the one after, as the event left it
+    if (++answered == 1)
+      return Reply{true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}}, "not attached", {}};
+    return Reply{true, QJsonObject{{"attached", disco}, {"hunt", QJsonValue::Null}}, discoLine, {}};
+  });
+  QList<bool> attachedAtTurn;
+  connect(&rig.board, &Board::turned, this, [&] { attachedAtTurn << rig.board.attached().has_value(); });
+
+  const int statuses = timesSeen(rig.fake, "status");
+  rig.fake.hold("status");
+  rig.board.tick();
+  QTRY_COMPARE(timesSeen(rig.fake, "status"), statuses + 1);
+  rig.fake.push(eventLine(5, "agent", "attach", {"disco.exe"}, discoLine));
+  QTRY_COMPARE(rig.board.line(), "agent: " + discoLine);
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(rig.fake, "status"), statuses + 1);  // nothing more while that one is out
+  QCOMPARE(attachedAtTurn.size(), 0);                     // and `turned` waits
+
+  rig.fake.release("status");
+  QTRY_COMPARE(timesSeen(rig.fake, "status"), statuses + 2);
+  QTRY_COMPARE(attachedAtTurn.size(), 1);
+  QCOMPARE(attachedAtTurn.at(0), true);  // the state the event caused is in when `turned` comes
+  QTest::qWait(200);
+  QCOMPARE(attachedAtTurn.size(), 1);
+  QCOMPARE(timesSeen(rig.fake, "status"), statuses + 2);
 }
 
 void TestBoard::ticksDoNotPileUp() {

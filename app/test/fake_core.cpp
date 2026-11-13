@@ -1,6 +1,7 @@
 #include "fake_core.hpp"
 
 #include <QDateTime>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QLocalSocket>
@@ -86,6 +87,8 @@ int FakeCore::watchers() const {
 
 QList<Opts> FakeCore::watches() const { return watches_; }
 
+void FakeCore::feedRequests(bool on) { feedRequests_ = on; }
+
 void FakeCore::accept() {
   while (QLocalSocket *s = server_.nextPendingConnection()) {
     connections_.append(s);
@@ -130,7 +133,7 @@ void FakeCore::heard(QLocalSocket *socket, const QByteArray &line) {
     socket->disconnectFromServer();
     return;
   }
-  if (req.record)
+  if (req.record && feedRequests_)
     push({{"busy", QJsonObject{{"actor", req.actor}, {"cmd", req.cmd}, {"args", QJsonArray::fromStringList(req.args)}}}});
   if (holding_.contains(req.cmd)) held_.append({socket, id, req});
   else answer(socket, id, req);
@@ -142,7 +145,7 @@ void FakeCore::answer(QLocalSocket *socket, const QJsonValue &id, const Seen &re
   else if (req.cmd == "status") r = {true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}}, "not attached", {}};
   else r.error = "unknown command: " + req.cmd + ". run: moth help";
 
-  if (req.record) {
+  if (req.record && feedRequests_) {
     QJsonObject ev{{"seq", ++seq_},
                    {"ts", QDateTime::currentMSecsSinceEpoch() / 1000.0},
                    {"actor", req.actor},
@@ -161,6 +164,20 @@ void FakeCore::answer(QLocalSocket *socket, const QJsonValue &id, const Seen &re
 void FakeCore::send(QLocalSocket *socket, const QJsonObject &line) {
   socket->write(QJsonDocument(line).toJson(QJsonDocument::Compact) + '\n');
   socket->flush();
+}
+
+FakeMoth::FakeMoth(const QString &dir) : path(dir + "/fake-moth"), marker(dir + "/marker") {
+  QFile f(path);
+  if (!f.open(QIODevice::WriteOnly)) qFatal("can't write %s", qPrintable(path));
+  f.write("#!/bin/sh\necho \"$1 $MOTH_HOME\" >> \"" + marker.toUtf8() + "\"\n");
+  f.close();
+  f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+}
+
+QStringList FakeMoth::runs() const {
+  QFile f(marker);
+  if (!f.open(QIODevice::ReadOnly)) return {};
+  return QString::fromUtf8(f.readAll()).split('\n', Qt::SkipEmptyParts);
 }
 
 bool Rig::ready() {

@@ -33,6 +33,8 @@ QString keyOf(const QString &cmd, const QStringList &args, const Opts &opts) {
   return QString::fromUtf8(QJsonDocument(QJsonArray{cmd, QJsonArray::fromStringList(args), o}).toJson(QJsonDocument::Compact));
 }
 
+QString statusKey() { return keyOf("status", {}, {}); }
+
 }  // namespace
 
 Board::Board(CoreClient *core, QObject *parent) : QObject(parent), core_(core) {
@@ -40,6 +42,12 @@ Board::Board(CoreClient *core, QObject *parent) : QObject(parent), core_(core) {
   connect(core, &CoreClient::event, this, &Board::ended);
   connect(core, &CoreClient::feedUp, this, &Board::feedWent);
   core->startFeed();
+  // the one time the app starts the service by itself; reads wait for it, then status is read
+  core->startService([self = QPointer<Board>(this)] {
+    if (!self) return;
+    self->starting_ = false;
+    self->readStatus();
+  });
 }
 
 const std::optional<Attached> &Board::attached() const { return attached_; }
@@ -51,6 +59,7 @@ bool Board::connected() const { return connected_; }
 QString Board::line() const { return line_; }
 
 void Board::say(const QString &line) {
+  owesLine_ = false;
   if (line == line_) return;
   line_ = line;
   emit changed();
@@ -69,7 +78,7 @@ void Board::run(const QString &cmd, const QStringList &args, const Opts &opts, s
 }
 
 void Board::read(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done) {
-  if (working_) return;
+  if (working_ || starting_) return;
   const QString key = keyOf(cmd, args, opts);
   if (reading_.contains(key)) return;
   reading_.insert(key);
@@ -95,19 +104,23 @@ void Board::began(const QJsonObject &what) {
 
 void Board::ended(const QJsonObject &ev) {
   const QString summary = ev.value("summary").toString();
+  const QString said = ev.value("actor").toString() == "user" ? summary : "agent: " + summary;
   working_ = false;
   what_.clear();
-  line_ = ev.value("actor").toString() == "user" ? summary : "agent: " + summary;
+  // the user's own failed action already shows its whole error, whose first line this is
+  if (said != line_.section('\n', 0, 0)) line_ = said;
+  owesLine_ = false;
   emit changed();
-  readStatus();
-  emit turned();
+  ++turnsOwed_;
+  refresh();
 }
 
 void Board::feedWent(bool up) {
   connected_ = up;
   if (up) {
+    lost_ = false;
     emit changed();
-    readStatus();
+    if (needStatus_) readStatus();
     return;
   }
   // a request that was running ends unseen if the service went with it; one still running holds
@@ -115,7 +128,7 @@ void Board::feedWent(bool up) {
   working_ = false;
   what_.clear();
   line_ = lostLine;
-  owesStatusLine_ = true;
+  lost_ = needStatus_ = owesLine_ = true;
   emit changed();
 }
 
@@ -124,22 +137,47 @@ void Board::readStatus() {
 }
 
 void Board::tookStatus(const Reply &r) {
-  if (!r.ok) {
-    say(r.error);
-    return;
+  if (r.ok) {
+    showStatus(r);
+  } else if (!lost_ && r.error != line_) {  // while the feed is lost, the line already says so
+    line_ = r.error;
+    emit changed();
   }
+  if (std::exchange(statusAgain_, false)) refresh();
+  else turn();
+}
+
+void Board::showStatus(const Reply &r) {
   const QJsonObject o = r.result.toObject();
   const auto attached = attachedOf(o.value("attached"));
   const auto hunt = huntOf(o.value("hunt"));
   const QString counts = hunt ? r.text.section('\n', 1) : QString();
   QString line = line_;
   if (o.contains("closed")) line = r.text;  // the game went: say so, whatever was said before
-  else if (owesStatusLine_) line = r.text.section('\n', 0, 0);
-  owesStatusLine_ = false;
+  else if (owesLine_) line = r.text.section('\n', 0, 0);
+  needStatus_ = owesLine_ = false;
   if (attached == attached_ && hunt == hunt_ && counts == counts_ && line == line_) return;
   attached_ = attached;
   hunt_ = hunt;
   counts_ = counts;
   line_ = line;
   emit changed();
+}
+
+// after an event: a status read sent after it, then `turned`. A read already out was sent before
+// the event, so one more follows when it returns (one, however many events came meanwhile).
+void Board::refresh() {
+  if (reading_.contains(statusKey())) {
+    statusAgain_ = true;
+    return;
+  }
+  if (working_ || starting_) {  // no read can go now: lists are told at once and read when they can
+    turn();
+    return;
+  }
+  readStatus();
+}
+
+void Board::turn() {
+  for (int n = std::exchange(turnsOwed_, 0); n > 0; --n) emit turned();
 }

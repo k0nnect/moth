@@ -39,6 +39,9 @@ public:
   QList<Seen> seen() const;                      // every request but watch, in order
   int watchers() const;
   QList<Opts> watches() const;                   // the options of every watch request, in order
+  // on (the default): a recorded request sends its own busy and event lines. off: only push() feeds,
+  // for tests that set the order of an event and its reply themselves
+  void feedRequests(bool on);
 
 private:
   struct Held { QPointer<QLocalSocket> socket; QJsonValue id; Seen request; };
@@ -57,6 +60,7 @@ private:
   QList<QPointer<QLocalSocket>> watchers_;
   QList<Seen> seen_;
   QList<Opts> watches_;
+  bool feedRequests_ = true;
   qint64 seq_ = 0;
 };
 
@@ -70,6 +74,14 @@ struct Rig {
   // waits until the board's feed is up and its first status read has been answered (the line
   // shows that read's first line)
   bool ready();
+};
+
+// a stand-in for the moth program, written into `dir`: each run adds the line
+// "<its first argument> <its MOTH_HOME>" to dir/marker and does nothing else
+struct FakeMoth {
+  explicit FakeMoth(const QString &dir);
+  QString path, marker;
+  QStringList runs() const;  // one line per run, oldest first
 };
 
 // how many requests for `cmd` the fake has seen

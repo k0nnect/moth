@@ -1,6 +1,5 @@
 #include <QCoreApplication>
 #include <QDir>
-#include <QFile>
 #include <QJsonArray>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -20,6 +19,8 @@ private slots:
   void feedSignalsInOrder();
   void feedComesBackAfterTheLastSeq();
   void startsTheServiceOnceThenSaysSo();
+  void anUnrecordedCallNeverStartsTheService();
+  void theStartAtLaunchRunsMothOnlyWhenNothingAnswers();
 };
 
 namespace {
@@ -165,29 +166,56 @@ void TestCoreClient::feedComesBackAfterTheLastSeq() {
   QCOMPARE(up.at(1).at(0).toBool(), true);
 }
 
+// a recorded request (the user's own action) starts the service once when nothing answers
 void TestCoreClient::startsTheServiceOnceThenSaysSo() {
   QTemporaryDir home("/tmp/moth-app-XXXXXX");
-  const QString marker = home.filePath("marker");
-  const QString script = home.filePath("fake-moth");
-  {
-    QFile f(script);
-    QVERIFY(f.open(QIODevice::WriteOnly));
-    f.write("#!/bin/sh\necho \"$1 $MOTH_HOME\" >> \"" + marker.toUtf8() + "\"\n");
-    f.close();
-    QVERIFY(f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
-  }
-  Env bin("MOTH_BIN", script.toUtf8());
+  FakeMoth moth(home.path());
+  Env bin("MOTH_BIN", moth.path.toUtf8());
   CoreClient core(home.path(), mothBin());
+
+  std::optional<Reply> got;
+  core.call("find", {"100"}, {}, true, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QVERIFY(!got->ok);
+  QCOMPARE(got->error, "moth's background service is not answering. see " + home.path() + "/core.log");
+  QCOMPARE(moth.runs(), QStringList{"status " + home.path()});  // once, with this home
+}
+
+// R7: a read sent unrecorded (a poll) never starts the service
+void TestCoreClient::anUnrecordedCallNeverStartsTheService() {
+  QTemporaryDir home("/tmp/moth-app-XXXXXX");
+  FakeMoth moth(home.path());
+  CoreClient core(home.path(), moth.path);
 
   std::optional<Reply> got;
   core.call("status", {}, {}, false, [&](const Reply &r) { got = r; });
   QTRY_VERIFY(got.has_value());
   QVERIFY(!got->ok);
   QCOMPARE(got->error, "moth's background service is not answering. see " + home.path() + "/core.log");
+  QTest::qWait(200);
+  QCOMPARE(moth.runs(), QStringList());
+}
 
-  QFile m(marker);
-  QVERIFY(m.open(QIODevice::ReadOnly));
-  QCOMPARE(QString::fromUtf8(m.readAll()), "status " + home.path() + "\n");  // once, with this home
+// R7: the app's one start, at launch, runs moth only when nothing answers, and asks the service
+// nothing when something does
+void TestCoreClient::theStartAtLaunchRunsMothOnlyWhenNothingAnswers() {
+  QTemporaryDir home("/tmp/moth-app-XXXXXX");
+  FakeMoth moth(home.path());
+  CoreClient core(home.path(), moth.path);
+
+  int over = 0;
+  core.startService([&] { ++over; });
+  QCOMPARE(over, 0);  // never before it returns
+  QTRY_COMPARE(over, 1);
+  QCOMPARE(moth.runs(), QStringList{"status " + home.path()});
+
+  FakeCore fake(home.path());
+  core.startService([&] { ++over; });
+  QTRY_COMPARE(over, 2);
+  QTest::qWait(100);
+  QCOMPARE(moth.runs().size(), 1);
+  QCOMPARE(fake.seen().size(), 0);
+  QCOMPARE(over, 2);
 }
 
 QTEST_GUILESS_MAIN(TestCoreClient)

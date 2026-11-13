@@ -16,9 +16,10 @@ struct Hunt {
   bool operator==(const Hunt &) const = default;
 };
 
-// What the window knows of moth, and the one way its panels ask for anything. It follows the
-// core's feed (started here) and reads `status` after every event, after the feed comes back, and
-// on every tick.
+// What the window knows of moth, and the one way its panels ask for anything. At its start it
+// starts the service if nothing answers (the one time the app does so by itself), then reads
+// `status`. It follows the core's feed (started here) and reads `status` after every event, when
+// the feed comes back, and on every tick.
 class Board : public QObject {
   Q_OBJECT
 public:
@@ -32,17 +33,22 @@ public:
   QString line() const;      // the newest thing to tell the user
   void say(const QString &line);
   // a recorded request as the user. Refused while working: line becomes "moth is busy: <what>",
-  // nothing is sent and `then` is not called. A failed request's error becomes the line.
+  // nothing is sent and `then` is not called. A failed request's whole error becomes the line, and
+  // its event (whose summary is the error's first line) leaves it so. With no service answering,
+  // it starts one.
   void run(const QString &cmd, const QStringList &args = {}, const Opts &opts = {},
            std::function<void(const Reply &)> then = {});
-  // an unrecorded read. Dropped (and `done` never called) while working, or when a read with the
-  // same command, arguments and options is still out
+  // an unrecorded read. Dropped (and `done` never called) while working, while the service is
+  // being started at the board's start, or when a read with the same command, arguments and
+  // options is still out. It never starts the service.
   void read(const QString &cmd, const QStringList &args, const Opts &opts,
             std::function<void(const Reply &)> done);
   void tick();               // the once-a-second poll; the window calls it from a timer while visible
 signals:
   void changed();            // anything the getters return changed
-  void turned();             // a recorded request ended (anyone's): lists read themselves again
+  // a recorded request ended (anyone's): lists read themselves again. Once per event, after the
+  // `status` read sent after that event has come back, so `attached()` and `hunt()` are as it left them
+  void turned();
   void ticked();             // a poll: lists refresh the values they show
 
 private:
@@ -51,12 +57,20 @@ private:
   void feedWent(bool up);
   void readStatus();
   void tookStatus(const Reply &r);
+  void showStatus(const Reply &r);
+  void refresh();
+  void turn();
 
   CoreClient *core_;
   std::optional<Attached> attached_;
   std::optional<Hunt> hunt_;
   QString counts_, what_, line_;
   bool working_ = false, connected_ = false;
-  bool owesStatusLine_ = true;  // at the start and after the feed was lost: the next status read is said
-  QSet<QString> reading_;       // the reads still out
+  bool lost_ = false;          // the feed went down and has not come back
+  bool starting_ = true;       // the start of the service at the board's start is under way
+  bool needStatus_ = true;     // no status read has come back since the start or since the feed was lost
+  bool owesLine_ = true;       // ... and nothing newer has been said: that status read is said
+  bool statusAgain_ = false;   // an event came while a status read was out: read again when it returns
+  int turnsOwed_ = 0;          // events whose `turned` waits for the status read after them
+  QSet<QString> reading_;      // the reads still out
 };
