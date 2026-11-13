@@ -1,0 +1,280 @@
+// The real window against the real core and a real game, for the end-to-end scenarios 33 and 34
+// (core/integration/it_main.ml), which run it. Not a ctest test.
+//
+//   it_app <edit|follow> <bottle> <exe name> <number> <0xaddr> <new number>
+//
+// MOTH_HOME and MOTH_BIN come from the environment (it refuses to run without them, so it never
+// touches the default home), and the window is offscreen. It attaches from the game bar, types
+// <number> and Return, and finds the result at <0xaddr> that is a whole number, reading more of
+// the list as needed (the 20,000 rows the list holds at most); then it prints `listed`.
+//   edit:   types <new number> over that row's value, keeps the row as `points`, and waits for
+//           the kept table to show `points` and <new number>.
+//   follow: changes nothing itself, and waits up to 30 seconds for the list to read itself again
+//           (another client changes the hunt) and the row at <0xaddr> to show <new number>.
+// It prints one line per step as it goes, then `ok`, exit 0. A step that does not come true in
+// time prints what it waited for and the window's line, exit 1. Whatever happens, it ends by
+// itself after three minutes.
+
+#include <QApplication>
+#include <QCheckBox>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
+#include <QTableView>
+#include <QTimer>
+#include <algorithm>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <unistd.h>
+
+#include "board.hpp"
+#include "core_client.hpp"
+#include "game_bar.hpp"
+#include "kept_panel.hpp"
+#include "main_window.hpp"
+#include "paths.hpp"
+#include "results_model.hpp"
+#include "results_panel.hpp"
+#include "search_bar.hpp"
+
+namespace {
+
+constexpr unsigned overallSeconds = 180;
+const QString dot = QString::fromUtf8(" · ");
+
+void print(const QString &line) {
+  std::fputs(line.toUtf8().constData(), stdout);
+  std::fputc('\n', stdout);
+  std::fflush(stdout);
+}
+
+// the overall deadline: async-signal-safe, so it works even if the event loop is stuck
+void overran(int) {
+  static const char said[] = "failed: it_app ran past its three minutes\n";
+  ssize_t ignored = write(STDOUT_FILENO, said, sizeof said - 1);
+  (void)ignored;
+  _exit(1);
+}
+
+// a 0x address as a number; 0 when it isn't one
+quint64 addressOf(const QString &text) {
+  bool ok = false;
+  const quint64 a = text.toULongLong(&ok, 0);
+  return ok ? a : 0;
+}
+
+class Drive {
+public:
+  Drive(MainWindow &window, Board &board) : board_(board) {
+    line_ = need<QLabel>(&window, "line");
+    gameBar_ = need<GameBar>(&window, "gameBar");
+    gameLabel_ = need<QLabel>(gameBar_, "game");
+    number_ = need<QLineEdit>(need<SearchBar>(&window, "searchBar"), "number");
+    panel_ = need<ResultsPanel>(&window, "resultsPanel");
+    model_ = panel_->model();
+    results_ = need<QTableView>(panel_, "results");
+    all_ = need<QCheckBox>(panel_, "all");
+    kept_ = need<QTableView>(need<KeptPanel>(&window, "keptPanel"), "kept");
+    QObject::connect(&board, &Board::turned, [this] { ++turns_; });
+    QObject::connect(model_, &QAbstractItemModel::modelReset, [this] { ++resets_; });
+  }
+
+  [[noreturn]] void fail(const QString &why) {
+    print("failed: " + why + ". the window's line: " + (line_ ? line_->text() : QString()));
+    std::_Exit(1);
+  }
+
+  // runs the window until `done` is true; past `seconds`, fails saying what it waited for
+  void waitFor(const QString &what, int seconds, const std::function<bool()> &done) {
+    QElapsedTimer clock;
+    clock.start();
+    while (!done()) {
+      if (clock.elapsed() >= seconds * 1000) fail(what + ": not within " + QString::number(seconds) + " seconds");
+      QEventLoop loop;
+      QTimer::singleShot(10, &loop, &QEventLoop::quit);
+      loop.exec();
+    }
+  }
+
+  void attach(const QString &bottle, const QString &exe) {
+    waitFor("moth's background service to answer", 30, [this] { return board_.connected() && !board_.working(); });
+    print("the service answers");
+    gameBar_->attach(bottle, exe);
+    print("attach " + exe + " in " + bottle);
+    const QString shows = exe + dot + bottle + dot;
+    waitFor("the game bar to show " + shows + "...", 90, [&] { return gameLabel_->text().startsWith(shows, Qt::CaseInsensitive); });
+    print("the game bar shows " + gameLabel_->text());
+  }
+
+  // the number typed into the search box, then Return: with no hunt, a find
+  void search(const QString &number) {
+    waitFor("the search box to take a number", 30, [this] { return number_->isEnabled(); });
+    if (board_.hunt()) fail("a hunt is already under way before the search");
+    number_->setText(number);
+    const int turns = turns_;
+    QKeyEvent press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+    QKeyEvent release(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier);
+    QApplication::sendEvent(number_, &press);
+    QApplication::sendEvent(number_, &release);
+    print("typed " + number + ", Return");
+    waitFor("find " + number + " to end, with a hunt", 120,
+            [&] { return turns_ > turns && board_.hunt() && !board_.working() && number_->isEnabled(); });
+    print("the hunt: " + board_.counts().section('\n', 0, 0));
+    waitFor("the results list to show rows", 60, [this] { return model_->listed() && model_->rowCount() > 0 && model_->total() > 0; });
+    print("results: " + QString::number(model_->rowCount()) + " rows read of " + QString::number(model_->total()));
+    if (all_->isChecked()) all_->setChecked(false);
+    if (model_->all()) fail("show rarer forms is still on");
+    print("show rarer forms is off");
+  }
+
+  // the row of the list showing a whole number at `addr`, or -1
+  int rowAt(quint64 addr) const {
+    for (int r = 0; r < model_->rowCount(); ++r)
+      if (addressOf(cell(r, ResultsModel::Address)) == addr && cell(r, ResultsModel::Kind) == "whole number") return r;
+    return -1;
+  }
+
+  // the row at `addr` as far as the list is read, reading the next page when there is one
+  int look(quint64 addr) {
+    const int r = rowAt(addr);
+    if (r < 0 && model_->canFetchMore({})) model_->fetchMore({});
+    return r;
+  }
+
+  // every row the list will hold is read: all of them, or the cap
+  bool readToTheEnd() const {
+    return model_->listed() && !model_->canFetchMore({}) &&
+           model_->rowCount() >= std::min<qint64>(model_->total(), ResultsModel::cap);
+  }
+
+  // finds the row at `addr`, selects it and shows it, as a click on it would
+  int pick(const QString &address) {
+    const quint64 addr = addressOf(address);
+    int row = -1;
+    waitFor("a whole number at " + address + " in the list", 120, [&] {
+      row = look(addr);
+      return row >= 0 || readToTheEnd();
+    });
+    if (row < 0)
+      fail("no whole number at " + address + " among the " + QString::number(model_->rowCount()) + " rows read of " +
+           QString::number(model_->total()));
+    const QModelIndex at = model_->index(row, ResultsModel::Value);
+    results_->selectionModel()->setCurrentIndex(at, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    results_->scrollTo(at);
+    print("row " + cell(row, ResultsModel::Number) + " is at " + address + ", showing " + cell(row, ResultsModel::Value));
+    return row;
+  }
+
+  // types `value` over the row's value, then keeps the row as `name`
+  void edit(int row, const QString &address, const QString &value, const QString &name) {
+    const quint64 addr = addressOf(address);
+    waitFor("moth to be free for a write", 30, [this] { return !board_.working() && !model_->writing(); });
+    const int turns = turns_, resets = resets_;
+    if (!model_->setData(model_->index(row, ResultsModel::Value), value, Qt::EditRole))
+      fail("the list would not write " + value + " into row " + cell(row, ResultsModel::Number));
+    print("typed " + value + " over row " + cell(row, ResultsModel::Number));
+    // the write's event has come back and the list was checked after it (R14)
+    waitFor("row " + cell(row, ResultsModel::Number) + " to show " + value, 30, [&] {
+      return turns_ > turns && !board_.working() && !model_->writing() && row < model_->rowCount() &&
+             cell(row, ResultsModel::Value) == value;
+    });
+    stillSelected(row, addr, resets);
+    print("row " + cell(row, ResultsModel::Number) + " shows " + value + ", still selected");
+    panel_->keepSelected(name);
+    print("keep it as " + name);
+    waitFor("the kept table to show " + name + " " + value, 30, [&] { return keptShows(name, value); });
+    print("kept: " + name + " " + value);
+    stillSelected(row, addr, resets);
+  }
+
+  // waits for the list to be read again from the start and, read as far as needed, to show
+  // `value` at `address`
+  void follow(const QString &address, const QString &value) {
+    const quint64 addr = addressOf(address);
+    const int resets = resets_;
+    int row = -1;
+    waitFor("the list to read itself again and show " + value + " at " + address, 30, [&] {
+      if (resets_ == resets) return false;
+      row = look(addr);
+      return row >= 0 && cell(row, ResultsModel::Value) == value;
+    });
+    print("the list read itself again: row " + cell(row, ResultsModel::Number) + " is at " + address + ", showing " + value +
+          ", of " + QString::number(model_->total()));
+  }
+
+private:
+  template <typename W>
+  W *need(QObject *in, const QString &name) {
+    W *w = in->findChild<W *>(name);
+    if (!w) fail("the window has no " + name);
+    return w;
+  }
+
+  QString cell(int row, int column) const { return model_->data(model_->index(row, column)).toString(); }
+
+  // the list was not read again from the start, and `row` (still at `addr`) is the one selected
+  void stillSelected(int row, quint64 addr, int resets) {
+    if (resets_ != resets) fail("the results list was read again from the start after the write");
+    const QModelIndexList picked = results_->selectionModel()->selectedRows();
+    if (picked.size() != 1 || picked.first().row() != row || rowAt(addr) != row) fail("the row written is no longer the one selected");
+  }
+
+  bool keptShows(const QString &name, const QString &value) const {
+    const QAbstractItemModel *m = kept_->model();
+    for (int r = 0; r < m->rowCount(); ++r)
+      if (m->data(m->index(r, 0)).toString() == name && m->data(m->index(r, 1)).toString() == value) return true;
+    return false;
+  }
+
+  Board &board_;
+  QLabel *line_ = nullptr, *gameLabel_ = nullptr;
+  GameBar *gameBar_ = nullptr;
+  QLineEdit *number_ = nullptr;
+  ResultsPanel *panel_ = nullptr;
+  ResultsModel *model_ = nullptr;
+  QTableView *results_ = nullptr, *kept_ = nullptr;
+  QCheckBox *all_ = nullptr;
+  int turns_ = 0, resets_ = 0;
+};
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  std::signal(SIGALRM, overran);
+  alarm(overallSeconds);
+  const QString usage = "usage: it_app <edit|follow> <bottle> <exe name> <number> <0xaddr> <new number>";
+  if (argc != 7 || (qstrcmp(argv[1], "edit") != 0 && qstrcmp(argv[1], "follow") != 0)) {
+    std::fprintf(stderr, "%s\n", usage.toUtf8().constData());
+    return 2;
+  }
+  if (qEnvironmentVariableIsEmpty("MOTH_HOME") || qEnvironmentVariableIsEmpty("MOTH_BIN")) {
+    std::fprintf(stderr, "it_app needs MOTH_HOME and MOTH_BIN: it never uses the default home\n");
+    return 2;
+  }
+  if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
+
+  QApplication app(argc, argv);
+  const QString mode = argv[1], bottle = argv[2], exe = argv[3], number = argv[4], address = argv[5], value = argv[6];
+  if (addressOf(address) == 0) {
+    std::fprintf(stderr, "%s is not an address like 0x7ffe1234\n", argv[5]);
+    return 2;
+  }
+  CoreClient core(mothHome(), mothBin());
+  Board board(&core);
+  MainWindow window(&board);
+  window.show();
+  Drive drive(window, board);
+
+  drive.attach(bottle, exe);
+  drive.search(number);
+  const int row = drive.pick(address);
+  print("listed");
+  if (mode == "edit") drive.edit(row, address, value, "points");
+  else drive.follow(address, value);
+  print("ok");
+  return 0;
+}

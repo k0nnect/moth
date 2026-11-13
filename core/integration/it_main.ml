@@ -1,10 +1,12 @@
 (* End to end in a bottle: the moth command, its daemon and the helper against the stand-in game
    (tests/target/target.cpp), all running in the test bottle MOTH_TEST_BOTTLE through WINE.
-   Scenarios drive [bin/moth ... --json] as a subprocess and check its replies against what the
-   target reports. One line per scenario; the exit code is 1 when any scenario fails.
+   Scenarios drive [bin/moth --json ...] as a subprocess and check its replies against what the
+   target reports; a few speak to the daemon's socket themselves, and two drive the window
+   through <dir>/../build/app/it_app. One line per scenario; the exit code is 1 when any
+   scenario fails.
 
      it_main.exe [--bin <dir>] [-v] [scenario numbers]   (every scenario when none are given;
-                                                     -v shows each moth command and its output)
+                                         -v shows each moth command and its output, and it_app's)
 
    Runs under a fresh MOTH_HOME in /tmp, and stops the daemon and the targets afterwards, whatever
    happened. The home is removed when every scenario passed, and kept (for its logs) otherwise. *)
@@ -74,8 +76,9 @@ let run ~timeout argv =
 (* -v: every moth command and what it printed, on stderr *)
 let verbose = ref false
 
+(* --json first: after launch's path everything is the game's own *)
 let moth_raw ?(timeout = 900.) args =
-  let r = run ~timeout (Array.of_list ((exe "moth" :: args) @ [ "--json" ])) in
+  let r = run ~timeout (Array.of_list (exe "moth" :: "--json" :: args)) in
   if !verbose then Printf.eprintf "moth %s -> exit %d\n%s%s%!" (String.concat " " args) r.code r.out r.err;
   r
 
@@ -186,12 +189,13 @@ let target_log () = Filename.concat !home "target.log"
 (* what the latest attach said *)
 let attach_said = ref ""
 
-let with_target ?(name = "moth-target.exe") ?(filler_mb = 0) ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) ?(filler_half_mb = 0) f =
+(* [attach] false: the scenario attaches itself *)
+let with_target ?(name = "moth-target.exe") ?(attach = true) ?(filler_mb = 0) ?(filler_small_mb = 0) ?(filler_tiny_mb = 0) ?(filler_half_mb = 0) f =
   let t = Target_ctl.start ~filler_small_mb ~filler_tiny_mb ~filler_half_mb ~log:(target_log ()) ~exe:(exe name) ~filler_mb () in
   Fun.protect
     ~finally:(fun () -> Target_ctl.stop t)
     (fun () ->
-      attach_said := to_string (member "message" (moth [ "attach"; "--bottle"; bottle (); name ]));
+      if attach then attach_said := to_string (member "message" (moth [ "attach"; "--bottle"; bottle (); name ]));
       f t)
 
 let set_row (r : row) v = ignore (moth [ "set"; string_of_int r.n; v ])
@@ -673,6 +677,220 @@ let put_back () =
       let k = kept_one "total" in
       check (member "set_to" k = `String "9" && member "put_back" k = `Bool true) "kept shows total as %s, expected set_to \"9\" and put_back true" (show k))
 
+(* ---- the daemon's own socket, for what the command line never sends ---- *)
+
+type conn = { fd : Unix.file_descr; got : Buffer.t }
+
+let connect_core () =
+  let path = match Moth_core.Daemon.socket_path ~home:!home with Ok p -> p | Error m -> failwith m in
+  let fd = Unix.socket ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  match Unix.connect fd (Unix.ADDR_UNIX path) with
+  | () -> { fd; got = Buffer.create 4096 }
+  | exception Unix.Unix_error (e, _, _) ->
+      Unix.close fd;
+      failf "couldn't reach moth's daemon at %s (%s)" path (Unix.error_message e)
+
+let hang_up c = try Unix.close c.fd with Unix.Unix_error _ -> ()
+
+(* one request; [record] false asks it to leave no trace. A broken connection is an error, not a
+   SIGPIPE that ends the harness *)
+let request ?(record = true) c cmd =
+  let j =
+    `Assoc ([ ("id", `Int 1); ("actor", `String "user"); ("cmd", `String cmd); ("args", `List []); ("opts", `Assoc []) ] @ if record then [] else [ ("record", `Bool false) ])
+  in
+  let s = Yojson.Safe.to_string j ^ "\n" in
+  let pipe = Sys.signal Sys.sigpipe Sys.Signal_ignore in
+  Fun.protect
+    ~finally:(fun () -> Sys.set_signal Sys.sigpipe pipe)
+    (fun () -> try ignore (restart (fun () -> Unix.write_substring c.fd s 0 (String.length s))) with Unix.Unix_error (e, _, _) -> failf "couldn't send %s (%s)" cmd (Unix.error_message e))
+
+(* the next line the daemon writes, as json; None when none comes within [timeout] *)
+let line_from c ~timeout =
+  let deadline = now () +. timeout and chunk = Bytes.create 4096 in
+  let rec go () =
+    let s = Buffer.contents c.got in
+    match String.index_opt s '\n' with
+    | Some i ->
+        Buffer.clear c.got;
+        Buffer.add_string c.got (String.sub s (i + 1) (String.length s - i - 1));
+        Some (Yojson.Safe.from_string (String.sub s 0 i))
+    | None -> (
+        let left = deadline -. now () in
+        if left <= 0. then None
+        else
+          match restart (fun () -> Unix.select [ c.fd ] [] [] left) with
+          | [], _, _ -> go ()
+          | _ -> (
+              match restart (fun () -> Unix.read c.fd chunk 0 (Bytes.length chunk)) with
+              | 0 -> failwith "moth's daemon closed the connection"
+              | n ->
+                  Buffer.add_subbytes c.got chunk 0 n;
+                  go ()))
+  in
+  go ()
+
+(* the reply to the request just sent, which must say ok *)
+let answered c what =
+  match line_from c ~timeout:60. with
+  | Some r when member "ok" r = `Bool true -> r
+  | Some r -> failf "%s was refused: %s" what (show r)
+  | None -> failf "%s got no answer within 60s" what
+
+(* 31: a second client watches while the first works: the find as it starts and as it ends, its
+   event the newest in the log; then a read that leaves no trace, which the watcher never hears of *)
+let the_feed () =
+  with_target (fun _ ->
+      let w = connect_core () in
+      Fun.protect
+        ~finally:(fun () -> hang_up w)
+        (fun () ->
+          request w "watch";
+          ignore (answered w "watch");
+          ignore (find "3");
+          let heard what = match line_from w ~timeout:10. with Some l -> l | None -> failf "the watcher heard no %s within 10s" what in
+          (* a feed line [kind] (busy or event) for [cmd] *)
+          let is kind cmd l = match member kind l with `Assoc _ as o -> member "cmd" o = `String cmd | _ -> false in
+          let busy = heard "start of find 3" in
+          check (is "busy" "find" busy && member "args" (member "busy" busy) = `List [ `String "3" ]) "the watcher's first line after find 3 is %s, expected find's busy line" (show busy);
+          let ev = heard "event for find 3" in
+          check (is "event" "find" ev) "the watcher's second line after find 3 is %s, expected find's event" (show ev);
+          let seq = to_int (member "seq" (member "event" ev)) in
+          (match to_list (moth [ "log"; "-n"; "1" ]) with
+          | [ newest ] -> check (member "seq" newest = `Int seq) "moth log's newest event is %s; the watcher's find event has seq %d" (show newest) seq
+          | l -> failf "moth log -n 1 gave %s" (show (`List l)));
+          (* moth log is recorded too: the watcher hears it start and end *)
+          List.iter
+            (fun kind ->
+              let l = heard ("log's " ^ kind ^ " line") in
+              check (is kind "log" l) "the watcher heard %s, expected log's %s line" (show l) kind)
+            [ "busy"; "event" ];
+          let c = connect_core () in
+          Fun.protect ~finally:(fun () -> hang_up c) (fun () ->
+              request ~record:false c "status";
+              ignore (answered c "status with record false"));
+          match line_from w ~timeout:1. with None -> () | Some l -> failf "after a status with record false the watcher heard %s" (show l)))
+
+(* waits until moth's helper no longer lists [name] in the test bottle *)
+let gone_from_bottle name =
+  let deadline = now () +. 30. in
+  let rec go () =
+    let procs = to_list (moth [ "ps"; "--bottle"; bottle () ]) in
+    if not (List.exists (fun p -> String.lowercase_ascii (to_string (member "name" p)) = name) procs) then ()
+    else if now () > deadline then failf "%s is still running in %s 30s after it was told to quit: %s" name (bottle ()) (show (`List procs))
+    else (Unix.sleepf 0.5; go ())
+  in
+  go ()
+
+(* 32: moth launches the stand-in game, which connects back as when the harness starts it; games
+   remembers it, attach finds it by name, and it is told to quit *)
+let launched () =
+  let path = exe "moth-target.exe" in
+  if not (Sys.file_exists path) then failf "%s not found. run make helper." path;
+  let t = Target_ctl.adopt (fun port -> ignore (moth [ "launch"; "--bottle"; bottle (); path; string_of_int port ])) in
+  Fun.protect
+    ~finally:(fun () -> Target_ctl.stop t)
+    (fun () ->
+      let games = to_list (moth [ "games" ]) in
+      let this g = member "name" g = `String "moth-target.exe" && member "bottle" g = `String (bottle ()) && member "path" g = `String path in
+      check (List.exists this games) "games does not list moth-target.exe in %s at %s: %s" (bottle ()) path (show (`List games));
+      ignore (moth [ "attach"; "--bottle"; bottle (); "moth-target.exe" ]);
+      let attached = member "attached" (moth [ "status" ]) in
+      check (attached <> `Null && String.lowercase_ascii (to_string (member "name" attached)) = "moth-target.exe") "status after attach shows %s, not moth-target.exe" (show attached);
+      Target_ctl.quit t;
+      gone_from_bottle "moth-target.exe")
+
+(* ---- the window: build/app/it_app drives the real one, offscreen, against this home ---- *)
+
+let it_app () = Filename.concat (Filename.dirname !bin) "build/app/it_app"
+
+(* the environment with [vars] set, each replacing the value it had *)
+let env_with vars =
+  let unset e = not (List.exists (fun (k, _) -> String.starts_with ~prefix:(k ^ "=") e) vars) in
+  Array.of_list (List.filter unset (Array.to_list (Unix.environment ())) @ List.map (fun (k, v) -> k ^ "=" ^ v) vars)
+
+(* Runs it_app with [args] against this home's daemon, and hands [on_line] each line it prints as
+   it prints it. Its stderr (Qt's own notes) goes to it_app.log in the home. It must end with ok
+   and exit 0. It is killed when it runs past [timeout] (its own limit is 180s) or when [on_line]
+   fails. *)
+let app_ok ?(on_line = fun _ -> ()) ?(timeout = 240.) args =
+  let prog = it_app () in
+  if not (Sys.file_exists prog) then failf "%s not found. run make app." prog;
+  let env = env_with [ ("MOTH_BIN", exe "moth"); ("QT_QPA_PLATFORM", "offscreen") ] in
+  let out_r, out_w = Unix.pipe ~cloexec:true () in
+  let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
+  let err = Unix.openfile (Filename.concat !home "it_app.log") [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ] 0o644 in
+  let pid =
+    Fun.protect ~finally:(fun () -> List.iter Unix.close [ null; out_w; err ]) (fun () -> Unix.create_process_env prog (Array.of_list (prog :: args)) env null out_w err)
+  in
+  let lines = ref [] and partial = Buffer.create 256 and chunk = Bytes.create 4096 in
+  let rec take () =
+    let s = Buffer.contents partial in
+    match String.index_opt s '\n' with
+    | None -> ()
+    | Some i ->
+        let line = String.sub s 0 i in
+        Buffer.clear partial;
+        Buffer.add_string partial (String.sub s (i + 1) (String.length s - i - 1));
+        if !verbose then Printf.eprintf "it_app: %s\n%!" line;
+        lines := line :: !lines;
+        on_line line;
+        take ()
+  in
+  let deadline = now () +. timeout in
+  let rec pump () =
+    let left = deadline -. now () in
+    left > 0.
+    &&
+    match restart (fun () -> Unix.select [ out_r ] [] [] left) with
+    | [], _, _ -> pump ()
+    | _ -> (
+        match restart (fun () -> Unix.read out_r chunk 0 (Bytes.length chunk)) with
+        | 0 -> true
+        | n ->
+            Buffer.add_subbytes partial chunk 0 n;
+            take ();
+            pump ())
+  in
+  let reap () = match snd (restart (fun () -> Unix.waitpid [] pid)) with Unix.WEXITED c -> c | WSIGNALED s | WSTOPPED s -> 128 + abs s in
+  let stop () =
+    (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
+    ignore (reap ())
+  in
+  let finished = Fun.protect ~finally:(fun () -> Unix.close out_r) (fun () -> try pump () with e -> stop (); raise e) in
+  let printed () = String.concat " | " (List.rev !lines) in
+  if not finished then (
+    stop ();
+    failf "it_app %s did not finish within %.0fs. it printed: %s" (String.concat " " args) timeout (printed ()));
+  let code = reap () in
+  check (code = 0 && List.nth_opt !lines 0 = Some "ok") "it_app %s ended with exit %d. it printed: %s" (String.concat " " args) code (printed ())
+
+(* 33: the window against the real game: attached from the game bar, 3 typed and Return, the row
+   at points' address typed over with 9 and kept; the game then has 9 *)
+let window () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      let points = Target_ctl.var t "points" in
+      app_ok [ "edit"; bottle (); "moth-target.exe"; "3"; hex points.addr; "9" ];
+      expect t "points" "9")
+
+(* 34: the window lists a hunt; once it shows points' row, the game moves points to 4 and moth
+   next 4 runs from the command line. The list reads itself again and shows 4 there, with
+   nothing clicked *)
+let list_follows () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      let points = Target_ctl.var t "points" in
+      let narrowed = ref false in
+      let on_line = function
+        | "listed" ->
+            Target_ctl.set t "points" "4";
+            ignore (next "4");
+            narrowed := true
+        | _ -> ()
+      in
+      app_ok ~on_line [ "follow"; bottle (); "moth-target.exe"; "3"; hex points.addr; "4" ];
+      check !narrowed "it_app never printed listed")
+
 let scenarios =
   [
     (1, "decimal found from a whole number", decimal_from_whole);
@@ -705,6 +923,10 @@ let scenarios =
     (28, "a snapshot over the limit", snapshot_over_limit);
     (29, "zero and one, fast", zero_and_one);
     (30, "put back", put_back);
+    (31, "the feed", the_feed);
+    (32, "launch", launched);
+    (33, "the window", window);
+    (34, "the list follows", list_follows);
   ]
 
 let rec rm p =

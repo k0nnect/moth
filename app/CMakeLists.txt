@@ -30,6 +30,11 @@ target_link_libraries(moth_window PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Ne
 add_executable(moth-app src/main.cpp)
 target_link_libraries(moth-app PRIVATE moth_window)
 
+# the real window driven against the real core, for the end-to-end scenarios (make
+# test-integration runs it from core/integration): a plain program, not a ctest test
+add_executable(it_app test/it_app.cpp)
+target_link_libraries(it_app PRIVATE moth_window)
+
 # tests: each test/<name>.cpp is a program and a ctest test, run offscreen against the fake core.
 # A new test is one more name in the list.
 enable_testing()

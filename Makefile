@@ -32,10 +32,11 @@ test-native:
 test-core:
 	opam exec -- dune test
 
-# the window (Qt 6 from Homebrew's qtbase), into bin/moth-app
+# the window (Qt 6 from Homebrew's qtbase), into bin/moth-app; and build/app/it_app, which the
+# end-to-end scenarios drive it with
 app:
 	$(APP_CMAKE)
-	cmake --build build/app -j $(JOBS) --target moth-app
+	cmake --build build/app -j $(JOBS) --target moth-app it_app
 	mkdir -p bin
 	cp -f build/app/moth-app bin/moth-app
 
@@ -65,7 +66,7 @@ smoke: helper
 	@grep -q '"hello"' build/smoke.out && grep -q 'smoketoken' build/smoke.out && grep -q 'moth-helper.exe' build/smoke.out && echo "smoke ok"
 
 # end to end in the test bottle (MOTH_TEST_BOTTLE): every scenario, one line each. a few minutes.
-test-integration: build helper
+test-integration: build helper app
 	_build/default/core/integration/it_main.exe --bin "$(CURDIR)/bin"
 
 # scenario 10 alone: the real helper's scan speed under wine, on a 1 GB target
