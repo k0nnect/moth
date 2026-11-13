@@ -5,6 +5,7 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QPointer>
 #include <QPushButton>
 #include <QTableView>
 #include <QVBoxLayout>
@@ -20,6 +21,13 @@ QString commas(qint64 n) {
   for (qsizetype i = digits.size() - 3; i > 0; i -= 3) digits.insert(i, ',');
   return n < 0 ? "-" + digits : digits;
 }
+
+// a table that can say whether a cell is being typed in (the view keeps that to itself)
+class ResultsTable : public QTableView {
+public:
+  using QTableView::QTableView;
+  bool editing() const { return state() == EditingState; }
+};
 
 }  // namespace
 
@@ -42,9 +50,11 @@ ResultsPanel::ResultsPanel(Board *board, QWidget *parent) : QWidget(parent), boa
   top->addWidget(keep_);
   column->addLayout(top);
 
-  view_ = new QTableView(this);
+  auto *table = new ResultsTable(this);
+  view_ = table;
   view_->setObjectName("results");
   view_->setModel(model_);
+  model_->setEditedRow([table = QPointer<ResultsTable>(table)] { return table && table->editing() ? table->currentIndex().row() : -1; });
   view_->setSelectionBehavior(QAbstractItemView::SelectRows);
   view_->setSelectionMode(QAbstractItemView::SingleSelection);
   view_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |

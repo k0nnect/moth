@@ -185,6 +185,7 @@ void TestSearchBar::aHeldFindDisablesEverything() {
   QTest::keyClicks(number, "100");
   QTest::keyClick(number, Qt::Key_Return);
   QTest::keyClick(number, Qt::Key_Return);  // again at once, before the service has said it is working
+  QCOMPARE(rig.board.line(), QString("moth is busy: find 100"));  // Board::run refuses it, in words
   QTRY_VERIFY(rig.board.working());
   QVERIFY(!number->isEnabled());
   for (const char *name : everything) QVERIFY2(!button(bar, name)->isEnabled(), name);

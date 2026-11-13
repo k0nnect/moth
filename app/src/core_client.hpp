@@ -23,10 +23,14 @@ class CoreClient : public QObject {
   Q_OBJECT
 public:
   CoreClient(QString home, QString mothBin, QObject *parent = nullptr);
+  const QString &home() const;
   // one request on its own connection, actor "user"; `done` runs once, on the caller's thread, and
   // never before call() returns. When no service answers, a recorded request (the user's own
   // action) runs `mothBin status` once to start one and is tried again when that ends (10 seconds
-  // at most). An unrecorded one (a poll) never starts it: it fails at once.
+  // at most). An unrecorded one (a poll) never starts it: it fails at once. Failing because no
+  // service answers, the error is "moth's background service is not answering. see
+  // <home>/core.log", or, when the last try to run `mothBin` could not start it at all, "could
+  // not run <mothBin>. set MOTH_BIN to the moth program."
   void call(const QString &cmd, const QStringList &args, const Opts &opts, bool record,
             std::function<void(const Reply &)> done);
   // the app's start of the service, once, at launch: when nothing answers at the socket, runs
@@ -58,6 +62,7 @@ private:
 
   QString home_, mothBin_;
   QProcess *starting_ = nullptr;               // `moth status`, while it runs
+  bool cannotRun_ = false;                      // the last try to run `moth status` could not start it
   QList<std::function<void()>> waiting_;       // what goes on once it has ended
   bool feedStarted_ = false, feedUp_ = false;
   QString refusedWith_;                         // the last refusal said, until the feed is up

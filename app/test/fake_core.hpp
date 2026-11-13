@@ -45,6 +45,12 @@ public:
   // answer every `watch` with this error (as the daemon answers a 17th watcher `too many watchers`)
   // and close it; "" accepts watchers again
   void refuseWatch(const QString &error);
+  // the game `name` closes: the next unrecorded `status` finds it gone, as the daemon's does. It is
+  // answered {"attached":null,"hunt":null,"closed":name} with the text "not attached. <name>
+  // closed.", and recorded all the same (R4): its event goes to watchers before the reply, with no
+  // busy line before it. From then on `status` answers `not attached` (what `on` registered for
+  // it is dropped)
+  void closeGame(const QString &name);
 
 private:
   struct Held { QPointer<QLocalSocket> socket; QJsonValue id; Seen request; };
@@ -65,6 +71,7 @@ private:
   QList<Opts> watches_;
   bool feedRequests_ = true;
   QString refuseWatch_;
+  QString closing_;          // the game the next unrecorded status finds closed, or ""
   qint64 seq_ = 0;
 };
 

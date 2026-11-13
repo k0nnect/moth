@@ -9,6 +9,7 @@
 #include <QMenu>
 #include <QPointer>
 #include <QPushButton>
+#include <utility>
 
 #include "board.hpp"
 
@@ -45,6 +46,10 @@ GameBar::GameBar(Board *board, QWidget *parent) : QWidget(parent), board_(board)
   step_.setSingleShot(false);
   connect(&step_, &QTimer::timeout, this, &GameBar::look);
   connect(board, &Board::changed, this, &GameBar::showState);
+  // the launched program is attached (whoever attached it): the wait is over
+  connect(board, &Board::changed, this, [this] {
+    if (arrived()) stopWaiting();
+  });
   showState();
 }
 
@@ -82,13 +87,20 @@ void GameBar::launch(const QString &bottle, const QString &path) {
   });
 }
 
+QString GameBar::waitingLine() const { return "waiting for " + waitName_ + " to start" + ellipsis; }
+
+bool GameBar::arrived() const {
+  const auto &a = board_->attached();
+  return waiting_ && a && a->name.compare(waitName_, Qt::CaseInsensitive) == 0;
+}
+
 void GameBar::startWaiting(const QString &bottle, const QString &name) {
   waiting_ = true;
   ++generation_;
   waitBottle_ = bottle;
   waitName_ = name;
   waited_ = 0;
-  board_->say("waiting for " + name + " to start" + ellipsis);
+  board_->say(waitingLine());
   step_.start(stepMs_);
   look();
 }
@@ -99,34 +111,55 @@ void GameBar::stopWaiting() {
   ++generation_;
 }
 
-// one step: the first comes at once, then one every step until the limit
+// One step: the first comes at once, then one every step until the limit. Once the program is
+// listed in its bottle it is attached; the wait ends when the board shows it attached, so an
+// attach that is refused, or not sent because moth is busy, is tried again at the next step.
 void GameBar::look() {
   if (!waiting_) return;
+  if (arrived()) {
+    stopWaiting();
+    return;
+  }
   if (waited_ >= limitMs_) {
     const QString name = waitName_, bottle = waitBottle_;
     stopWaiting();
-    board_->say(name + " did not show up in " + bottle + " after " + QString::number(limitMs_ / 1000) +
-                " seconds. pick it once it is running.");
+    board_->say(name + " did not show up in " + bottle + " after " + QString::number(limitMs_ / 1000) + " seconds. see " +
+                board_->home() + "/launch.log, or pick it once it is running.");
     return;
   }
   waited_ += stepMs_;
-  board_->say("waiting for " + waitName_ + " to start" + ellipsis);  // an event may have replaced it
+  // said again when an event replaced it with nothing, but never over what the user's own action
+  // said, such as why an attach was refused
+  if (board_->line().isEmpty() || board_->line() == waitingLine()) board_->say(waitingLine());
   const int gen = generation_;
   const QString bottle = waitBottle_, name = waitName_;
-  board_->read("ps", {}, {{"bottle", bottle}}, [this, gen, bottle, name](const Reply &r) {
-    if (gen != generation_ || !r.ok) return;
+  readPs(bottle, [this, gen, bottle, name](const Reply &r) {
+    if (gen != generation_ || !r.ok || !board_->busyText().isEmpty()) return;
     for (const QJsonValue &p : r.result.toArray()) {
       const QString listed = p.toObject().value("name").toString();
       if (listed.compare(name, Qt::CaseInsensitive) == 0) {
-        attach(bottle, listed);
+        board_->run("attach", {listed}, {{"bottle", bottle}});
         return;
       }
     }
   });
 }
 
-QString GameBar::notSent() const {
-  return board_->working() ? "moth is busy: " + board_->what() : QString::fromUtf8("moth is starting…");
+// every `ps` the bar sends goes through here: one the same as a ps still out is not sent again
+// (Board::read would answer only the first caller), and its reply goes to every caller
+bool GameBar::readPs(const QString &bottle, std::function<void(const Reply &)> then) {
+  if (psOut_.contains(bottle)) {
+    psOut_[bottle].append(std::move(then));
+    return true;
+  }
+  QPointer<GameBar> self(this);
+  const bool sent = board_->read("ps", {}, {{"bottle", bottle}}, [self, bottle](const Reply &r) {
+    if (!self) return;
+    for (const auto &f : self->psOut_.take(bottle))
+      if (f) f(r);
+  });
+  if (sent) psOut_.insert(bottle, {std::move(then)});
+  return sent;
 }
 
 // whichever reply comes fills the menu, however many times it was opened meanwhile
@@ -135,7 +168,7 @@ void GameBar::fillMenu() {
   separator_ = nullptr;
   QPointer<GameBar> self(this);
   if (!board_->read("bottles", {}, {}, [self](const Reply &r) { if (self) self->fillTop(r); })) {
-    menu_->addAction(notSent())->setEnabled(false);
+    menu_->addAction(board_->busyText())->setEnabled(false);
     return;
   }
   menu_->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
@@ -151,12 +184,14 @@ void GameBar::fillTop(const Reply &r) {
       const QString bottle = b.toString();
       QMenu *sub = menu_->addMenu(bottle);
       connect(sub, &QMenu::aboutToShow, this, [self, sub, bottle] { if (self) self->fillBottle(sub, bottle); });
+      // closed before its turn to look: it no longer waits for one
+      connect(sub, &QMenu::aboutToHide, this, [self, sub] { if (self && self->next_ == sub) self->next_ = nullptr; });
     }
   }
   separator_ = menu_->addSeparator();
   QPointer<GameBar> self(this);
   if (!board_->read("games", {}, {}, [self](const Reply &g) { if (self) self->fillGames(g); }))
-    menu_->addAction(notSent())->setEnabled(false);
+    menu_->addAction(board_->busyText())->setEnabled(false);
 }
 
 // what follows the separator is replaced, so a late reply never doubles the entries
@@ -178,26 +213,56 @@ void GameBar::fillGames(const Reply &g) {
   menu_->addAction(QString::fromUtf8("another game…"), this, [self] { if (self) self->askForAnotherGame(); });
 }
 
+// Looking in a bottle can start wine there, and the core does one thing at a time, so the menu
+// looks in one bottle at a time and the line says which. A submenu opened meanwhile says whose
+// turn it is and looks once that is done, if it is still the one open.
 void GameBar::fillBottle(QMenu *submenu, const QString &bottle) {
   submenu->clear();
+  if (!looking_.isEmpty()) {
+    next_ = submenu;
+    nextBottle_ = bottle;
+    submenu->addAction(looking_ == bottle ? QString::fromUtf8("looking…") : "looking in " + looking_ + " first" + ellipsis)->setEnabled(false);
+    return;
+  }
   QPointer<GameBar> self(this);
   QPointer<QMenu> sub(submenu);
-  const bool sent = board_->read("ps", {}, {{"bottle", bottle}}, [self, sub, bottle](const Reply &r) {
-    if (!self || !sub) return;
-    sub->clear();
-    if (!r.ok) {
-      sub->addAction(r.error)->setEnabled(false);
-      return;
-    }
-    const QJsonArray procs = r.result.toArray();
-    if (procs.isEmpty()) sub->addAction(r.text)->setEnabled(false);
-    for (const QJsonValue &p : procs) {
-      const QString name = p.toObject().value("name").toString();
-      sub->addAction(name, self.data(), [self, bottle, name] { if (self) self->attach(bottle, name); });
-    }
-  });
-  if (sent) submenu->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
-  else submenu->addAction(notSent())->setEnabled(false);
+  if (!readPs(bottle, [self, sub, bottle](const Reply &r) { if (self) self->looked(sub, bottle, r); })) {
+    submenu->addAction(board_->busyText())->setEnabled(false);
+    return;
+  }
+  looking_ = bottle;
+  lineBefore_ = board_->line();
+  board_->say("looking in " + bottle + ellipsis);
+  submenu->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
+}
+
+// the menu's `ps` came back: its submenu is filled, and the line says what the core said when
+// nothing is running there (or its error), else goes back to what it said before
+void GameBar::looked(QMenu *submenu, const QString &bottle, const Reply &r) {
+  looking_.clear();
+  if (submenu) showProcesses(submenu, bottle, r);
+  if (!r.ok) board_->say(r.error);
+  else if (r.result.toArray().isEmpty()) board_->say(r.text);
+  else if (board_->line() == "looking in " + bottle + ellipsis) board_->say(lineBefore_);
+  QPointer<QMenu> next = std::exchange(next_, nullptr);
+  if (!next) return;
+  if (nextBottle_ == bottle) showProcesses(next, bottle, r);
+  else fillBottle(next, nextBottle_);
+}
+
+void GameBar::showProcesses(QMenu *submenu, const QString &bottle, const Reply &r) {
+  submenu->clear();
+  if (!r.ok) {
+    submenu->addAction(r.error)->setEnabled(false);
+    return;
+  }
+  const QJsonArray procs = r.result.toArray();
+  if (procs.isEmpty()) submenu->addAction(r.text)->setEnabled(false);
+  QPointer<GameBar> self(this);
+  for (const QJsonValue &p : procs) {
+    const QString name = p.toObject().value("name").toString();
+    submenu->addAction(name, this, [self, bottle, name] { if (self) self->attach(bottle, name); });
+  }
 }
 
 void GameBar::askForAnotherGame() {
@@ -215,5 +280,5 @@ void GameBar::askForAnotherGame() {
     const QString bottle = QInputDialog::getItem(self, "pick a bottle", "bottle", bottles, 0, false, &ok);
     if (ok) self->launch(bottle, path);
   });
-  if (!sent) board_->say(notSent());
+  if (!sent) board_->say(board_->busyText());
 }

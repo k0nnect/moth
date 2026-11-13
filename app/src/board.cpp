@@ -7,6 +7,7 @@
 namespace {
 
 const QString lostLine = QString::fromUtf8("lost moth's background service. trying again…");
+const QString stoppedLine = "moth's background service was stopped. it starts again with your next action.";
 
 std::optional<Attached> attachedOf(const QJsonValue &v) {
   if (!v.isObject()) return std::nullopt;
@@ -66,16 +67,29 @@ void Board::say(const QString &line) {
   emit changed();
 }
 
-void Board::run(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> then) {
-  if (working_) {
-    say("moth is busy: " + what_);
-    return;
+QString Board::home() const { return core_->home(); }
+
+QString Board::busyText() const {
+  if (!running_.isEmpty()) return "moth is busy: " + running_;
+  if (working_) return "moth is busy: " + what_;
+  if (starting_) return QString::fromUtf8("moth is starting…");
+  return {};
+}
+
+bool Board::run(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> then) {
+  // one of the user's own at a time, even before the feed says the first has started
+  if (!running_.isEmpty() || working_) {
+    say(busyText());
+    return false;
   }
+  running_ = (QStringList{cmd} + args).join(' ');
   core_->call(cmd, args, opts, true, [self = QPointer<Board>(this), then](const Reply &r) {
     if (!self) return;
+    self->running_.clear();
     self->say(r.ok ? r.text : r.error);  // all its lines; its event (the first line) leaves them
     if (then) then(r);
   });
+  return true;
 }
 
 bool Board::read(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done) {
@@ -114,6 +128,8 @@ void Board::ended(const QJsonObject &ev) {
   const QString said = ev.value("actor").toString() == "user" ? summary : "agent: " + summary;
   working_ = false;
   what_.clear();
+  // the stop's own event comes just before the feed drops: the drop is then said as a stop
+  stopped_ = ev.value("cmd").toString() == "stop" && ev.value("ok").toBool();
   // the user's own action already shows its whole answer, whose first line this is
   if (said != line_.section('\n', 0, 0)) line_ = said;
   owesLine_ = false;
@@ -125,7 +141,7 @@ void Board::ended(const QJsonObject &ev) {
 void Board::feedWent(bool up) {
   connected_ = up;
   if (up) {
-    lost_ = false;
+    lost_ = stopped_ = false;
     // the line still shows why the feed was refused, which is over: the next status read is said
     if (!refusal_.isEmpty() && line_ == refusal_) needStatus_ = owesLine_ = true;
     refusal_.clear();
@@ -137,7 +153,7 @@ void Board::feedWent(bool up) {
   // the service, so the feed can't come back before it is over
   working_ = false;
   what_.clear();
-  line_ = lostLine;
+  line_ = stopped_ ? stoppedLine : lostLine;
   lost_ = needStatus_ = owesLine_ = true;
   emit changed();
 }

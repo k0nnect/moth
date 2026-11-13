@@ -26,6 +26,7 @@ private slots:
   void anUnrecordedCallNeverStartsTheService();
   void theStartAtLaunchRunsMothOnlyWhenNothingAnswers();
   void aHungStartIsGivenUpOn();
+  void aMothThatCannotBeRunIsNamed();
 };
 
 namespace {
@@ -270,6 +271,41 @@ void TestCoreClient::aHungStartIsGivenUpOn() {
   const pid_t pid = f.readAll().trimmed().toInt();
   QVERIFY(pid > 0);
   QTRY_VERIFY(::kill(pid, 0) != 0);  // killed, and reaped once `finished` came
+}
+
+// F7: a `moth` program that can't be run at all is named, with where to set it, instead of
+// pointing at core.log; once one runs, the old words come back
+void TestCoreClient::aMothThatCannotBeRunIsNamed() {
+  QTemporaryDir home("/tmp/moth-app-XXXXXX");
+  const QString missing = home.filePath("fake-moth");  // where FakeMoth writes one, later
+  CoreClient core(home.path(), missing);
+  const QString named = "could not run " + missing + ". set MOTH_BIN to the moth program.";
+
+  std::optional<Reply> got;
+  core.call("find", {"100"}, {}, true, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QVERIFY(!got->ok);
+  QCOMPARE(got->error, named);
+  got.reset();
+  core.call("status", {}, {}, false, [&](const Reply &r) { got = r; });  // a poll says the same
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(got->error, named);
+
+  int over = 0;
+  core.startService([&] { ++over; });  // the window's own start: the same
+  QTRY_COMPARE(over, 1);
+  got.reset();
+  core.call("status", {}, {}, false, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(got->error, named);
+
+  FakeMoth moth(home.path());  // now there is one, which runs (and starts nothing)
+  QCOMPARE(moth.path, missing);
+  got.reset();
+  core.call("find", {"100"}, {}, true, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(got->error, "moth's background service is not answering. see " + home.path() + "/core.log");
+  QCOMPARE(moth.runs().size(), 1);
 }
 
 QTEST_GUILESS_MAIN(TestCoreClient)

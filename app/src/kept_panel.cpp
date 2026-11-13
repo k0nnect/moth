@@ -13,6 +13,10 @@
 
 #include "board.hpp"
 
+namespace {
+const QString nothingKept = "nothing kept yet. select a result and press keep.";
+}
+
 // The kept values as the core last listed them. There are only a handful, so one read fills it.
 // The same names in the same order are updated in place (selection stays); anything else is
 // rebuilt. A typed value shows in its cell only once the core says it was written.
@@ -39,17 +43,17 @@ public:
     if (index.isValid() && index.column() == Value && !board_->working()) f |= Qt::ItemIsEditable;
     return f;
   }
-  // `set <name> <text>`. False when nothing is sent (nothing typed, the value it shows, moth busy)
+  // `set <name> <text>`. False when nothing is sent (nothing typed, the value it shows, moth busy:
+  // Board::run says so)
   bool setData(const QModelIndex &index, const QVariant &value, int role = Qt::EditRole) override {
     if (role != Qt::EditRole || !index.isValid() || index.column() != Value || index.row() >= rows_.size()) return false;
     const QString text = value.toString().trimmed();
     const QString name = rows_[index.row()].name;
-    if (text.isEmpty() || text == rows_[index.row()].shown || board_->working()) return false;
+    if (text.isEmpty() || text == rows_[index.row()].shown) return false;
     QPointer<KeptModel> self(this);
-    board_->run("set", {name, text}, {}, [self, name, text](const Reply &r) {
+    return board_->run("set", {name, text}, {}, [self, name, text](const Reply &r) {
       if (self && r.ok) self->show(name, text);
     });
-    return true;
   }
 
   QString nameAt(int row) const { return row >= 0 && row < rows_.size() ? rows_[row].name : QString(); }
@@ -142,7 +146,7 @@ KeptPanel::KeptPanel(Board *board, QWidget *parent) : QWidget(parent), board_(bo
   view_->horizontalHeader()->setStretchLastSection(true);
   column->addWidget(view_, 1);
 
-  nothing_ = new QLabel("nothing kept yet. select a result and press keep.", this);
+  nothing_ = new QLabel(nothingKept, this);
   nothing_->setObjectName("nothing");
   nothing_->setTextFormat(Qt::PlainText);
   nothing_->setWordWrap(true);
@@ -153,18 +157,23 @@ KeptPanel::KeptPanel(Board *board, QWidget *parent) : QWidget(parent), board_(bo
   connect(view_->selectionModel(), &QItemSelectionModel::selectionChanged, this, &KeptPanel::showState);
   connect(model_, &QAbstractItemModel::modelReset, this, &KeptPanel::showState);
 
-  // read `kept` again; the cell being typed in keeps its text. With no game nothing is read.
-
+  // read `kept` again; the cell being typed in keeps its text. With no game nothing is read. A
+  // read that fails says why in this panel, until one works
   auto refresh = [this] {
     if (!board_->attached()) return;
     QPointer<KeptPanel> self(this);
     board_->read("kept", {}, {}, [self](const Reply &r) {
-      if (!self || !r.ok || !self->board_->attached()) return;
+      if (!self || !self->board_->attached()) return;
+      if (!r.ok) {
+        self->error_ = r.error;
+        self->showState();
+        return;
+      }
       const QModelIndex cur = self->view_->currentIndex();
-      const QString editing =
-          self->view_->editing() ? self->model_->nameAt(cur.row()) : QString();
+      const QString editing = self->view_->editing() ? self->model_->nameAt(cur.row()) : QString();
       self->model_->load(r.result.toArray(), editing);
       self->loaded_ = true;
+      self->error_.clear();
       self->showState();
     });
   };
@@ -173,6 +182,7 @@ KeptPanel::KeptPanel(Board *board, QWidget *parent) : QWidget(parent), board_(bo
   connect(board, &Board::changed, this, [this, refresh] {
     if (!board_->attached()) {
       loaded_ = false;
+      error_.clear();
       model_->clear();
     } else if (!wasAttached_) {
       refresh();
@@ -189,9 +199,12 @@ void KeptPanel::showState() {
   const bool idle = !board_->working();
   forget_->setEnabled(idle && view_->selectionModel()->hasSelection());
   undo_->setEnabled(idle);
+  // the label says nothing is kept, or why the last read failed
+  const bool failed = !error_.isEmpty() && board_->attached();
   const bool none = loaded_ && board_->attached() && model_->empty();
-  nothing_->setVisible(none);
-  view_->setVisible(!none);
+  nothing_->setText(failed ? error_ : nothingKept);
+  nothing_->setVisible(failed || none);
+  view_->setVisible(!(failed || none) || !model_->empty());
 }
 
 void KeptPanel::forgetSelected() {

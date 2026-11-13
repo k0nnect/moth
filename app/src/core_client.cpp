@@ -44,6 +44,8 @@ struct CoreClient::Exchange {
 CoreClient::CoreClient(QString home, QString mothBin, QObject *parent)
     : QObject(parent), home_(std::move(home)), mothBin_(std::move(mothBin)) {}
 
+const QString &CoreClient::home() const { return home_; }
+
 QString CoreClient::socketPath() const { return home_ + "/core.sock"; }
 
 void CoreClient::call(const QString &cmd, const QStringList &args, const Opts &opts, bool record,
@@ -78,7 +80,8 @@ void CoreClient::attempt(const std::shared_ptr<Exchange> &x) {
     } else if (*reached) {
       finish(failure("lost contact with moth's background service. see " + home_ + "/core.log"));
     } else if (x->retried || !x->mayStart) {
-      finish(failure("moth's background service is not answering. see " + home_ + "/core.log"));
+      finish(failure(cannotRun_ ? "could not run " + mothBin_ + ". set MOTH_BIN to the moth program."
+                                : "moth's background service is not answering. see " + home_ + "/core.log"));
     } else {
       x->retried = true;
       QObject::disconnect(s, nullptr, this, nullptr);
@@ -129,11 +132,13 @@ void CoreClient::runMoth(std::function<void()> then) {
       if (next) next();
   };
   // nothing waits on the process: it is deleted once it has ended, however it ends
+  connect(p, &QProcess::started, this, [this] { cannotRun_ = false; });
   connect(p, &QProcess::finished, this, over);
   connect(p, &QProcess::finished, p, &QObject::deleteLater);
   connect(
-      p, &QProcess::errorOccurred, this, [over, p](QProcess::ProcessError e) {
+      p, &QProcess::errorOccurred, this, [this, over, p](QProcess::ProcessError e) {
         if (e != QProcess::FailedToStart) return;
+        cannotRun_ = true;
         over();
         p->deleteLater();
       },

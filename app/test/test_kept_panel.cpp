@@ -92,6 +92,8 @@ private slots:
   void noGameMeansAnEmptyTableAndNoRequest();
   void buttonsAreDisabledWhileWorking();
   void itIsLastInTheWindowsColumn();
+  void anEditCommittedWhileBusyIsSaid();
+  void aFailedReadIsShownInThePanel();
 };
 
 void TestKeptPanel::twoKeptValuesAppear() {
@@ -288,6 +290,56 @@ void TestKeptPanel::itIsLastInTheWindowsColumn() {
   QCOMPARE(w.column()->itemAt(w.column()->count() - 1)->widget(), panel);
   QCOMPARE(w.column()->count(), 4);
   QVERIFY(w.findChild<QTableView *>("kept"));
+}
+
+// F4: a value typed while moth turns busy is not dropped silently: the line says what is running
+void TestKeptPanel::anEditCommittedWhileBusyIsSaid() {
+  KeptRig h;
+  QVERIFY(h.start());
+  QTRY_COMPARE(h.view->model()->rowCount(), 2);
+  QLineEdit *e = h.edit(0);
+  QVERIFY(e);
+  e->selectAll();
+  QTest::keyClicks(e, "5");
+  h.rig.fake.push({{"busy", QJsonObject{{"actor", "agent"}, {"cmd", "next"}, {"args", QJsonArray{"down"}}}}});
+  QTRY_VERIFY(h.rig.board.working());
+  QTest::keyClick(e, Qt::Key_Return);
+  QTRY_COMPARE(h.rig.board.line(), QString("moth is busy: next down (agent)"));
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(h.rig.fake, "set"), 0);
+  QCOMPARE(h.cell(0, 1), QString("10"));
+}
+
+// F7: a `kept` read that fails says so in the panel, in the core's words, until one works; the
+// window's line is left to the user's actions
+void TestKeptPanel::aFailedReadIsShownInThePanel() {
+  KeptRig h;
+  QVERIFY(h.start());
+  QTRY_COMPARE(h.view->model()->rowCount(), 2);
+  const QString line = h.rig.board.line();
+  bool failing = true;
+  h.rig.fake.on("kept", [&](const QStringList &, const Opts &) {
+    return failing ? refused("couldn't read the kept values") : ok(h.kept);
+  });
+  h.rig.board.tick();
+  QTRY_VERIFY(h.nothing->isVisible());
+  QCOMPARE(h.nothing->text(), QString("couldn't read the kept values"));
+  QVERIFY(h.view->isVisible());  // the values it had stay
+  QCOMPARE(h.rig.board.line(), line);
+
+  h.kept = QJsonArray();
+  h.rig.board.tick();  // still failing, with nothing kept as far as it knows
+  QTest::qWait(100);
+  QCOMPARE(h.nothing->text(), QString("couldn't read the kept values"));
+  failing = false;
+  h.rig.board.tick();
+  QTRY_COMPARE(h.nothing->text(), QString("nothing kept yet. select a result and press keep."));
+  QVERIFY(h.nothing->isVisible());
+  QVERIFY(!h.view->isVisible());
+  h.kept = QJsonArray{item("xp", "0x6c551068", "whole number", "92")};
+  h.rig.board.tick();
+  QTRY_VERIFY(h.view->isVisible());
+  QVERIFY(!h.nothing->isVisible());
 }
 
 QTEST_MAIN(TestKeptPanel)

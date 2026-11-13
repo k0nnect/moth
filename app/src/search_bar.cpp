@@ -56,7 +56,7 @@ SearchBar::SearchBar(Board *board, QWidget *parent) : QWidget(parent), board_(bo
 }
 
 void SearchBar::showState() {
-  const bool free = board_->attached().has_value() && !board_->working() && !sending_;
+  const bool free = board_->attached().has_value() && !board_->working();
   const auto &hunt = board_->hunt();
   number_->setEnabled(free);
   hunt_->setEnabled(free);
@@ -96,17 +96,11 @@ void SearchBar::snapshot() { step("snapshot", {}); }
 
 void SearchBar::compare(const QString &how) { step("next", {how}); }
 
+// a second press before the first step is answered sends nothing: Board::run refuses it and the
+// line says what is running
 void SearchBar::step(const QString &cmd, const QStringList &args) {
-  if (sending_) return;  // a second press before the first step is seen to start sends nothing
-  if (board_->working()) {
-    board_->run(cmd, args);  // refused: the line says what is running
-    return;
-  }
-  sending_ = true;
-  showState();
   board_->run(cmd, args, {}, [self = QPointer<SearchBar>(this)](const Reply &r) {
     if (!self) return;
-    self->sending_ = false;
     self->selectNext_ = r.ok;
     self->showState();
   });

@@ -32,17 +32,25 @@ public:
   bool connected() const;
   QString line() const;      // the newest thing to tell the user
   void say(const QString &line);
-  // a recorded request as the user. Refused while working: line becomes "moth is busy: <what>",
-  // nothing is sent and `then` is not called. The core's whole answer becomes the line, all its
+  QString home() const;      // moth's home, as the client uses it
+  // why a request would not be sent now: "moth is busy: <words>" while one of the user's own
+  // requests is unanswered (its words: "undo", "find 100") or while working ("moth is busy: " +
+  // what()); "moth is starting…" while the service is being started at the board's start; ""
+  // when nothing stands in the way
+  QString busyText() const;
+  // a recorded request as the user; true when it was sent. Refused while one of the user's own
+  // requests is still unanswered, or while working: the line becomes busyText(), nothing is sent,
+  // `then` is not called, and it returns false. The core's whole answer becomes the line, all its
   // lines: the text when it worked, the error when it failed; its event (whose summary is the
   // answer's first line) leaves it so. With no service answering, it starts one.
-  void run(const QString &cmd, const QStringList &args = {}, const Opts &opts = {},
+  bool run(const QString &cmd, const QStringList &args = {}, const Opts &opts = {},
            std::function<void(const Reply &)> then = {});
-  // an unrecorded read. Dropped (and `done` never called) while working, while the service is
-  // being started at the board's start, or when a read with the same command, arguments and
-  // options is still out. It never starts the service. Returns true when the read was sent or an
-  // identical one is out (a reply will come), false when it was dropped for working or starting
-  // (no reply will come).
+  // an unrecorded read. Dropped while working or while the service is being started at the
+  // board's start: it returns false, and `done` is never called. When a read with the same
+  // command, arguments and options is still out, nothing more is sent and it returns true, but
+  // this `done` is never called either: only the first caller's is, once its reply comes.
+  // Otherwise the read is sent and it returns true; `done` is called once with its reply. It never
+  // starts the service.
   bool read(const QString &cmd, const QStringList &args, const Opts &opts,
             std::function<void(const Reply &)> done);
   void tick();               // the once-a-second poll; the window calls it from a timer while visible
@@ -69,8 +77,10 @@ private:
   std::optional<Attached> attached_;
   std::optional<Hunt> hunt_;
   QString counts_, what_, line_;
+  QString running_;            // the words of the user's own request still unanswered, or ""
   bool working_ = false, connected_ = false;
   bool lost_ = false;          // the feed went down and has not come back
+  bool stopped_ = false;       // the last event was a stop: the feed is about to drop
   bool starting_ = true;       // the start of the service at the board's start is under way
   bool needStatus_ = true;     // no status read has come back since the start or since the feed was lost
   bool owesLine_ = true;       // ... and nothing newer has been said: that status read is said

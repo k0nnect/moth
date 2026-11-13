@@ -9,9 +9,9 @@ class QPushButton;
 
 // The second panel: a box for the number the game shows, with no type to choose, and the steps of
 // a hunt. Return narrows when a hunt is in progress and starts one otherwise. Everything is
-// disabled with no game attached, while moth is working, and while its own step is on its way;
-// `narrow` needs a hunt, and the four relations a hunt that can be compared by change. What it
-// shows follows Board::changed.
+// disabled with no game attached and while moth is working; a step pressed while the last is still
+// unanswered is refused by Board::run. `narrow` needs a hunt, and the four relations a hunt that
+// can be compared by change. What it shows follows Board::changed.
 class SearchBar : public QWidget {
   Q_OBJECT
 public:
@@ -32,6 +32,5 @@ private:
   QPushButton *hunt_, *narrow_, *snapshot_;
   QList<QPushButton *> relations_;
   QLabel *counts_;
-  bool sending_ = false;     // our own step is on its way: one at a time, even before the feed says so
   bool selectNext_ = false;  // a step worked: the box's text is selected once it can be typed in
 };

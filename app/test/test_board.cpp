@@ -24,6 +24,10 @@ private slots:
   void ticksDoNotPileUp();
   void readSaysWhetherAReplyWillCome();
   void huntFromStatus();
+  void twoRunsBeforeTheFeedSaysSendOne();
+  void busyTextSaysWhatStandsInTheWay();
+  void theGameClosingAsTheCoreRecordsIt();
+  void aStopFromElsewhereIsSaidAsAStop();
 };
 
 namespace {
@@ -412,6 +416,100 @@ void TestBoard::huntFromStatus() {
   QCOMPARE(h->canCompare, false);
   QCOMPARE(rig.board.counts(), QString("241,178 matches\n5,000,000,000 more in rarer forms"));
   QCOMPARE(rig.board.line(), discoLine);  // the first status read says where things stand
+}
+
+// F4: two presses of `undo last change` before the feed has said the first one started send one
+// request; the second is refused in words, and its `then` is never called
+void TestBoard::twoRunsBeforeTheFeedSaysSendOne() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.feedRequests(false);  // no busy line comes: the service is busy with something else
+  rig.fake.on("undo", [](const QStringList &, const Opts &) { return Reply{true, QJsonObject{}, "restored #3 to 100", {}}; });
+  rig.fake.hold("undo");
+  int first = 0, second = 0;
+  QVERIFY(rig.board.run("undo", {}, {}, [&](const Reply &) { ++first; }));
+  QVERIFY(!rig.board.run("undo", {}, {}, [&](const Reply &) { ++second; }));
+  QCOMPARE(rig.board.line(), QString("moth is busy: undo"));
+  QCOMPARE(rig.board.busyText(), QString("moth is busy: undo"));
+  QVERIFY(!rig.board.working());
+  QTest::qWait(200);
+  QCOMPARE(timesSeen(rig.fake, "undo"), 1);
+  rig.fake.release("undo");
+  QTRY_COMPARE(first, 1);
+  QCOMPARE(rig.board.line(), QString("restored #3 to 100"));
+  QCOMPARE(rig.board.busyText(), QString());
+  // answered: the next one goes
+  QVERIFY(rig.board.run("undo", {}, {}, [&](const Reply &) { ++first; }));
+  QTRY_COMPARE(first, 2);
+  QCOMPARE(timesSeen(rig.fake, "undo"), 2);
+  QCOMPARE(second, 0);
+}
+
+// the one sentence for why a request is not sent: the user's own words, someone else's request
+// as the feed names it, or the service still being started
+void TestBoard::busyTextSaysWhatStandsInTheWay() {
+  Rig rig;
+  QCOMPARE(rig.board.busyText(), QString::fromUtf8("moth is starting…"));  // the start at the board's start
+  QVERIFY(rig.ready());
+  QCOMPARE(rig.board.busyText(), QString());
+  rig.fake.push(busyLine("agent", "find", {"100"}));
+  QTRY_VERIFY(rig.board.working());
+  QCOMPARE(rig.board.busyText(), QString("moth is busy: find 100 (agent)"));
+  QVERIFY(!rig.board.run("next", {"down"}));
+  QCOMPARE(rig.board.line(), QString("moth is busy: find 100 (agent)"));
+}
+
+// F5: the game closes and the core finds out on the window's own unrecorded status read, which it
+// records all the same (R4): the event comes with no busy line before it, and the window ends up
+// with no game, no hunt, and the core's sentence in its line
+void TestBoard::theGameClosingAsTheCoreRecordsIt() {
+  Rig rig;
+  rig.fake.on("status", [](const QStringList &, const Opts &) {
+    const QJsonObject hunt{{"main", 3}, {"wide", 0}, {"groups", QJsonArray()}, {"blind", false},
+                           {"by_tag", QJsonArray{QJsonArray{"whole number", 3}}}, {"can_compare", true}};
+    return Reply{true, QJsonObject{{"attached", disco}, {"hunt", hunt}}, discoLine + "\n3 matches", {}};
+  });
+  QVERIFY(rig.ready());
+  QVERIFY(rig.board.hunt().has_value());
+  QSignalSpy turned(&rig.board, &Board::turned);
+  QList<bool> workingSeen;
+  connect(&rig.board, &Board::changed, this, [&] { workingSeen << rig.board.working(); });
+  const int statuses = timesSeen(rig.fake, "status");
+
+  rig.fake.closeGame("disco.exe");
+  rig.board.tick();
+  QTRY_COMPARE(turned.count(), 1);
+  QVERIFY(!rig.board.attached().has_value());
+  QVERIFY(!rig.board.hunt().has_value());
+  QCOMPARE(rig.board.counts(), QString());
+  QCOMPARE(rig.board.line(), QString("not attached. disco.exe closed."));
+  QVERIFY(!workingSeen.contains(true));  // no busy line came
+  QTest::qWait(200);
+  // the tick's read and the one the event brought; the line stays the core's sentence
+  QCOMPARE(timesSeen(rig.fake, "status"), statuses + 2);
+  QCOMPARE(turned.count(), 1);
+  QCOMPARE(rig.board.line(), QString("not attached. disco.exe closed."));
+  for (const auto &s : rig.fake.seen()) QVERIFY(!s.record);
+}
+
+// F7: `moth stop` from elsewhere: its event, then the feed drops. The line says it was stopped,
+// not that the service was lost; a drop with no stop before it still says lost
+void TestBoard::aStopFromElsewhereIsSaidAsAStop() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.push(eventLine(3, "user", "stop", {}, "stopped"));
+  QTRY_COMPARE(rig.board.line(), QString("stopped"));
+  rig.fake.stop();
+  QTRY_VERIFY(!rig.board.connected());
+  QTRY_COMPARE(rig.board.line(), QString("moth's background service was stopped. it starts again with your next action."));
+  rig.board.tick();
+  QTest::qWait(200);
+  QCOMPARE(rig.board.line(), QString("moth's background service was stopped. it starts again with your next action."));
+
+  rig.fake.start();
+  QTRY_VERIFY_WITH_TIMEOUT(rig.board.connected(), 2000);
+  rig.fake.dropWatchers();
+  QTRY_COMPARE(rig.board.line(), lost);
 }
 
 QTEST_GUILESS_MAIN(TestBoard)

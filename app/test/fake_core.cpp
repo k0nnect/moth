@@ -91,6 +91,8 @@ void FakeCore::feedRequests(bool on) { feedRequests_ = on; }
 
 void FakeCore::refuseWatch(const QString &error) { refuseWatch_ = error; }
 
+void FakeCore::closeGame(const QString &name) { closing_ = name; }
+
 void FakeCore::accept() {
   while (QLocalSocket *s = server_.nextPendingConnection()) {
     connections_.append(s);
@@ -148,11 +150,22 @@ void FakeCore::heard(QLocalSocket *socket, const QByteArray &line) {
 
 void FakeCore::answer(QLocalSocket *socket, const QJsonValue &id, const Seen &req) {
   Reply r;
-  if (answers_.contains(req.cmd)) r = answers_.value(req.cmd)(req.args, req.opts);
-  else if (req.cmd == "status") r = {true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}}, "not attached", {}};
-  else r.error = "unknown command: " + req.cmd + ". run: moth help";
+  // the daemon's closed-game status: recorded though it was asked not to be (R4)
+  const bool closes = req.cmd == "status" && !req.record && !closing_.isEmpty();
+  if (closes) {
+    r = {true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}, {"closed", closing_}},
+         "not attached. " + closing_ + " closed.", {}};
+    closing_.clear();
+    answers_.remove("status");
+  } else if (answers_.contains(req.cmd)) {
+    r = answers_.value(req.cmd)(req.args, req.opts);
+  } else if (req.cmd == "status") {
+    r = {true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}}, "not attached", {}};
+  } else {
+    r.error = "unknown command: " + req.cmd + ". run: moth help";
+  }
 
-  if (req.record && feedRequests_) {
+  if ((req.record && feedRequests_) || closes) {
     QJsonObject ev{{"seq", ++seq_},
                    {"ts", QDateTime::currentMSecsSinceEpoch() / 1000.0},
                    {"actor", req.actor},
