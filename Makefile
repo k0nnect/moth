@@ -7,7 +7,10 @@ DUNE := opam exec -- dune
 CMAKE := cmake -G "Unix Makefiles"
 JOBS ?= $(shell sysctl -n hw.ncpu)
 
-.PHONY: setup build test test-native test-core bench-native helper smoke test-integration bench clean
+QTBASE ?= $(shell brew --prefix qtbase)
+APP_CMAKE = $(CMAKE) -S app -B build/app -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$(QTBASE)
+
+.PHONY: setup build test test-native test-core test-app app bench-native helper smoke test-integration bench clean
 
 setup:
 	opam init --bare --no-setup -y
@@ -19,7 +22,7 @@ build:
 	mkdir -p bin
 	cp -f _build/default/core/bin/main.exe bin/moth
 
-test: test-native test-core
+test: test-native test-core test-app
 
 test-native:
 	$(CMAKE) -S helper -B build/native -DCMAKE_BUILD_TYPE=Release
@@ -28,6 +31,19 @@ test-native:
 
 test-core:
 	opam exec -- dune test
+
+# the window (Qt 6 from Homebrew's qtbase), into bin/moth-app
+app:
+	$(APP_CMAKE)
+	cmake --build build/app -j $(JOBS) --target moth-app
+	mkdir -p bin
+	cp -f build/app/moth-app bin/moth-app
+
+# the window's tests, offscreen, against a fake core
+test-app:
+	$(APP_CMAKE)
+	cmake --build build/app -j $(JOBS)
+	QT_QPA_PLATFORM=offscreen ctest --test-dir build/app --output-on-failure
 
 # engine speed on this machine, native: a relative guide only (the real helper runs under wine)
 bench-native:

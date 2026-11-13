@@ -1,0 +1,76 @@
+#pragma once
+
+#include <QHash>
+#include <QJsonObject>
+#include <QList>
+#include <QLocalServer>
+#include <QPointer>
+#include <QSet>
+#include <QString>
+#include <QStringList>
+#include <QTemporaryDir>
+#include <functional>
+
+#include "board.hpp"
+#include "core_client.hpp"
+
+class QLocalSocket;
+
+// A stand-in for moth's background service, for every app test: a QLocalServer at <home>/core.sock
+// speaking the client protocol. Each request is answered from what `on` registered; with nothing
+// registered, `status` is answered `not attached` (attached and hunt null) and any other command
+// with the daemon's `unknown command` error. Like the daemon, a recorded request sends watchers a
+// busy line when it arrives and its event (the next seq, its first line as summary) just before
+// its reply, and a command that changes something is refused when sent with `record: false`.
+// `watch` is answered with the newest seq and the connection kept for the feed; `after` is noted
+// (see watches()) but nothing is replayed.
+class FakeCore : public QObject {
+public:
+  explicit FakeCore(const QString &home);
+  ~FakeCore() override;
+
+  void on(const QString &cmd, std::function<Reply(const QStringList &args, const Opts &opts)> answer);
+  void hold(const QString &cmd);                 // answer this command only when release() is called
+  void release(const QString &cmd);
+  void push(const QJsonObject &feedLine);        // to every watcher
+  void dropWatchers();
+  void stop(); void start();                     // the service going away and coming back
+  struct Seen { QString actor, cmd; QStringList args; Opts opts; bool record; };
+  QList<Seen> seen() const;                      // every request but watch, in order
+  int watchers() const;
+  QList<Opts> watches() const;                   // the options of every watch request, in order
+
+private:
+  struct Held { QPointer<QLocalSocket> socket; QJsonValue id; Seen request; };
+
+  void accept();
+  void heard(QLocalSocket *socket, const QByteArray &line);
+  void answer(QLocalSocket *socket, const QJsonValue &id, const Seen &request);
+  void send(QLocalSocket *socket, const QJsonObject &line);
+
+  QString path_;
+  QLocalServer server_;
+  QHash<QString, std::function<Reply(const QStringList &, const Opts &)>> answers_;
+  QSet<QString> holding_;
+  QList<Held> held_;
+  QList<QPointer<QLocalSocket>> connections_;
+  QList<QPointer<QLocalSocket>> watchers_;
+  QList<Seen> seen_;
+  QList<Opts> watches_;
+  qint64 seq_ = 0;
+};
+
+// What most app tests start from: a fake core in a fresh home, a client on it and a board on that.
+// Starting the service runs /usr/bin/true, so a stopped fake stays stopped.
+struct Rig {
+  QTemporaryDir home{"/tmp/moth-app-XXXXXX"};  // short: a socket path is limited to about 104 bytes
+  FakeCore fake{home.path()};
+  CoreClient core{home.path(), "/usr/bin/true"};
+  Board board{&core};
+  // waits until the board's feed is up and its first status read has been answered (the line
+  // shows that read's first line)
+  bool ready();
+};
+
+// how many requests for `cmd` the fake has seen
+int timesSeen(const FakeCore &fake, const QString &cmd);

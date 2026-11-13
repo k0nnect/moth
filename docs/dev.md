@@ -4,6 +4,7 @@
 
 - OCaml 5.5.2 in a local opam switch (`_opam/`), with dune, yojson and alcotest.
 - C++20 with cmake (Makefiles generator, no ninja). Native build uses Apple clang. The Windows helper uses mingw-w64 from Homebrew (`x86_64-w64-mingw32-g++` and `i686-w64-mingw32-g++`).
+- The window uses Qt 6 from Homebrew's `qtbase` (`brew install qtbase`; 6.12 here), its Core, Gui, Widgets, Network and Test modules only, linked dynamically. `make` finds it with `brew --prefix qtbase`; set `QTBASE` to use another install.
 - Nothing needs sudo. `opam init` runs with `--no-setup`, so no shell profile is touched.
 
 ## setup
@@ -15,8 +16,10 @@ This runs `opam init --bare --no-setup`, creates the switch in this directory an
 ## build and test
 
     make build    # dune build, copies the moth executable to bin/moth
-    make test     # native C++ unit tests (build/native), then dune test
+    make test     # native C++ unit tests (build/native), then dune test, then test-app
     make helper   # the Windows helper (x86_64 only) and the stand-in game (64-bit and 32-bit), into bin/
+    make app      # the window (build/app), copied to bin/moth-app
+    make test-app # the window's tests (build/app), offscreen, through ctest
     make clean
 
 Variables: `WINE` (path to CrossOver's wine) and `MOTH_TEST_BOTTLE` (default `uhmm`), both overridable on the command line.
@@ -42,6 +45,17 @@ A request with `"record": false` is answered as usual but takes no event number,
 ## launch and games
 
 `moth launch --bottle <bottle> <full path to game.exe> [args]` starts the program under CrossOver's wine in that bottle and answers at once; it does not wait for the game. The path must be absolute, end in `.exe` (any case) and exist. Everything after the path is the game's own arguments, passed untouched, `-windowed` or `--json` included (the command line stops reading moth's options at the path). The game runs in its own session with stdin from `/dev/null`, so it outlives the daemon; its output is appended to `[home]/launch.log`. Each launch is remembered in `[home]/games.json`, a JSON list of `{"name","bottle","path","last"}`, newest first, one entry per bottle and path, 20 at most; a file that can't be read counts as empty and is replaced by the next launch. `moth games` lists them (`name  bottle  path`; json: a list of `{"name","bottle","path"}`) and may be sent with `record: false`; `launch` may not. A launched game is not attached: once it is up, run the `moth attach` line the answer prints. The daemon takes the starting function as `~launch` (`Daemon.default_launch` is the real one; tests pass a fake), so only the integration scenarios start a real game.
+
+## the window
+
+    make build && make app
+    bin/moth-app
+
+`bin/moth-app` is one more client of the background service, like `moth`, and talks to nothing but `[home]/core.sock`. It honours `MOTH_HOME` as `moth` does (made absolute; unset, `~/Library/Application Support/moth`) and `MOTH_BIN`, the `moth` program it runs to start the service (unset, the `moth` next to `moth-app`, so `bin/moth`). When a request finds no service answering, the window runs `[MOTH_BIN] status` once with that home, waits for it to end (10 seconds at most) and sends the request again; if that fails too, its line says `moth's background service is not answering. see [home]/core.log`. While the window is visible it reads `status` on showing and then once a second, unrecorded; so a window left open starts the service again within a second of `moth stop`. Close it first. It follows the feed, and when the feed drops it says `lost moth's background service. trying again…` and watches again every second, from the newest event it has seen.
+
+To try it away from your own session, give it a home of its own: `MOTH_HOME=$(mktemp -d /tmp/moth-XXXXXX) MOTH_BIN=$PWD/bin/moth bin/moth-app`. With `QT_QPA_PLATFORM=offscreen` it runs with no window on the screen. Close it, then `moth stop` with the same `MOTH_HOME`.
+
+The code is in `app/src`: `CoreClient` (requests, starting the service, the feed), `Board` (what every panel reads: the game, the hunt, whether a request is running and whose, the line; and the way panels send requests), `MainWindow` (a column of panels in a splitter, and the line under it). The tests in `app/test` run offscreen against `FakeCore`, a `QLocalServer` in a temporary home under `/tmp` that answers as the service does, feed included. The home is made with a short template, `/tmp/moth-app-XXXXXX`, because a socket path may be about 104 bytes at most and `QTemporaryDir`'s default place is longer than that allows. `Rig` in `fake_core.hpp` sets up a fake, a client and a board. `MainWindow::setPolling(false)` keeps the one-second poll off for tests that count requests. A new test is `app/test/<name>.cpp` plus its name in `MOTH_APP_TESTS` in `app/CMakeLists.txt`; a new source file is one line in `moth_window`.
 
 ## engine speed
 
