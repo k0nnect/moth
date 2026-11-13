@@ -194,3 +194,110 @@ Date: 2026-11-11 into 2026-11-12. Done with Chris at the keyboard, in the same g
 3. A value whose number is not on screen (minutes left on a thought, shown only as a percentage) needed the save file for its starting number. Hunting by change alone would cover it.
 4. `results --near` reaches 4 kb. Records of the same kind that the game allocates further apart are not found by it.
 5. `keep` right after a `set` on the same row reports the value from the listing, not the one just written (`kept #1 as money (106.98, ...)` after setting 200.00).
+
+# disco elysium, stage 1c
+
+Date: 2026-11-12. Done with Chris at the keyboard, on Day 2 of the same playthrough.
+
+## setup
+
+- Game and machine as above. The game's writable memory has grown to between 5.87 and 5.93 GiB (4.2 to 4.5 GiB in stage 1b). Experience, money and skill points are at the same addresses as in stage 1b.
+- moth: branch `stage-1c-change-hunts` at `0abd138`, default `MOTH_HOME`, default snapshot limit (8192 MiB).
+- Every read and write of the game in this section went through `moth` commands, and no save file was read. A script was used on moth's own output twice: to time commands, and to shortlist rows from `moth results` (see "the thought").
+- Earlier in the same game session, before this section's work, the skill records had been located for an unrelated request with the stage 1b build. So the address Conceptualization ended at was already known; the hunt below was still done from the typed numbers alone.
+- The Mac was short of memory throughout: 37% free before the first snapshot, and 9.9 of 10.2 GB of swap in use.
+
+## result
+
+| check | bar | measured | verdict |
+| --- | --- | --- | --- |
+| snapshot speed | 3.0 s/GiB or better | 1.81 s/GiB (first, timed end to end) and 1.50 s/GiB (second, helper's own time) | met |
+| each step taken while the snapshot is held | 3.0 s/GiB or better | `next same` as a first step 3.08, a second `next same` 3.05, `next down` as a first step 1.70 | missed for `next same`, met for `next down` |
+| a thought's remaining time found and changed with no number typed until it was on moth's screen, and no save file read | done | found after four changes, set to 1, the thought completed on the next game minute | met |
+| `find 1` and `next 0` | 8 seconds or less each | `find 1` 9.0 s, `next 0` 6.4 s (stage 1b: 5.4 s and 10.6 s) | `find 1` missed, `next 0` met |
+| `moth kept` says a recalculated number went back | said in plain words | `conc    13    0x50d4a6cd4  whole number  you set it to 20; it is back to what it was before.` | met |
+| the game stayed playable while the snapshot was held | Chris's word | Chris played through the second hold without reporting a problem; asked about the first, he said he had not been paying attention | not confirmed |
+
+## memory
+
+| moment | helper's memory (top) | of which compressed | system free |
+| --- | --- | --- | --- |
+| attached, before any hunt | 18 MB | | 37% |
+| after the first snapshot (5.87 GiB) | 6,992 MB | 6,045 MB | 29% |
+| peak during the first `next same` | 8,112 MB | 6,094 MB | 30% |
+| after a `find 92` replaced the hunt | 768 MB | 641 MB | 57% |
+| after the second snapshot (5.92 GiB) | 7,121 MB | 4,525 MB | 33% |
+| after the first `next down` of that hunt | 860 MB | 434 MB | |
+
+- The plan expected about 4.2 GB held and 7.2 GB at the first step's peak; the game is larger now, and the numbers are about 7.0 and 8.1 GB.
+- macOS had moved most of the first snapshot into compressed memory within seconds of it being taken.
+
+## speed of the first steps
+
+| command | bytes | time | s/GiB | matches left (main) | lost | unreadable |
+| --- | --- | --- | --- | --- | --- | --- |
+| `snapshot` (first) | 6,300,262,400 | 10.6 s end to end | 1.81 | 7,875,328,000 | | 0 |
+| `next same` | 6,300,262,400 | 18,071 ms | 3.08 | 7,758,033,648 | 0 | 0 |
+| `next same` | 6,300,057,240 | 17,918 ms | 3.05 | 7,756,445,639 | 0 | 0 |
+| `find 92` | 5.868 GiB | 7,760 ms | 1.32 | 1,301,541 | 0 | 0 |
+| `snapshot` (second) | 6,350,856,192 | 8,889 ms | 1.50 | | | 0 |
+| `next down` | 6,350,856,192 | 10,055 ms | 1.70 | 23,167,556 | 0 | 0 |
+
+- `next same` right after a snapshot keeps almost everything (98.5% here), so the snapshot stays held and nearly every value is stored. `next down` kept 0.3% and the helper let the snapshot go at once.
+- The bottle scenario measures `next same` at 1.94 to 2.45 s/GiB on 1 GiB with memory to spare.
+
+## the thought (by change alone)
+
+Ace's Low, research time 2h 45m, started at 09:54 game time. Nothing about it was typed into moth.
+
+| game time | what Chris did | command | time | matches left (main) |
+| --- | --- | --- | --- | --- |
+| 09:54 | started the research | `snapshot` | 8,889 ms | everything |
+| 09:57 | talked to someone | `next down` | 10,055 ms | 23,167,556 |
+| 09:58 | talked to someone | `next down` | 675 ms | 2,943,254 |
+| 09:58 | nothing | `next same` eight times | 126 to 179 ms | 1,074,037 |
+| 09:58 | walked around, no dialogue | `next same` twice | 88 to 126 ms | 432,385 |
+| 09:59 | talked to someone | `next down` | 132 ms | 33,191 |
+| 09:59 | nothing | `next same` three times | 43 to 57 ms | 25,835 |
+| 10:00 | walked, then talked | `next down` | 35 ms | 3,841 (1 lost) |
+| 10:00 | nothing | `next same` twice | 16 to 17 ms | 3,751 |
+
+- At 3,751 rows (790 whole number, 747 decimal, 1,112 two-byte, 510 eight-byte, 592 eight-byte decimal) all of them were listed with `moth results --all` in 19 pages, and a script kept the rows whose value was the size of a timer. One fitted: row 1,850, `159  0x7000e78c  whole number`, which is 165 minutes less the six that had passed.
+- `keep 1850 thought`, `set thought 1` (was 159, held). At 10:01 Chris reported the thought finished. `moth kept` then read 0 for it.
+
+## zero and one
+
+Skill points were set from 5 to 1 with `moth set points 1` first.
+
+| step | time | whole number | decimal | all main | wide | lost | unreadable |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `find 1` | 8,987 ms | 40,167,952 | 43,981,098 | 157,040,720 | 202,006,807 | 0 | 0 |
+| point spent on a thought slot, `next 0` | 6,413 ms | 333,243 | 649,974 | 12,564,648 | 72,666,134 | 506 | 0 |
+
+- `find 1` scanned 5.93 GiB at 1.52 s/GiB; in stage 1b it scanned 4.2 GiB at 1.29.
+- Decimals fell from 44.0 million to 0.65 million (stage 1b: 31.4 to 25.4 million). The eight-byte decimals did not: 11,337,824 to 11,106,428. That group had no stored values after `find 1` (`has_values` false), so the rule that a value must have moved could not apply to it.
+- `results --near points`: 43 rows, the first three at `0x6c551070`. Points were set back to 5.
+
+## put back
+
+| step | time | whole number | all main | lost | unreadable |
+| --- | --- | --- | --- | --- | --- |
+| `find 13` | 4,890 ms | 285,059 | 2,269,960 | 0 | 0 |
+| shirt off, `next 12` | 3,714 ms | 84 | 220 | 0 | 0 |
+| shirt on, `next 13` | 22 ms | 31 | 66 | 0 | 0 |
+
+- 28 of the 31 whole numbers sit at evenly repeating addresses from `0xe080d4d0` up; three are together at `0x50d4a6cd4`, `0x50d4a6cd8` and `0x50d4a6cec`.
+- `keep 33 conc` (`0x50d4a6cd4`), `set conc 20`: `set conc to 20 (was 13)`, `held` true.
+- Chris reopened the character sheet: it showed 13. `moth kept` printed the line in the result table, and `kept --json` gave `"shown":"13","set_to":"20","put_back":true`.
+
+## problems found
+
+1. `next same` as the first step of a snapshot hunt took 3.05 to 3.08 s/GiB here, just over the bar, with the Mac short of memory and the snapshot already compressed by macOS.
+2. `find 1` took 9.0 seconds. Its speed per GiB is as before; the game is 1.4 times the size it was when the 8-second bar was written.
+3. Holding a snapshot of this game costs about 7 GB in the helper and 8.1 GB at the first step's peak, on a 24 GB Mac that was already swapping. Whether the game stutters during that was not established.
+4. After four changes a blind hunt still had 3,751 rows. `results` cannot filter or sort by value or by form, so picking the timer out meant paging through all of them. Something to hide the rows that cannot be a small number would have made the last step one screen.
+5. The eight-byte decimals keep no values after a large `find`, so `next 0` cannot thin them (11.1 million left).
+
+## also seen in this session (not part of this proof)
+
+- With the stage 1b build, before the work above: writing a skill's own numbers (value, maximum, rank, in both copies of the character sheet) held, but a dialogue check's tooltip ignored them. Raising the attribute the skill is built from (Psyche) changed the check from 3% to 97%. All fourteen values were put back afterwards.
