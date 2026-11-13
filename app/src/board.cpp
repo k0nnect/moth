@@ -41,6 +41,7 @@ Board::Board(CoreClient *core, QObject *parent) : QObject(parent), core_(core) {
   connect(core, &CoreClient::busy, this, &Board::began);
   connect(core, &CoreClient::event, this, &Board::ended);
   connect(core, &CoreClient::feedUp, this, &Board::feedWent);
+  connect(core, &CoreClient::feedRefused, this, &Board::refused);
   core->startFeed();
   // the one time the app starts the service by itself; reads wait for it, then status is read
   core->startService([self = QPointer<Board>(this)] {
@@ -79,6 +80,11 @@ void Board::run(const QString &cmd, const QStringList &args, const Opts &opts, s
 
 void Board::read(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done) {
   if (working_ || starting_) return;
+  ask(cmd, args, opts, std::move(done));
+}
+
+// an unrecorded read, unless the same one is still out
+void Board::ask(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done) {
   const QString key = keyOf(cmd, args, opts);
   if (reading_.contains(key)) return;
   reading_.insert(key);
@@ -119,6 +125,9 @@ void Board::feedWent(bool up) {
   connected_ = up;
   if (up) {
     lost_ = false;
+    // the line still shows why the feed was refused, which is over: the next status read is said
+    if (!refusal_.isEmpty() && line_ == refusal_) needStatus_ = owesLine_ = true;
+    refusal_.clear();
     emit changed();
     if (needStatus_) readStatus();
     return;
@@ -130,6 +139,13 @@ void Board::feedWent(bool up) {
   line_ = lostLine;
   lost_ = needStatus_ = owesLine_ = true;
   emit changed();
+}
+
+// the core would not take the feed (such as `too many watchers`): said in its words; the client
+// keeps trying
+void Board::refused(const QString &error) {
+  refusal_ = error;
+  say(error);
 }
 
 void Board::readStatus() {
@@ -165,17 +181,15 @@ void Board::showStatus(const Reply &r) {
 }
 
 // after an event: a status read sent after it, then `turned`. A read already out was sent before
-// the event, so one more follows when it returns (one, however many events came meanwhile).
+// the event, so one more follows when it returns (one, however many events came meanwhile). This
+// read goes even while a request runs (the core answers it when that is over) or while the start
+// is under way, so `turned` always comes after fresh status.
 void Board::refresh() {
   if (reading_.contains(statusKey())) {
     statusAgain_ = true;
     return;
   }
-  if (working_ || starting_) {  // no read can go now: lists are told at once and read when they can
-    turn();
-    return;
-  }
-  readStatus();
+  ask("status", {}, {}, [this](const Reply &r) { tookStatus(r); });
 }
 
 void Board::turn() {

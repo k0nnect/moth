@@ -55,6 +55,8 @@ private:
   void began(const QJsonObject &what);
   void ended(const QJsonObject &ev);
   void feedWent(bool up);
+  void refused(const QString &error);
+  void ask(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done);
   void readStatus();
   void tookStatus(const Reply &r);
   void showStatus(const Reply &r);
@@ -72,5 +74,6 @@ private:
   bool owesLine_ = true;       // ... and nothing newer has been said: that status read is said
   bool statusAgain_ = false;   // an event came while a status read was out: read again when it returns
   int turnsOwed_ = 0;          // events whose `turned` waits for the status read after them
+  QString refusal_;            // the core's refusal of the feed, while the feed is not up
   QSet<QString> reading_;      // the reads still out
 };

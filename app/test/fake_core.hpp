@@ -42,6 +42,9 @@ public:
   // on (the default): a recorded request sends its own busy and event lines. off: only push() feeds,
   // for tests that set the order of an event and its reply themselves
   void feedRequests(bool on);
+  // answer every `watch` with this error (as the daemon answers a 17th watcher `too many watchers`)
+  // and close it; "" accepts watchers again
+  void refuseWatch(const QString &error);
 
 private:
   struct Held { QPointer<QLocalSocket> socket; QJsonValue id; Seen request; };
@@ -61,6 +64,7 @@ private:
   QList<Seen> seen_;
   QList<Opts> watches_;
   bool feedRequests_ = true;
+  QString refuseWatch_;
   qint64 seq_ = 0;
 };
 

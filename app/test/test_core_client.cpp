@@ -1,5 +1,8 @@
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
+#include <signal.h>
 #include <QJsonArray>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -18,9 +21,11 @@ private slots:
   void anErrorReplyIsTheCoresText();
   void feedSignalsInOrder();
   void feedComesBackAfterTheLastSeq();
+  void aRefusedWatchIsSaidOnceAndTriedAgain();
   void startsTheServiceOnceThenSaysSo();
   void anUnrecordedCallNeverStartsTheService();
   void theStartAtLaunchRunsMothOnlyWhenNothingAnswers();
+  void aHungStartIsGivenUpOn();
 };
 
 namespace {
@@ -166,6 +171,28 @@ void TestCoreClient::feedComesBackAfterTheLastSeq() {
   QCOMPARE(up.at(1).at(0).toBool(), true);
 }
 
+// the core's answer to a refused watch comes out in its words, once; the feed keeps trying
+void TestCoreClient::aRefusedWatchIsSaidOnceAndTriedAgain() {
+  QTemporaryDir home("/tmp/moth-app-XXXXXX");
+  FakeCore fake(home.path());
+  fake.refuseWatch("too many watchers");
+  CoreClient core(home.path(), "/usr/bin/true");
+  QSignalSpy refused(&core, &CoreClient::feedRefused);
+  QSignalSpy up(&core, &CoreClient::feedUp);
+
+  core.startFeed();
+  QTRY_COMPARE(refused.count(), 1);
+  QCOMPARE(refused.at(0).at(0).toString(), QString("too many watchers"));
+  QTRY_VERIFY_WITH_TIMEOUT(fake.watches().size() >= 3, 3000);  // a watch each second
+  QCOMPARE(refused.count(), 1);
+  QCOMPARE(up.count(), 0);
+
+  fake.refuseWatch({});
+  QTRY_COMPARE_WITH_TIMEOUT(up.count(), 1, 2000);
+  QCOMPARE(up.at(0).at(0).toBool(), true);
+  QCOMPARE(fake.watchers(), 1);
+}
+
 // a recorded request (the user's own action) starts the service once when nothing answers
 void TestCoreClient::startsTheServiceOnceThenSaysSo() {
   QTemporaryDir home("/tmp/moth-app-XXXXXX");
@@ -216,6 +243,33 @@ void TestCoreClient::theStartAtLaunchRunsMothOnlyWhenNothingAnswers() {
   QCOMPARE(moth.runs().size(), 1);
   QCOMPARE(fake.seen().size(), 0);
   QCOMPARE(over, 2);
+}
+
+// a `moth status` that hangs is given up on after 10 seconds, killed, and not waited for
+void TestCoreClient::aHungStartIsGivenUpOn() {
+  QTemporaryDir home("/tmp/moth-app-XXXXXX");
+  const QString script = home.filePath("hung-moth"), pidFile = home.filePath("pid");
+  {
+    QFile f(script);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write("#!/bin/sh\necho $$ > \"" + pidFile.toUtf8() + "\"\nexec sleep 60\n");  // exec: the kill reaches sleep
+    f.close();
+    QVERIFY(f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+  }
+  CoreClient core(home.path(), script);
+  QElapsedTimer took;
+  took.start();
+  std::optional<Reply> got;
+  core.call("find", {"100"}, {}, true, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY_WITH_TIMEOUT(got.has_value(), 15000);
+  QVERIFY2(took.elapsed() >= 9500 && took.elapsed() < 12000, qPrintable(QString::number(took.elapsed())));
+  QCOMPARE(got->error, "moth's background service is not answering. see " + home.path() + "/core.log");
+
+  QFile f(pidFile);
+  QVERIFY(f.open(QIODevice::ReadOnly));
+  const pid_t pid = f.readAll().trimmed().toInt();
+  QVERIFY(pid > 0);
+  QTRY_VERIFY(::kill(pid, 0) != 0);  // killed, and reaped once `finished` came
 }
 
 QTEST_GUILESS_MAIN(TestCoreClient)

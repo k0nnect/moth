@@ -121,25 +121,27 @@ void CoreClient::runMoth(std::function<void()> then) {
   p->setStandardInputFile(QProcess::nullDevice());
   p->setStandardOutputFile(QProcess::nullDevice());
   p->setStandardErrorFile(QProcess::nullDevice());
+  // whoever waits goes on once, when it ends, fails to start, or is given up on
   auto over = [this, p] {
     if (starting_ != p) return;
     starting_ = nullptr;
-    QObject::disconnect(p, nullptr, this, nullptr);
-    if (p->state() != QProcess::NotRunning) {
-      p->kill();
-      p->waitForFinished(1000);
-    }
-    p->deleteLater();
     for (const auto &next : std::exchange(waiting_, {}))
       if (next) next();
   };
+  // nothing waits on the process: it is deleted once it has ended, however it ends
   connect(p, &QProcess::finished, this, over);
+  connect(p, &QProcess::finished, p, &QObject::deleteLater);
   connect(
-      p, &QProcess::errorOccurred, this, [over](QProcess::ProcessError e) {
-        if (e == QProcess::FailedToStart) over();
+      p, &QProcess::errorOccurred, this, [over, p](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        over();
+        p->deleteLater();
       },
       Qt::QueuedConnection);
-  QTimer::singleShot(10000, p, over);
+  QTimer::singleShot(10000, p, [over, p] {  // hung: killed, and deleted when `finished` comes
+    over();
+    p->kill();
+  });
   p->start(mothBin_, {"status"});
 }
 
@@ -168,16 +170,25 @@ void CoreClient::watch() {
 // service lets go of the feed is dropped with the connection.
 void CoreClient::heard(QLocalSocket *feed, bool &answered) {
   while (feed->canReadLine()) {
-    const QJsonObject line = QJsonDocument::fromJson(feed->readLine()).object();
+    const QByteArray raw = feed->readLine();
     if (!answered) {
       answered = true;
-      if (line.value("ok") != QJsonValue(true)) {  // such as `too many watchers`: try again later
+      const Reply r = replyOf(raw);
+      if (!r.ok) {  // such as `too many watchers`: said once, and tried again every second
+        if (r.error != refusedWith_) {
+          refusedWith_ = r.error;
+          emit feedRefused(r.error);
+        }
         dropFeed(feed);
         return;
       }
-      if (lastSeq_ < 0) lastSeq_ = line.value("result").toObject().value("seq").toInteger();
+      refusedWith_.clear();
+      if (lastSeq_ < 0) lastSeq_ = r.result.toObject().value("seq").toInteger();
       setFeedUp(true);
-    } else if (line.value("busy").isObject()) {
+      continue;
+    }
+    const QJsonObject line = QJsonDocument::fromJson(raw).object();
+    if (line.value("busy").isObject()) {
       emit busy(line.value("busy").toObject());
     } else if (line.value("event").isObject()) {
       const QJsonObject ev = line.value("event").toObject();

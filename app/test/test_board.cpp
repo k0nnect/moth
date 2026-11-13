@@ -17,6 +17,9 @@ private slots:
   void pollingNeverStartsTheService();
   void aFailedActionKeepsItsWholeError();
   void anEventAlwaysBringsFreshStatus();
+  void anEventsStatusReadIsNeverSkipped();
+  void aRefusedWatchIsSaid();
+  void readsWaitWhileARequestRuns();
   void ticksDoNotPileUp();
   void huntFromStatus();
 };
@@ -241,6 +244,74 @@ void TestBoard::anEventAlwaysBringsFreshStatus() {
   QTest::qWait(200);
   QCOMPARE(attachedAtTurn.size(), 1);
   QCOMPARE(timesSeen(rig.fake, "status"), statuses + 2);
+}
+
+// R9, back to back: someone attaches, then finds at once, while a tick's status read is out. The
+// read after the attach still goes (the core answers it when it is free), and `turned` waits for it
+void TestBoard::anEventsStatusReadIsNeverSkipped() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  int answered = 0;
+  rig.fake.on("status", [&](const QStringList &, const Opts &) {
+    if (++answered == 1)
+      return Reply{true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}}, "not attached", {}};
+    return Reply{true, QJsonObject{{"attached", disco}, {"hunt", QJsonValue::Null}}, discoLine, {}};
+  });
+  QList<bool> attachedAtTurn;
+  connect(&rig.board, &Board::turned, this, [&] { attachedAtTurn << rig.board.attached().has_value(); });
+
+  const int statuses = timesSeen(rig.fake, "status");
+  rig.fake.hold("status");
+  rig.board.tick();
+  QTRY_COMPARE(timesSeen(rig.fake, "status"), statuses + 1);
+  rig.fake.push(eventLine(5, "agent", "attach", {"disco.exe"}, discoLine));
+  rig.fake.push(busyLine("agent", "find", {"100"}));
+  QTRY_VERIFY(rig.board.working());
+  QCOMPARE(attachedAtTurn.size(), 0);
+
+  rig.fake.release("status");
+  QTRY_COMPARE(timesSeen(rig.fake, "status"), statuses + 2);  // sent though the find is running
+  QCOMPARE(rig.fake.seen().last().record, false);
+  QTRY_COMPARE(attachedAtTurn.size(), 1);
+  QCOMPARE(attachedAtTurn.at(0), true);
+  QVERIFY(rig.board.working());
+  QTest::qWait(200);
+  QCOMPARE(attachedAtTurn.size(), 1);
+}
+
+// the core refusing the feed (`too many watchers`) is said in its words, at the start and after a
+// loss, and the feed keeps trying
+void TestBoard::aRefusedWatchIsSaid() {
+  Rig rig;
+  rig.fake.refuseWatch("too many watchers");
+  QTRY_COMPARE(rig.board.line(), QString("too many watchers"));
+  QTest::qWait(1500);  // the status read and the tries again leave it said
+  QCOMPARE(rig.board.line(), QString("too many watchers"));
+  QVERIFY(!rig.board.connected());
+
+  rig.fake.refuseWatch({});
+  QTRY_VERIFY_WITH_TIMEOUT(rig.board.connected(), 2000);
+  QTRY_COMPARE(rig.board.line(), QString("not attached"));
+
+  rig.fake.refuseWatch("too many watchers");
+  rig.fake.dropWatchers();
+  QTRY_COMPARE(rig.board.line(), lost);
+  QTRY_COMPARE_WITH_TIMEOUT(rig.board.line(), QString("too many watchers"), 2000);
+  QTest::qWait(1500);
+  QCOMPARE(rig.board.line(), QString("too many watchers"));
+}
+
+// every panel relies on this: while a recorded request runs, a read sends nothing and never answers
+void TestBoard::readsWaitWhileARequestRuns() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.push(busyLine("agent", "find", {"100"}));
+  QTRY_VERIFY(rig.board.working());
+  int answered = 0;
+  rig.board.read("results", {}, {{"n", "200"}}, [&](const Reply &) { ++answered; });
+  QTest::qWait(200);
+  QCOMPARE(timesSeen(rig.fake, "results"), 0);
+  QCOMPARE(answered, 0);
 }
 
 void TestBoard::ticksDoNotPileUp() {

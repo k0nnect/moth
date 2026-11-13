@@ -42,6 +42,9 @@ signals:
   void event(const QJsonObject &ev);    // a recorded request ended
 #pragma clang diagnostic pop
   void feedUp(bool up);
+  // the service answered `watch` with this error (such as `too many watchers`); the feed tries
+  // again every second. Once per refusal: not again for the same text until the feed has been up
+  void feedRefused(const QString &error);
 
 private:
   struct Exchange;
@@ -57,5 +60,6 @@ private:
   QProcess *starting_ = nullptr;               // `moth status`, while it runs
   QList<std::function<void()>> waiting_;       // what goes on once it has ended
   bool feedStarted_ = false, feedUp_ = false;
+  QString refusedWith_;                         // the last refusal said, until the feed is up
   qint64 lastSeq_ = -1;                         // the newest event seen; -1 before the first watch
 };
