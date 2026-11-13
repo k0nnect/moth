@@ -120,8 +120,18 @@ let rec wait_up ?(tries = 500) path =
       Thread.delay 0.01;
       wait_up ~tries:(tries - 1) path
 
-let start ?(home = fresh_home ()) start_helper =
-  let thread = Thread.create (fun () -> Daemon.run ~home ~start_helper) () in
+(* a launch that records its calls (newest first) and starts nothing *)
+let fake_launch ?(result = Ok ()) () =
+  let calls = ref [] in
+  ((fun ~bottle ~exe ~args ->
+      calls := (bottle, exe, args) :: !calls;
+      result),
+   calls)
+
+let no_launch ~bottle:_ ~exe:_ ~args:_ = Ok ()
+
+let start ?(home = fresh_home ()) ?(launch = no_launch) start_helper =
+  let thread = Thread.create (fun () -> Daemon.run ~home ~start_helper ~launch) () in
   wait_up (sock home);
   { home; thread }
 
@@ -131,8 +141,8 @@ let json = function Ok (j, _) -> j | Error e -> Alcotest.failf "unexpected error
 let check_err n msg = function Error e -> check_str n msg e | Ok (_, t) -> Alcotest.failf "%s: expected the error %S, got %S" n msg t
 let check_json n w g = check_str n (Yojson.Safe.to_string w) (Yojson.Safe.to_string g)
 
-let with_daemon ?home start_helper f =
-  let d = start ?home start_helper in
+let with_daemon ?home ?launch start_helper f =
+  let d = start ?home ?launch start_helper in
   Fun.protect
     ~finally:(fun () ->
       ignore (call d "stop" []);
@@ -484,7 +494,7 @@ let stop_and_restart () =
 let second_daemon () =
   let _, sh = fake () in
   with_daemon sh (fun d ->
-      (match Daemon.run ~home:d.home ~start_helper:sh with
+      (match Daemon.run ~home:d.home ~start_helper:sh ~launch:no_launch with
       | () -> Alcotest.fail "a second daemon ran"
       | exception Failure m -> check_str "second daemon refuses" "moth is already running" m);
       check_str "the first still serves" "not attached" (text (call d "status" [])))
@@ -500,12 +510,12 @@ let long_home () =
   let msg = Printf.sprintf "the path %s/core.sock is too long for a unix socket. set MOTH_HOME to a shorter directory." home in
   check_err "client" msg (Client.call ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] ());
   let _, sh = fake () in
-  (match Daemon.run ~home ~start_helper:sh with () -> Alcotest.fail "the daemon ran" | exception Failure m -> check_str "daemon" msg m);
+  (match Daemon.run ~home ~start_helper:sh ~launch:no_launch with () -> Alcotest.fail "the daemon ran" | exception Failure m -> check_str "daemon" msg m);
   check_bool "nothing created" false (Sys.file_exists home);
   let home = "/dev/null/moth" in
   let msg = "couldn't create /dev/null/moth (Not a directory). set MOTH_HOME to a directory you can write to." in
   check_err "home can't be made" msg (Client.call ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] ());
-  match Daemon.run ~home ~start_helper:sh with () -> Alcotest.fail "the daemon ran" | exception Failure m -> check_str "daemon, home can't be made" msg m
+  match Daemon.run ~home ~start_helper:sh ~launch:no_launch with () -> Alcotest.fail "the daemon ran" | exception Failure m -> check_str "daemon, home can't be made" msg m
 
 let autostart () =
   let _, sh = fake () in
@@ -514,7 +524,7 @@ let autostart () =
   (* a stale socket: a plain file at the socket's path, no daemon *)
   close_out (open_out (sock home));
   let thread = ref None in
-  let spawn_daemon ~home = thread := Some (Thread.create (fun () -> Daemon.run ~home ~start_helper:sh) ()) in
+  let spawn_daemon ~home = thread := Some (Thread.create (fun () -> Daemon.run ~home ~start_helper:sh ~launch:no_launch) ()) in
   Fun.protect
     ~finally:(fun () -> rm home)
     (fun () ->
@@ -1440,6 +1450,119 @@ let parse_results_args () =
   same "near needs a value" (Error "--near needs a value") (p [ "results"; "--near" ]);
   same "-n needs a value" (Error "-n needs a value") (p [ "results"; "-n" ])
 
+(* ---- launch and games ---- *)
+
+let path_of_file () =
+  let dir = Filename.concat (fresh_home ()) "g" in
+  let rec mk d = if not (Sys.file_exists d) then (mk (Filename.dirname d); Unix.mkdir d 0o755) in
+  mk dir;
+  dir
+
+let touch dir name =
+  let p = Filename.concat dir name in
+  close_out (open_out p);
+  p
+
+let nothing_yet = "nothing launched from moth yet. start a game with: moth launch --bottle <bottle> <full path to game.exe>"
+
+let launching () =
+  let _, sh = fake () in
+  let launch, calls = fake_launch () in
+  let dir = path_of_file () in
+  Fun.protect ~finally:(fun () -> rm (Filename.dirname dir)) (fun () ->
+      let game = touch dir "game.exe" in
+      with_daemon ~launch sh (fun d ->
+          check_str "empty" nothing_yet (text (call d "games" []));
+          let r = call d "launch" [ game; "-windowed" ] ~opts:[ ("bottle", "uhmm") ] in
+          check_str "started" (Printf.sprintf "started game.exe in uhmm. when it is up: moth attach --bottle \"uhmm\" game.exe") (text r);
+          check_json "json"
+            (`Assoc [ ("message", `String (text r)); ("name", `String "game.exe"); ("bottle", `String "uhmm"); ("path", `String game) ])
+            (json r);
+          Alcotest.(check (list (triple string string (list string)))) "called once" [ ("uhmm", game, [ "-windowed" ]) ] !calls;
+          check_str "games" (Printf.sprintf "game.exe  uhmm  %s" game) (text (call d "games" []));
+          check_json "games json"
+            (`List [ `Assoc [ ("name", `String "game.exe"); ("bottle", `String "uhmm"); ("path", `String game) ] ])
+            (json (call d "games" []));
+          check_bool "games.json in the home" true (Sys.file_exists (Filename.concat d.home "games.json"));
+          (* an unrecorded games is fine *)
+          ignore (Client.call ~autostart:false ~home:d.home ~actor:"user" ~cmd:"games" ~args:[] ~opts:[] ())))
+
+let launch_remembers_once () =
+  let _, sh = fake () in
+  let launch, calls = fake_launch () in
+  let dir = path_of_file () in
+  Fun.protect ~finally:(fun () -> rm (Filename.dirname dir)) (fun () ->
+      let game = touch dir "game.exe" in
+      with_daemon ~launch sh (fun d ->
+          let go () = ignore (call d "launch" [ game ] ~opts:[ ("bottle", "uhmm") ]) in
+          go ();
+          go ();
+          check_int "launched twice" 2 (List.length !calls);
+          check_int "remembered once" 1 (List.length (Yojson.Safe.Util.to_list (json (call d "games" []))));
+          (* another bottle is another entry, newest first *)
+          ignore (call d "launch" [ game ] ~opts:[ ("bottle", "other") ]);
+          check_strs "newest first" [ "other"; "uhmm" ]
+            (List.map (fun g -> Yojson.Safe.Util.(member "bottle" g |> to_string)) (Yojson.Safe.Util.to_list (json (call d "games" []))));
+          (* 21 different ones leave 20, the oldest gone *)
+          for i = 1 to 21 do
+            ignore (call d "launch" [ touch dir (Printf.sprintf "g%d.exe" i) ] ~opts:[ ("bottle", "uhmm") ])
+          done;
+          let names = List.map (fun g -> Yojson.Safe.Util.(member "name" g |> to_string)) (Yojson.Safe.Util.to_list (json (call d "games" []))) in
+          check_int "twenty" 20 (List.length names);
+          check_str "newest" "g21.exe" (List.hd names);
+          check_str "oldest kept" "g2.exe" (List.nth names 19)))
+
+let launch_refusals () =
+  let _, sh = fake () in
+  let launch, calls = fake_launch () in
+  let dir = path_of_file () in
+  Fun.protect ~finally:(fun () -> rm (Filename.dirname dir)) (fun () ->
+      let txt = touch dir "notes.txt" in
+      let upper = touch dir "GAME.EXE" in
+      with_daemon ~launch sh (fun d ->
+          let b = [ ("bottle", "uhmm") ] in
+          let usage = "launch needs a bottle and a program: moth launch --bottle <bottle> <full path to game.exe>" in
+          check_err "no bottle" usage (call d "launch" [ "/x/game.exe" ]);
+          check_err "no program" usage (call d "launch" [] ~opts:b);
+          check_err "relative" "launch needs the full path to a windows program (.exe): game.exe" (call d "launch" [ "game.exe" ] ~opts:b);
+          check_err "txt" (Printf.sprintf "launch needs the full path to a windows program (.exe): %s" txt) (call d "launch" [ txt ] ~opts:b);
+          check_err "missing" (Printf.sprintf "no such file: %s/nope.exe" dir) (call d "launch" [ dir ^ "/nope.exe" ] ~opts:b);
+          check_int "never called" 0 (List.length !calls);
+          ignore (text (call d "launch" [ upper ] ~opts:b));
+          check_int ".EXE counts" 1 (List.length !calls);))
+
+let launch_fails () =
+  let _, sh = fake () in
+  let launch, _ = fake_launch ~result:(Error "no bottle named x") () in
+  let dir = path_of_file () in
+  Fun.protect ~finally:(fun () -> rm (Filename.dirname dir)) (fun () ->
+      let game = touch dir "game.exe" in
+      with_daemon ~launch sh (fun d ->
+          check_err "its message" "no bottle named x" (call d "launch" [ game ] ~opts:[ ("bottle", "x") ]);
+          check_str "not remembered" nothing_yet (text (call d "games" []))))
+
+let games_corrupt () =
+  let _, sh = fake () in
+  let home = fresh_home () in
+  Unix.mkdir home 0o700;
+  let oc = open_out (Filename.concat home "games.json") in
+  output_string oc "{not json";
+  close_out oc;
+  with_daemon ~home sh (fun d -> check_str "empty" nothing_yet (text (call d "games" [])))
+
+let launch_args_pass_through () =
+  let show = function
+    | Ok { Client.cmd; args; opts; json } ->
+        Printf.sprintf "%s [%s] {%s} %b" cmd (String.concat "; " args) (String.concat "; " (List.map (fun (k, v) -> k ^ "=" ^ v) opts)) json
+    | Error e -> "error " ^ e
+  in
+  let p = Client.parse_args in
+  check_str "after the path" "launch [/g/a.exe; -windowed; --json; --bottle; x; -n] {bottle=uhmm} false"
+    (show (p [ "launch"; "--bottle"; "uhmm"; "/g/a.exe"; "-windowed"; "--json"; "--bottle"; "x"; "-n" ]));
+  check_str "path first" "launch [/g/a.exe; -windowed] {} false" (show (p [ "launch"; "/g/a.exe"; "-windowed" ]));
+  check_str "json before the path is moth's" "launch [/g/a.exe] {bottle=u} true" (show (p [ "launch"; "--json"; "--bottle"; "u"; "/g/a.exe" ]));
+  check_str "no path" "launch [] {bottle=u} false" (show (p [ "launch"; "--bottle"; "u" ]))
+
 let home () =
   with_env "MOTH_HOME" "/x/y" (fun () -> check_str "env" "/x/y" (Client.home ()));
   with_env "MOTH_HOME" "rel" (fun () -> check_str "made absolute" (Filename.concat (Sys.getcwd ()) "rel") (Client.home ()));
@@ -1458,6 +1581,12 @@ let () =
           t "the hunt" hunt;
           t "status for the panels" status_for_panels;
           t "kept says its note" kept_says_its_note;
+          t "launch" launching;
+          t "launch remembers one per bottle and path, twenty at most" launch_remembers_once;
+          t "launch refusals" launch_refusals;
+          t "launch that fails" launch_fails;
+          t "games with a corrupt games.json" games_corrupt;
+          t "launch passes the game's arguments through" launch_args_pass_through;
           t "at guards a row" at_guards_a_row;
           t "helper lost" helper_lost;
           t "target gone" target_gone;

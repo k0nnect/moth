@@ -6,6 +6,8 @@ let usage =
   bottles                              list crossover bottles
   ps --bottle <bottle>                 list the windows programs running in a bottle
   attach --bottle <bottle> <game.exe>  attach to a running game, by name or pid
+  launch --bottle <bottle> <game.exe path> [args]  start a game in a bottle
+  games                                games started from moth before
   status                               what moth is attached to, and the hunt so far
   find <number>                        start a hunt for a number the game shows
   snapshot                             start a hunt with no number: remember everything, then narrow by how the value moves
@@ -70,7 +72,7 @@ let () =
   | [] | [ "help" ] | [ "--help" ] | [ "-h" ] -> print_string usage
   | [ "daemon" ] -> (
       let home = Client.home () in
-      try Daemon.run ~home ~start_helper:(Daemon.default_start_helper ~home) with Failure m -> fail 1 m)
+      try Daemon.run ~home ~start_helper:(Daemon.default_start_helper ~home) ~launch:(Daemon.default_launch ~home) with Failure m -> fail 1 m)
   | argv -> (
       match Client.parse_args argv with
       | Error m -> fail 2 m

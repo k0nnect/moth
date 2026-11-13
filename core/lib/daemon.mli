@@ -9,6 +9,9 @@
 (** starts a helper inside the named bottle *)
 type start_helper = bottle:string -> (Helper_api.helper, string) result
 
+(** starts a Windows program inside the named bottle and does not wait for it *)
+type launch = bottle:string -> exe:string -> args:string list -> (unit, string) result
+
 (** serves until a "stop" request, SIGTERM or SIGINT; on the way out it closes the helper
     connection and removes the socket. Raises [Failure] with the message to show when another
     daemon already serves [home] or the socket path is too long.
@@ -17,7 +20,7 @@ type start_helper = bottle:string -> (Helper_api.helper, string) result
     MiB, that every hunt's [find] sends with its scan; anything else is ignored, with a line in
     the log (unset or empty, quietly). MOTH_SNAPSHOT_MB likewise: a whole number from 1 to
     1048576 is the most memory, in MiB, a [snapshot] may take, sent with each one. *)
-val run : home:string -> start_helper:start_helper -> unit
+val run : home:string -> start_helper:start_helper -> launch:launch -> unit
 
 (** the real helper under CrossOver's wine, its output appended to [home]/helper.log *)
 val default_start_helper : home:string -> start_helper
@@ -38,3 +41,7 @@ val make_home : string -> unit
 (** removes [home]/core.sock unless a daemon holds [home]'s lock (one is running or starting);
     false when one does *)
 val clear_stale_socket : home:string -> bool
+
+(** the program under CrossOver's wine, detached in its own session, stdin from /dev/null, its
+    output appended to [home]/launch.log *)
+val default_launch : home:string -> launch

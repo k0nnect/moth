@@ -39,6 +39,10 @@ A client can follow what moth does, whoever asks it. `watch` (opts: `after`, an 
 
 A request with `"record": false` is answered as usual but takes no event number, adds no line to `events.jsonl` and tells no watcher: for polling. Only `bottles`, `ps`, `status`, `results`, `kept`, `log` and `games` may ask; any other command is refused, unrecorded, with `only commands that change nothing can go unrecorded`. One exception: a read that makes the daemon let go of the game or of its helper is recorded anyway, so watchers learn why the game went. That is a `status` that finds the game closed, or any read the helper answers with `target_gone` or `helper_lost`. It takes a `seq` and goes into `events.jsonl`, and watchers get its event with no `busy` line before it. The command line never sends `record`; `watch` is never recorded.
 
+## launch and games
+
+`moth launch --bottle <bottle> <full path to game.exe> [args]` starts the program under CrossOver's wine in that bottle and answers at once; it does not wait for the game. The path must be absolute, end in `.exe` (any case) and exist. Everything after the path is the game's own arguments, passed untouched, `-windowed` or `--json` included (the command line stops reading moth's options at the path). The game runs in its own session with stdin from `/dev/null`, so it outlives the daemon; its output is appended to `[home]/launch.log`. Each launch is remembered in `[home]/games.json`, a JSON list of `{"name","bottle","path","last"}`, newest first, one entry per bottle and path, 20 at most; a file that can't be read counts as empty and is replaced by the next launch. `moth games` lists them (`name  bottle  path`; json: a list of `{"name","bottle","path"}`) and may be sent with `record: false`; `launch` may not. A launched game is not attached: once it is up, run the `moth attach` line the answer prints. The daemon takes the starting function as `~launch` (`Daemon.default_launch` is the real one; tests pass a fake), so only the integration scenarios start a real game.
+
 ## engine speed
 
     make bench-native   # builds build/native/moth_bench and runs it

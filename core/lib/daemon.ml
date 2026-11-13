@@ -1,4 +1,5 @@
 type start_helper = bottle:string -> (Helper_api.helper, string) result
+type launch = bottle:string -> exe:string -> args:string list -> (unit, string) result
 
 let ( let* ) = Result.bind
 let sprintf = Printf.sprintf
@@ -70,6 +71,7 @@ type state = {
   home : string;
   sock : string;
   start_helper : start_helper;
+  launch : launch;
   budget_mb : int option; (* from MOTH_BUDGET_MB, for every session *)
   snapshot_mb : int option; (* from MOTH_SNAPSHOT_MB, for every session *)
   mutable conn : (string * Helper_api.helper) option; (* the helper and the bottle it runs in *)
@@ -360,6 +362,61 @@ let ps_listing bottle procs =
       let w = List.fold_left (fun w (pid, _) -> max w (String.length (string_of_int pid))) 0 procs in
       (json, String.concat "\n" (List.map (fun (pid, name) -> sprintf "%*d  %s" w pid name) procs))
 
+(* ---- launch and games: [home]/games.json, newest first ---- *)
+
+type game = { name : string; bottle : string; path : string; last : float }
+
+let max_games = 20
+let games_file st = in_home st.home "games.json"
+
+(* an unreadable file counts as empty *)
+let read_games st =
+  let open Yojson.Safe.Util in
+  try
+    Yojson.Safe.from_file (games_file st)
+    |> to_list
+    |> List.filter_map (fun g ->
+           try Some { name = to_string (member "name" g); bottle = to_string (member "bottle" g); path = to_string (member "path" g); last = to_float (member "last" g) }
+           with Type_error _ -> None)
+  with Sys_error _ | Yojson.Json_error _ | Type_error _ -> []
+
+let write_games st games =
+  let json = `List (List.map (fun g -> `Assoc [ ("name", `String g.name); ("bottle", `String g.bottle); ("path", `String g.path); ("last", `Float g.last) ]) games) in
+  let tmp = games_file st ^ ".tmp" in
+  try
+    Yojson.Safe.to_file tmp json;
+    Unix.rename tmp (games_file st)
+  with Sys_error _ | Unix.Unix_error _ -> say "couldn't write %s" (games_file st)
+
+let remember st ~bottle ~path =
+  let g = { name = Filename.basename path; bottle; path; last = Unix.time () } in
+  let others = List.filter (fun o -> not (o.bottle = bottle && o.path = path)) (read_games st) in
+  write_games st (List.filteri (fun i _ -> i < max_games) (g :: others))
+
+let launch_usage = "launch needs a bottle and a program: moth launch --bottle <bottle> <full path to game.exe>"
+
+let launch_game st ~bottle ~path ~args =
+  let* () =
+    if Filename.is_relative path || not (String.lowercase_ascii (Filename.extension path) = ".exe") then
+      Error (sprintf "launch needs the full path to a windows program (.exe): %s" path)
+    else if not (Sys.file_exists path) then Error (sprintf "no such file: %s" path)
+    else Ok ()
+  in
+  let* () = st.launch ~bottle ~exe:path ~args in
+  remember st ~bottle ~path;
+  let name = Filename.basename path in
+  let m = sprintf "started %s in %s. when it is up: moth attach --bottle \"%s\" %s" name bottle bottle name in
+  Ok (`Assoc [ ("message", `String m); ("name", `String name); ("bottle", `String bottle); ("path", `String path) ], m)
+
+let games st =
+  match read_games st with
+  | [] -> (`List [], "nothing launched from moth yet. start a game with: moth launch --bottle <bottle> <full path to game.exe>")
+  | gs ->
+      let w f = List.fold_left (fun w g -> max w (String.length (f g))) 0 gs in
+      let wn = w (fun g -> g.name) and wb = w (fun g -> g.bottle) in
+      ( `List (List.map (fun g -> `Assoc [ ("name", `String g.name); ("bottle", `String g.bottle); ("path", `String g.path) ]) gs),
+        String.concat "\n" (List.map (fun g -> sprintf "%-*s  %-*s  %s" wn g.name wb g.bottle g.path) gs) )
+
 (* ---- the event log ---- *)
 
 let event_line ev =
@@ -499,6 +556,8 @@ let check_usage ~cmd ~args ~opts =
       let* () = need (List.mem_assoc "bottle" opts) "ps needs a bottle: moth ps --bottle <bottle>" in
       none
   | "attach" -> need (List.length args = 1 && List.mem_assoc "bottle" opts) "attach needs a bottle and a process: moth attach --bottle <bottle> <game.exe>"
+  | "launch" -> need (args <> [] && List.mem_assoc "bottle" opts) launch_usage
+  | "games" -> none
   | "find" -> need (List.length args = 1) "find needs a number"
   | "snapshot" -> none
   | "next" -> need (List.length args = 1) "next needs a number, or one of: down, up, same, changed"
@@ -583,6 +642,8 @@ let handle st ~cmd ~args ~opts =
       let* text, w = Session.undo s in
       st.wrote <- Some (written_json w);
       Ok (said text)
+  | "launch", path :: args -> launch_game st ~bottle:(bottle ()) ~path ~args
+  | "games", _ -> Ok (games st)
   | "detach", _ -> Ok (said (detach st))
   | "log", _ -> Ok (log st opts)
   | "stop", _ ->
@@ -745,7 +806,7 @@ let mb_from_env name max =
           say "ignoring %s=%S: it must be a whole number from 1 to %d" name v max;
           None)
 
-let run ~home ~start_helper =
+let run ~home ~start_helper ~launch =
   let sock = match socket_path ~home with Ok p -> p | Error m -> failwith m in
   make_home home;
   if answers sock then failwith already_running;
@@ -758,6 +819,7 @@ let run ~home ~start_helper =
       home;
       sock;
       start_helper;
+      launch;
       budget_mb = mb_from_env "MOTH_BUDGET_MB" 65536;
       snapshot_mb = mb_from_env "MOTH_SNAPSHOT_MB" 1048576;
       conn = None;
@@ -804,3 +866,34 @@ let default_start_helper ~home ~bottle =
     ~launch:(Helper_conn.wine_launcher ~bottle ~helper_exe)
     ~label:(sprintf "bottle \"%s\"" bottle)
     ~log:(in_home home "helper.log") ()
+
+(* the program under CrossOver's wine, in its own session with stdin from /dev/null and its output
+   appended to [home]/launch.log; not waited for *)
+let default_launch ~home ~bottle ~exe ~args =
+  let* app = Crossover.find_app () in
+  let* () = Crossover.check_bottle bottle in
+  let argv = Crossover.wine_argv ~app ~bottle ~exe args in
+  let log = in_home home "launch.log" in
+  (* a new session, so the game outlives the daemon and holds no terminal; a grandchild, so it is
+     nobody's zombie when it ends *)
+  match Unix.fork () with
+  | exception Unix.Unix_error (e, _, _) -> Error (sprintf "could not start wine (%s). see %s" (Unix.error_message e) log)
+  | 0 ->
+      (try
+         ignore (Unix.setsid ());
+         if Unix.fork () = 0 then begin
+           let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
+           let out = Unix.openfile log [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND ] 0o644 in
+           Unix.dup2 null Unix.stdin;
+           Unix.dup2 out Unix.stdout;
+           Unix.dup2 out Unix.stderr;
+           Unix.close null;
+           Unix.close out;
+           Unix.execv argv.(0) argv
+         end
+       with _ -> ());
+      Unix._exit 0
+  | pid ->
+      let rec wait () = match Unix.waitpid [] pid with _ -> () | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait () in
+      wait ();
+      Ok ()

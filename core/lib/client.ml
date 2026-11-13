@@ -136,6 +136,9 @@ let parse_args argv =
   let set k v opts = List.remove_assoc k opts @ [ (k, v) ] in
   let rec go words opts json = function
     | [] -> ( match List.rev words with [] -> Error "no command. run: moth help" | cmd :: args -> Ok { cmd; args; opts; json })
+    (* the program's own arguments, whatever they look like, follow launch's path *)
+    | (_ :: _) as game_args when (match words with [ _; "launch" ] -> true | _ -> false) ->
+        Ok { cmd = "launch"; args = List.hd words :: game_args; opts; json }
     | "--json" :: rest -> go words opts true rest
     | "--all" :: rest -> go words (set "all" "true" opts) json rest
     | (("--bottle" | "-n" | "--from" | "--near" | "--after" | "--at") as o) :: rest -> (
