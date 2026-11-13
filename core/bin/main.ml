@@ -27,6 +27,10 @@ let usage =
   daemon                               run the background service in the foreground
 
   a result number can be written 3 or #3. in a script, write 3 or quote '#3'.
+  set and keep take #n from the last results you listed. with --at <0xaddr>, #n is
+  looked up again as results lists it now (not --near), and must still be at that
+  address; --kind <interp_id> (from results --json) pins its kind too, and --all
+  counts the rarer forms, as results --all does. --kind and --all go with --at.
   --json prints the result as json.
 |}
 

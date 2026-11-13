@@ -31,6 +31,13 @@ val watch : home:string -> ?after:int -> (Yojson.Safe.t -> bool) -> (unit, strin
 type invocation = { cmd : string; args : string list; opts : (string * string) list; json : bool }
 
 (** [moth <cmd> [args] [--bottle <b>] [--all] [--json] [-n <n>] [--from <row>] [--near <v>]
-    [--after <seq>]] without the program name. Options may come anywhere; an argument like [-5]
-    or [-.5] is a number, not an option. *)
+    [--after <seq>] [--at <0xaddr>] [--kind <interp_id>]] without the program name. Options may
+    come anywhere; an argument like [-5] or [-.5] is a number, not an option.
+
+    [--at] goes with a row write, [set <#n> <number>] or [keep <#n> [name]]: row n is then found
+    afresh in the hunt, numbered as [results] numbers it without [--near], and must be at that
+    address. [--kind] (an [interp_id] as [results --json] gives it) also pins the row's
+    interpretation, and [--all] counts the rarer forms when numbering, as [results --all] does;
+    on [set] and [keep] both go only with [--at]. Without [--at], row n is the one the last
+    recorded [results] listed. *)
 val parse_args : string list -> (invocation, string) result

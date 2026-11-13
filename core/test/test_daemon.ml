@@ -1072,22 +1072,23 @@ let at_guards_a_row () =
   let f = fk.script in
   with_daemon sh (fun d ->
       hunt_for_three d f 3;
-      let list () =
-        Fake_helper.queue_peek f "i32" (threes 3);
-        ignore (text (call d "results" []))
-      in
-      list ();
+      (* --at finds the row afresh: row 3 alone, which is at 0x1008 *)
+      let row3 () = Fake_helper.queue_peek f "i32" [ List.nth (threes 3) 2 ] in
       let at a = [ ("at", a) ] in
       let moved n a = Printf.sprintf "row %d is not at %s any more: the list changed. look again: moth results" n a in
-      (* row 3 is at 0x1008 *)
+      row3 ();
       Fake_helper.queue_write f ~prev:(Vint 3L);
       Fake_helper.queue_read f (Vint 9L);
       check_str "set at its address" "set #3 to 9 (was 3)" (text (call d "set" [ "3"; "9" ] ~opts:(at "0x1008")));
+      check_bool "row 3 alone" true (Fake_helper.last_peek f "i32" = (2, 1));
       check_bool "wrote" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
+      row3 ();
       check_err "set elsewhere" (moved 3 "0x1000") (call d "set" [ "3"; "7" ] ~opts:(at "0x1000"));
       check_bool "no write" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
+      row3 ();
       check_err "keep elsewhere" (moved 3 "0x1000") (call d "keep" [ "3"; "hp" ] ~opts:(at "0x1000"));
       check_str "nothing kept" nothing_kept (text (call d "kept" []));
+      row3 ();
       Fake_helper.queue_read f (Vint 9L);
       check_str "keep at its address" "kept #3 as hp (9, whole number)" (text (call d "keep" [ "3"; "hp" ] ~opts:(at "0x1008")));
       let row_only = "--at goes with a row number" in
@@ -1402,6 +1403,117 @@ let watching_until_stop () =
   check_int "and nothing else" 3 (List.length seen);
   rm d.home
 
+(* ---- a row write names its own row ---- *)
+
+let first_addr r = Yojson.Safe.Util.(index 0 (member "rows" (json r)) |> member "addr" |> to_string)
+let moved_text n a = Printf.sprintf "row %d is not at %s any more: the list changed. look again: moth results" n a
+
+(* the window's unrecorded poll comes between a command-line listing and its row write: the row
+   numbers stay the ones the command line was shown (the whole-branch review's probe) *)
+let a_poll_leaves_the_rows () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 3;
+      (* the command line lists near 0x1008: #1 0x1008, #2 0x1004, #3 0x1000 *)
+      Fake_helper.queue_peek_from f "i32" (threes 3);
+      check_str "the command line's #1" "0x1008" (first_addr (call d "results" [] ~opts:[ ("near", "0x1008") ]));
+      (* the window's poll: page 1 of the plain list, unrecorded, whose #1 is 0x1000 *)
+      Fake_helper.queue_peek f "i32" (threes 3);
+      check_str "the window's #1" "0x1000" (first_addr (unrecorded d "results" [] ~opts:[ ("from", "1"); ("n", "200") ]));
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "set 1 9" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ]));
+      check_bool "written where the command line was shown #1" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
+      (* the window reads another page: the command line's #3 is still there *)
+      Fake_helper.queue_peek f "i32" [ List.nth (threes 3) 1 ];
+      ignore (json (unrecorded d "results" [] ~opts:[ ("from", "2"); ("n", "1") ]));
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "set 3 9" "set #3 to 9 (was 3)" (text (call d "set" [ "3"; "9" ]));
+      check_bool "written at its #3" true (Fake_helper.last_write f = (0x1000L, "i32", Put_value (Vint 9L))))
+
+(* with --at, row n is found afresh in the hunt as results lists it without --near (--all as
+   given); the rows a listing left are neither used nor changed *)
+let a_row_found_afresh () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 3; gi "u8" 1 ];
+      ignore (text (call d "find" [ "3" ]));
+      let at a = [ ("at", a) ] and all = [ ("all", "true") ] in
+      let three a = { addr = a; v = Some (Vint 3L) } in
+      let wrote n = Fake_helper.queue_write f ~prev:(Vint 3L); Fake_helper.queue_read f (Vint n) in
+      (* nothing listed yet: row 1 is the first whole number *)
+      Fake_helper.queue_peek f "i32" [ three 0x1000L ];
+      wrote 9L;
+      check_str "set, nothing listed" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(at "0x1000")));
+      check_bool "its row alone" true (Fake_helper.last_peek f "i32" = (0, 1));
+      check_bool "written there" true (Fake_helper.last_write f = (0x1000L, "i32", Put_value (Vint 9L)));
+      (* a recorded listing: its #1 is 0x1004 *)
+      Fake_helper.queue_peek f "i32" [ three 0x1004L; three 0x1008L ];
+      check_str "listed from 2" "0x1004" (first_addr (call d "results" [] ~opts:[ ("from", "2") ]));
+      (* with --all the rarer forms count too, fewest matches first: row 1 is the 1-byte one *)
+      Fake_helper.queue_peek f "u8" [ three 0x2001L ];
+      wrote 9L;
+      check_str "set, all" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(at "0x2001" @ all)));
+      check_bool "the 1-byte one" true (Fake_helper.last_write f = (0x2001L, "u8", Put_value (Vint 9L)));
+      Fake_helper.queue_peek f "i32" [ three 0x1000L ];
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "keep, all" "kept #2 as hp (9, whole number)" (text (call d "keep" [ "2"; "hp" ] ~opts:(at "0x1000" @ all)));
+      check_bool "row 2 is the first whole number" true (Fake_helper.last_peek f "i32" = (0, 1));
+      (* past the end: no row, and nothing asked of the helper *)
+      let calls = List.length (Fake_helper.calls f) in
+      check_err "no row 5" "no result #5. run: moth results" (call d "set" [ "5"; "9" ] ~opts:(at "0x1000"));
+      check_err "nor kept" "no result #5. run: moth results" (call d "keep" [ "5" ] ~opts:(at "0x1000"));
+      check_int "nothing asked" calls (List.length (Fake_helper.calls f));
+      (* without --at, the recorded listing's rows, as they were *)
+      wrote 7L;
+      check_str "set 2 7" "set #2 to 7 (was 3)" (text (call d "set" [ "2"; "7" ]));
+      check_bool "the listing's #2" true (Fake_helper.last_write f = (0x1004L, "i32", Put_value (Vint 7L)));
+      check_err "the listing has no #1" "no result #1. run: moth results" (call d "set" [ "1"; "7" ]))
+
+(* --kind pins the row's interpretation as well: the same address read as another kind is not
+   that row *)
+let a_row_of_another_kind () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 3;
+      let pin kind = [ ("at", "0x1000"); ("kind", kind) ] in
+      Fake_helper.queue_peek f "i32" (threes 1);
+      check_err "set as a decimal" (moved_text 1 "0x1000") (call d "set" [ "1"; "9" ] ~opts:(pin "f32"));
+      Fake_helper.queue_peek f "i32" (threes 1);
+      check_err "keep as a decimal" (moved_text 1 "0x1000") (call d "keep" [ "1"; "hp" ] ~opts:(pin "f32"));
+      check_int "nothing written" 0 (Fake_helper.write_calls f);
+      check_str "nothing kept" nothing_kept (text (call d "kept" []));
+      Fake_helper.queue_peek f "i32" (threes 1);
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "as its own kind" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(pin "i32")));
+      check_bool "written" true (Fake_helper.last_write f = (0x1000L, "i32", Put_value (Vint 9L))))
+
+let kind_and_all_go_with_at () =
+  let check n w g = Alcotest.(check (result unit string)) n w g in
+  let u cmd args opts = Daemon.check_usage ~cmd ~args ~opts in
+  let kind = Error "--kind goes with --at" and all = Error "--all goes with --at" in
+  check "set --kind" kind (u "set" [ "1"; "9" ] [ ("kind", "i32") ]);
+  check "keep --kind" kind (u "keep" [ "1"; "hp" ] [ ("kind", "i32") ]);
+  check "set by name --kind" kind (u "set" [ "hp"; "9" ] [ ("kind", "i32") ]);
+  check "results --kind" kind (u "results" [] [ ("kind", "i32") ]);
+  check "set --all" all (u "set" [ "1"; "9" ] [ ("all", "true") ]);
+  check "keep --all" all (u "keep" [ "1" ] [ ("all", "true") ]);
+  check "set --at --kind --all" (Ok ()) (u "set" [ "1"; "9" ] [ ("at", "0x10"); ("kind", "i32"); ("all", "true") ]);
+  check "keep --at --kind --all" (Ok ()) (u "keep" [ "1"; "hp" ] [ ("at", "0x10"); ("kind", "i32"); ("all", "true") ]);
+  check "results --all" (Ok ()) (u "results" [] [ ("all", "true") ]);
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      hunt_for_three d fk.script 3;
+      check_err "from the daemon, --kind" "--kind goes with --at" (call d "set" [ "1"; "9" ] ~opts:[ ("kind", "i32") ]);
+      check_err "from the daemon, --all" "--all goes with --at" (call d "keep" [ "1" ] ~opts:[ ("all", "true") ]);
+      check_int "nothing asked of the helper" 0 (Fake_helper.write_calls fk.script + List.length (Fake_helper.peeks fk.script)))
+
 let usage () =
   let check n w g = Alcotest.(check (result unit string)) n w g in
   check "unknown" (Error "unknown command: frob. run: moth help") (Daemon.check_usage ~cmd:"frob" ~args:[] ~opts:[]);
@@ -1437,6 +1549,8 @@ let parse_args () =
   same "after needs a value" (Error "--after needs a value") (p [ "watch"; "--after" ]);
   same "at" (inv "set" [ "3"; "9" ] [ ("at", "0x10") ] false) (p [ "set"; "3"; "9"; "--at"; "0x10" ]);
   same "at needs a value" (Error "--at needs a value") (p [ "keep"; "3"; "--at" ]);
+  same "at, kind and all" (inv "set" [ "3"; "9" ] [ ("at", "0x10"); ("kind", "i32"); ("all", "true") ] false) (p [ "set"; "3"; "9"; "--at"; "0x10"; "--kind"; "i32"; "--all" ]);
+  same "kind needs a value" (Error "--kind needs a value") (p [ "set"; "3"; "9"; "--kind" ]);
   same "no command" (Error "no command. run: moth help") (p [ "--json" ])
 
 let parse_results_args () =
@@ -1645,6 +1759,13 @@ let () =
           t "a watcher that never reads" a_watcher_that_never_reads;
           t "Client.watch with no daemon" watch_with_no_daemon;
           t "watch until stop" watching_until_stop;
+        ] );
+      ( "row writes",
+        [
+          t "a poll leaves the command line's rows" a_poll_leaves_the_rows;
+          t "--at finds its row afresh" a_row_found_afresh;
+          t "--kind refuses a row of another kind" a_row_of_another_kind;
+          t "--kind and --all go with --at" kind_and_all_go_with_at;
         ] );
       ("client", [ t "parse args" parse_args; t "parse args: results options" parse_results_args; t "home" home ]);
     ]

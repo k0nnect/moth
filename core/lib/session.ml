@@ -67,12 +67,7 @@ let lost_values =
   "moth lost what it remembered of the last step, so it can't compare by change now. type the number it shows (moth next <number>), or start again: moth snapshot"
 
 let no_row n = Printf.sprintf "no result #%d. run: moth results" n
-
-(* a click names the address its row showed: a row that is anywhere else now is not that row *)
-let moved ~row ~at (l : listed) =
-  match at with
-  | Some a when a <> l.laddr -> Some (Printf.sprintf "row %d is not at 0x%Lx any more: the list changed. look again: moth results" row a)
-  | _ -> None
+let moved row at = Printf.sprintf "row %d is not at 0x%Lx any more: the list changed. look again: moth results" row at
 let no_kept name = Printf.sprintf "no kept value called %s. see: moth kept" name
 let find_kept t name = List.find_opt (fun k -> k.kname = name) t.named
 
@@ -448,9 +443,11 @@ let nearby t gs ~target ~addr ~from ~limit =
 (* how a value reads as [i]; "?" when it couldn't be read *)
 let shown_as i = function Some x -> Interp.decode i x | None -> "?"
 
-(* the page as rows; they become the rows set and keep_row take *)
-let listing_of t ~from ~total found =
-  t.listing <- List.map (fun (n, li, (it : item), _) -> { at = n; li; laddr = it.addr; lshown = shown_as li it.v }) found;
+let listed_of (n, li, (it : item), _) = { at = n; li; laddr = it.addr; lshown = shown_as li it.v }
+
+(* the page as rows; when [remember], they become the rows set and keep_row take *)
+let listing_of t ~remember ~from ~total found =
+  if remember then t.listing <- List.map listed_of found;
   let row (n, (i : Interp.t), (it : item), away) = { n; addr = it.addr; interp_id = i.id; tag = Interp.describe i; shown = shown_as i it.v; away } in
   { rows = List.map row found; total; from }
 
@@ -459,19 +456,36 @@ let target_addr t target = match parse_addr target with Some a -> Some a | None 
 
 let nothing_yet = "nothing to list yet. tell moth how the value moved first: moth next down, up, same or changed."
 
-let results t ~all ~from ~limit ~near =
+let results ?(remember = true) t ~all ~from ~limit ~near =
   match t.hunt with
   | None -> Error no_hunt
   | Some { blind = true; _ } -> Error nothing_yet
   | Some hunt -> (
       let gs = shown_groups hunt ~all in
-      let list numbered = guard t (fun () -> Result.map (fun (found, total) -> listing_of t ~from ~total found) (numbered ())) in
+      let list numbered = guard t (fun () -> Result.map (fun (found, total) -> listing_of t ~remember ~from ~total found) (numbered ())) in
       match near with
       | None -> list (fun () -> paged t gs ~from ~limit)
       | Some target -> (
           match target_addr t target with
           | None -> Error (no_kept target)
           | Some addr -> list (fun () -> nearby t gs ~target ~addr ~from ~limit)))
+
+(* The row a write or a keep takes. With [at]: row [row] found afresh in the hunt, as [results]
+   lists it without [near] ([all] as given), which must be at [at] and, when [kind] is given, be
+   that interpretation; the remembered rows are neither used nor changed. Without: the row of that
+   number in the last remembered listing. *)
+let row_for ?at ?kind ?(all = false) t row =
+  match (t.hunt, at) with
+  | None, _ -> Error no_hunt
+  | Some _, None -> ( match List.find_opt (fun l -> l.at = row) t.listing with Some l -> Ok l | None -> Error (no_row row))
+  | Some { blind = true; _ }, Some _ -> Error (no_row row)
+  | Some hunt, Some at ->
+      guard t (fun () ->
+          match paged t (shown_groups hunt ~all) ~from:row ~limit:1 with
+          | Error _ | Ok ([], _) -> Error (no_row row)
+          | Ok (found :: _, _) ->
+              let l = listed_of found in
+              if l.laddr <> at || Option.fold ~none:false ~some:(fun k -> k <> l.li.id) kind then Error (moved row at) else Ok l)
 
 (* ---- writes ---- *)
 
@@ -515,14 +529,10 @@ let write_checked t ~label (i : Interp.t) addr text =
           in
           Ok { text = (match why with Some why -> text ^ "\n" ^ why | None -> text); w; held })
 
-let set ?at t ~row text =
-  match t.hunt with
-  | None -> Error no_hunt
-  | Some _ -> (
-      match List.find_opt (fun l -> l.at = row) t.listing with
-      | None -> Error (no_row row)
-      | Some l when moved ~row ~at l <> None -> Error (Option.get (moved ~row ~at l))
-      | Some l -> write_checked t ~label:(Printf.sprintf "#%d" row) l.li l.laddr text)
+let set ?at ?kind ?all t ~row text =
+  match row_for ?at ?kind ?all t row with
+  | Error e -> Error e
+  | Ok l -> write_checked t ~label:(Printf.sprintf "#%d" row) l.li l.laddr text
 
 let undo t =
   match t.undo with
@@ -569,23 +579,19 @@ let read_as t (i : Interp.t) addr =
   | Error { code = "read_failed"; _ } -> None
   | Error e -> raise (Helper_failed e)
 
-let keep_row ?at t ~row ~name =
+let keep_row ?at ?kind ?all t ~row ~name =
   match new_name t name with
   | Error e -> Error e
   | Ok name -> (
-      match t.hunt with
-      | None -> Error no_hunt
-      | Some _ -> (
-          match List.find_opt (fun l -> l.at = row) t.listing with
-          | None -> Error (no_row row)
-          | Some l when moved ~row ~at l <> None -> Error (Option.get (moved ~row ~at l))
-          | Some l ->
-              guard t (fun () ->
-                  (* how it reads now, which a write since the listing may have changed; as listed
-                     when it can't be read *)
-                  let shown = match read_as t l.li l.laddr with Some v -> Interp.decode l.li v | None -> l.lshown in
-                  add_kept t name l.li l.laddr;
-                  Ok (Printf.sprintf "kept #%d as %s (%s, %s)" row name shown (Interp.describe l.li)))))
+      match row_for ?at ?kind ?all t row with
+      | Error e -> Error e
+      | Ok l ->
+          guard t (fun () ->
+              (* how it reads now, which a write since the listing may have changed; as listed
+                 when it can't be read *)
+              let shown = match read_as t l.li l.laddr with Some v -> Interp.decode l.li v | None -> l.lshown in
+              add_kept t name l.li l.laddr;
+              Ok (Printf.sprintf "kept #%d as %s (%s, %s)" row name shown (Interp.describe l.li))))
 
 let keep_at t ~addr text ~name =
   match new_name t name with

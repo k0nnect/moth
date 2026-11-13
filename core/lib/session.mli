@@ -101,18 +101,24 @@ val reach : int
     value's name, or a [0x] address), the rows are every position within [reach] bytes of that
     address, its own included, nearest first, ties in plan order. Either way rows are numbered by
     position: a position whose value can't be read is a row in its place, shown as ["?"]. A
-    [from] past [total] (when there are any) is an error. The page's rows are the ones [set] and
-    [keep_row] take, as any rows, until the hunt changes or another listing replaces them. *)
-val results : t -> all:bool -> from:int -> limit:int -> near:string option -> (listing, string) result
+    [from] past [total] (when there are any) is an error. When [remember] (the default), the
+    page's rows are the ones [set] and [keep_row] without [at] take, until the hunt changes or
+    another remembered listing replaces them; a listing not remembered changes nothing. *)
+val results : ?remember:bool -> t -> all:bool -> from:int -> limit:int -> near:string option -> (listing, string) result
 
 (** writes the number, waits ([settle]), then reads the address back: the game putting back the
     bytes the write replaced, or anything else there, is a second line and [held = Some false]. A
     read-back that can't happen is [held = None] and a second line saying why; when it lost the
     game or the helper, the hunt, the kept values and the undo list end there, as they would in
     any step. The write landed, so it is the result in every case, and it can be undone unless
-    the undo list ended. With [at], the row must be at that address, or nothing is written and
-    the error says the list changed. *)
-val set : ?at:int64 -> t -> row:int -> string -> (set_done, string) result
+    the undo list ended.
+
+    Without [at], [row] is the row of that number in the last remembered listing. With [at], it
+    is found afresh in the hunt, numbered as [results] numbers rows without [near] ([all] as
+    given, false by default), and the remembered listing is neither used nor changed; that row
+    must be at [at] and, when [kind] is given, be the interpretation with that id, or nothing is
+    written and the error says the list changed. *)
+val set : ?at:int64 -> ?kind:string -> ?all:bool -> t -> row:int -> string -> (set_done, string) result
 
 (** writes back the exact bytes the newest write replaced *)
 val undo : t -> (string * written, string) result
@@ -125,12 +131,12 @@ val undo : t -> (string * written, string) result
     it wrote); never when it can't be read. *)
 type kept = { name : string; kaddr : int64; ktag : string; kshown : string; set_to : string option; put_back : bool }
 
-(** keeps a row of the latest listing by name, or as the first of [v1], [v2], ... not in use, and
-    says how it reads now (as the listing showed it when it can't be read). A name is a lowercase
-    letter and up to 23 lowercase letters, digits, [_] or [-]; at most 64 values are kept. Kept
-    values outlast the hunt. With [at], the row must be at that address, or nothing is kept and
-    the error says the list changed. *)
-val keep_row : ?at:int64 -> t -> row:int -> name:string option -> (string, string) result
+(** keeps a row by name, or as the first of [v1], [v2], ... not in use, and says how it reads now
+    (as the listing showed it when it can't be read). A name is a lowercase letter and up to 23
+    lowercase letters, digits, [_] or [-]; at most 64 values are kept. Kept values outlast the
+    hunt. The row is found as [set] finds it: in the last remembered listing, or with [at] (and
+    [kind], [all]) afresh, and nothing is kept when it is not there. *)
+val keep_row : ?at:int64 -> ?kind:string -> ?all:bool -> t -> row:int -> name:string option -> (string, string) result
 
 (** keeps the address as the first interpretation of the number, in plan order, that reads as it
     there *)

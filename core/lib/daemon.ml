@@ -550,6 +550,10 @@ let check_usage ~cmd ~args ~opts =
         else need (address a <> None) "--at needs an address like 0x7ffe1234"
   in
   let* () = at_ok in
+  (* --kind, and --all on a row write, say how to find the row --at names *)
+  let pinned = List.mem_assoc "at" opts in
+  let* () = need (pinned || not (List.mem_assoc "kind" opts)) "--kind goes with --at" in
+  let* () = need (pinned || not ((cmd = "set" || cmd = "keep") && List.mem_assoc "all" opts)) "--all goes with --at" in
   match cmd with
   | "bottles" | "status" | "kept" | "undo" | "detach" | "stop" -> none
   | "ps" ->
@@ -591,10 +595,13 @@ let check_usage ~cmd ~args ~opts =
 
 let relations = [ ("down", Session.Down); ("up", Session.Up); ("same", Session.Same); ("changed", Session.Changed) ]
 
-let handle st ~cmd ~args ~opts =
+(* [record]: false when the request asked to leave no trace; such a results listing is not the
+   one row numbers are taken from *)
+let handle st ~record ~cmd ~args ~opts =
   let* () = check_usage ~cmd ~args ~opts in
   let bottle () = List.assoc "bottle" opts in
-  let at = Option.bind (List.assoc_opt "at" opts) address in
+  let all = List.assoc_opt "all" opts = Some "true" in
+  let at = Option.bind (List.assoc_opt "at" opts) address and kind = List.assoc_opt "kind" opts in
   let session () = match st.target with Some t -> Ok t.session | None -> Error not_attached in
   match (cmd, args) with
   | "bottles", _ -> Ok (bottles ())
@@ -617,16 +624,16 @@ let handle st ~cmd ~args ~opts =
         (match List.assoc_opt (String.lowercase_ascii a) relations with Some r -> Session.next_relation s r | None -> Session.next_number s a)
   | "results", _ ->
       let* s = session () in
-      let all = List.assoc_opt "all" opts = Some "true" and near = List.assoc_opt "near" opts in
+      let near = List.assoc_opt "near" opts in
       let given k default = Option.fold ~none:default ~some:int_of_string (List.assoc_opt k opts) in
-      Result.map (listing ?near ~all) (Session.results s ~all ~from:(given "from" 1) ~limit:(given "n" 20) ~near)
+      Result.map (listing ?near ~all) (Session.results ~remember:record s ~all ~from:(given "from" 1) ~limit:(given "n" 20) ~near)
   | "keep", first :: rest ->
       let* s = session () in
       let name = function [ n ] -> Some n | _ -> None in
       Result.map said
         (match (address first, rest) with
         | Some addr, number :: more -> Session.keep_at s ~addr number ~name:(name more)
-        | _ -> Session.keep_row ?at s ~row:(Option.get (row_number first)) ~name:(name rest))
+        | _ -> Session.keep_row ?at ?kind ~all s ~row:(Option.get (row_number first)) ~name:(name rest))
   | "kept", _ ->
       let* s = session () in
       Result.map kept (Session.kept s)
@@ -635,7 +642,7 @@ let handle st ~cmd ~args ~opts =
       Result.map said (Session.forget s name)
   | "set", [ target; v ] ->
       let* s = session () in
-      let* d = match row_number target with Some row -> Session.set ?at s ~row v | None -> Session.set_kept s ~name:target v in
+      let* d = match row_number target with Some row -> Session.set ?at ?kind ~all s ~row v | None -> Session.set_kept s ~name:target v in
       Ok (set_done st d)
   | "undo", _ ->
       let* s = session () in
@@ -697,7 +704,7 @@ let answer st = function
   | Ok r when not (r.record || List.mem r.cmd reads) -> reply r.rid (Error "only commands that change nothing can go unrecorded")
   | Ok r ->
       if r.record then feed st (`Assoc [ ("busy", `Assoc [ ("actor", `String r.actor); ("cmd", `String r.cmd); ("args", `List (List.map (fun a -> `String a) r.args)) ]) ]);
-      let result = try handle st ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
+      let result = try handle st ~record:r.record ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
       let lost_the_game = st.closed || st.lost || st.gone in
       settle st;
       if r.record || lost_the_game then record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
