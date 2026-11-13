@@ -33,9 +33,9 @@ public:
   QString line() const;      // the newest thing to tell the user
   void say(const QString &line);
   // a recorded request as the user. Refused while working: line becomes "moth is busy: <what>",
-  // nothing is sent and `then` is not called. A failed request's whole error becomes the line, and
-  // its event (whose summary is the error's first line) leaves it so. With no service answering,
-  // it starts one.
+  // nothing is sent and `then` is not called. The core's whole answer becomes the line, all its
+  // lines: the text when it worked, the error when it failed; its event (whose summary is the
+  // answer's first line) leaves it so. With no service answering, it starts one.
   void run(const QString &cmd, const QStringList &args = {}, const Opts &opts = {},
            std::function<void(const Reply &)> then = {});
   // an unrecorded read. Dropped (and `done` never called) while working, while the service is

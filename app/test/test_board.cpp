@@ -16,6 +16,7 @@ private slots:
   void theLaunchAndTheUsersOwnRequestsStartTheService();
   void pollingNeverStartsTheService();
   void aFailedActionKeepsItsWholeError();
+  void anActionShowsItsWholeAnswer();
   void anEventAlwaysBringsFreshStatus();
   void anEventsStatusReadIsNeverSkipped();
   void aRefusedWatchIsSaid();
@@ -212,6 +213,46 @@ void TestBoard::aFailedActionKeepsItsWholeError() {
   rig.fake.push(eventLine(2, "user", "set", {"3", "9"}, first, false));
   QTRY_COMPARE(turned.count(), turns + 1);  // the event has been taken
   QCOMPARE(rig.board.line(), whole);
+}
+
+// R13: the user's own action that worked shows the core's whole answer, all its lines, whether its
+// event (whose summary is the first line) comes before the reply or after it; someone else's
+// event still shows its first line, as theirs
+void TestBoard::anActionShowsItsWholeAnswer() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.feedRequests(false);  // this test sends the events itself, in the order it wants
+  const QString first = "set #3 to 9";
+  const QString whole = first + "\nthe game put it straight back to 100. it's worked out from something else, so writing here won't stick.";
+  rig.fake.on("set", [&](const QStringList &, const Opts &) {
+    return Reply{true, QJsonObject{{"message", whole}, {"held", false}}, whole, {}};
+  });
+  QSignalSpy turned(&rig.board, &Board::turned);
+
+  // the event, then the reply
+  rig.fake.hold("set");
+  std::optional<Reply> got;
+  rig.board.run("set", {"3", "9"}, {{"at", "0x7ffe1234"}}, [&](const Reply &r) { got = r; });
+  QTRY_COMPARE(timesSeen(rig.fake, "set"), 1);
+  rig.fake.push(eventLine(1, "user", "set", {"3", "9"}, first));
+  QTRY_COMPARE(rig.board.line(), first);
+  rig.fake.release("set");
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(rig.board.line(), whole);
+
+  // the reply, then the event
+  rig.board.say("something else");
+  got.reset();
+  rig.board.run("set", {"3", "9"}, {{"at", "0x7ffe1234"}}, [&](const Reply &r) { got = r; });
+  QTRY_VERIFY(got.has_value());
+  QCOMPARE(rig.board.line(), whole);
+  const int turns = turned.count();
+  rig.fake.push(eventLine(2, "user", "set", {"3", "9"}, first));
+  QTRY_COMPARE(turned.count(), turns + 1);  // the event has been taken
+  QCOMPARE(rig.board.line(), whole);
+
+  rig.fake.push(eventLine(3, "agent", "set", {"3", "9"}, first));
+  QTRY_COMPARE(rig.board.line(), "agent: " + first);
 }
 
 // R9: an event always brings a status read sent after it, and `turned` once that is in

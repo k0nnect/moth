@@ -73,7 +73,7 @@ void Board::run(const QString &cmd, const QStringList &args, const Opts &opts, s
   }
   core_->call(cmd, args, opts, true, [self = QPointer<Board>(this), then](const Reply &r) {
     if (!self) return;
-    if (!r.ok) self->say(r.error);
+    self->say(r.ok ? r.text : r.error);  // all its lines; its event (the first line) leaves them
     if (then) then(r);
   });
 }
@@ -114,7 +114,7 @@ void Board::ended(const QJsonObject &ev) {
   const QString said = ev.value("actor").toString() == "user" ? summary : "agent: " + summary;
   working_ = false;
   what_.clear();
-  // the user's own failed action already shows its whole error, whose first line this is
+  // the user's own action already shows its whole answer, whose first line this is
   if (said != line_.section('\n', 0, 0)) line_ = said;
   owesLine_ = false;
   emit changed();

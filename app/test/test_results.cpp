@@ -135,6 +135,11 @@ private slots:
   void aTickRefreshesTheRowsInView();
   void readsThatOverlapEndWithTheList();
   void aReloadWhileBusyWaitsForTheEvent();
+  void aRowThatMovedBeforeItsWriteIsNotWritten();
+  void aWriteWhileBusyIsNotSent();
+  void aWriteSendsNoOtherReadUntilItIsAnswered();
+  void aSetThatWorkedKeepsTheListAndItsSelection();
+  void anEventWithAnotherTotalStartsTheListAgain();
   void itIsThirdInTheWindowsColumn();
 };
 
@@ -248,8 +253,10 @@ void TestResults::keepSelectedKeepsThatRowAtItsAddress() {
   QVERIFY(!keep->isEnabled());
   h.view->selectRow(1);
   QVERIFY(keep->isEnabled());
+  QSignalSpy reset(h.model, &QAbstractItemModel::modelReset);
   h.rig.fake.on("keep", [](const QStringList &, const Opts &) { return ok(QJsonObject{{"message", "kept #2 as hp"}}, "kept #2 as hp"); });
   h.panel->keepSelected("hp");
+  QVERIFY(!keep->isEnabled());  // one write at a time
   QTRY_COMPARE(seenOf(h.rig.fake, "keep").size(), 1);
   const auto keepIt = seenOf(h.rig.fake, "keep")[0];
   QCOMPARE(keepIt.args, (QStringList{"2", "hp"}));
@@ -258,11 +265,13 @@ void TestResults::keepSelectedKeepsThatRowAtItsAddress() {
   QCOMPARE(justBefore(h.rig.fake, "keep").cmd, QString("results"));
   QCOMPARE(opt(justBefore(h.rig.fake, "keep").opts, "from"), QString("2"));
   QCOMPARE(opt(justBefore(h.rig.fake, "keep").opts, "n"), QString("1"));
-  // the list is read again after it, which forgets the selection
-  QTRY_VERIFY(!keep->isEnabled());
+  // R14: its event leaves the list the same, so the row stays selected
+  QTRY_COMPARE(count(after(h.rig.fake, "keep"), "results"), 1);
+  QTRY_VERIFY(keep->isEnabled());
+  QCOMPARE(h.view->selectionModel()->selectedRows(), QModelIndexList{h.model->index(1, 0)});
+  QCOMPARE(reset.count(), 0);
 
   // while moth is working, nothing that would start a request can be used
-  QTRY_COMPARE(h.model->rowCount(), 200);
   h.view->selectRow(4);
   QVERIFY(keep->isEnabled());
   h.rig.fake.push({{"busy", QJsonObject{{"actor", "agent"}, {"cmd", "next"}, {"args", QJsonArray{"down"}}}}});
@@ -432,6 +441,139 @@ void TestResults::aReloadWhileBusyWaitsForTheEvent() {
   h.rig.fake.push(eventLine(1, "next", "3 matches"));
   QTRY_COMPARE(h.model->rowCount(), 200);
   QCOMPARE(h.shown->text(), QString("showing 200 of 16,700,000"));
+}
+
+// R12: the row listed alone is no longer where it was shown: nothing is written, the line says
+// why, and the list is read again
+void TestResults::aRowThatMovedBeforeItsWriteIsNotWritten() {
+  ListRig h;
+  QVERIFY(h.start());
+  const QString was = h.list.addrOf(3);
+  h.list.addr[3] = "0x20000000";  // the list changed, and no event has said so yet
+  QSignalSpy reset(h.model, &QAbstractItemModel::modelReset);
+  h.rig.fake.on("set", [](const QStringList &, const Opts &) { return ok(QJsonObject{{"message", "set"}}, "set"); });
+  h.rig.fake.on("keep", [](const QStringList &, const Opts &) { return ok(QJsonObject{{"message", "kept"}}, "kept"); });
+  QVERIFY(h.model->setData(h.model->index(2, 1), "9"));
+  const QString moved = "row 3 is not at " + was + " any more: the list changed. look again: moth results";
+  QTRY_COMPARE(h.rig.board.line(), moved);
+  QTRY_COMPARE(reset.count(), 1);
+  QTRY_COMPARE(cell(h.model, 2, 3), QString("0x20000000"));
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(h.rig.fake, "set"), 0);
+
+  // likewise a keep; and a row the core can't list says the core's words
+  h.list.addr[3] = "0x30000000";
+  h.view->selectRow(2);
+  h.panel->keepSelected("hp");
+  QTRY_COMPARE(h.rig.board.line(), QString("row 3 is not at 0x20000000 any more: the list changed. look again: moth results"));
+  QTRY_COMPARE(cell(h.model, 2, 3), QString("0x30000000"));
+  h.rig.fake.on("results", [&](const QStringList &, const Opts &o) {
+    return opt(o, "n") == "1" ? refused("the game closed. attach again once it's running.") : h.list.page(o);
+  });
+  QVERIFY(h.model->setData(h.model->index(2, 1), "9"));
+  QTRY_COMPARE(h.rig.board.line(), QString("the game closed. attach again once it's running."));
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(h.rig.fake, "set"), 0);
+  QCOMPARE(timesSeen(h.rig.fake, "keep"), 0);
+}
+
+// R12: a write that can't list its row (moth is working) is not sent; the line says why
+void TestResults::aWriteWhileBusyIsNotSent() {
+  ListRig h;
+  QVERIFY(h.start());
+  h.rig.fake.push({{"busy", QJsonObject{{"actor", "agent"}, {"cmd", "next"}, {"args", QJsonArray{"down"}}}}});
+  QTRY_VERIFY(h.rig.board.working());
+  const int before = timesSeen(h.rig.fake, "results");
+  QVERIFY(!h.model->setData(h.model->index(2, 1), "9"));
+  QCOMPARE(h.rig.board.line(), QString("moth is busy: next down (agent)"));
+  QCOMPARE(h.model->rowCount(), 0);  // read again: once the work is over
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(h.rig.fake, "results"), before);
+  QCOMPARE(timesSeen(h.rig.fake, "set"), 0);
+  h.rig.fake.push(eventLine(1, "next", "3 matches"));
+  QTRY_COMPARE(h.model->rowCount(), 200);
+  QCOMPARE(timesSeen(h.rig.fake, "set"), 0);
+}
+
+// R12: from the row's own read until the write is answered, the model reads nothing else, so its
+// own polling can't change the core's last listing under the write; what was asked for meanwhile
+// is done after
+void TestResults::aWriteSendsNoOtherReadUntilItIsAnswered() {
+  ListRig h;
+  QVERIFY(h.start());
+  h.rig.fake.feedRequests(false);  // no busy line: the board would drop reads by itself
+  h.rig.fake.on("set", [&](const QStringList &, const Opts &) {
+    h.list.shown[3] = "9";
+    return ok(QJsonObject{{"message", "set #3 to 9"}, {"held", true}}, "set #3 to 9");
+  });
+  h.rig.fake.hold("results");
+  h.rig.fake.hold("set");
+  QSignalSpy turned(&h.rig.board, &Board::turned);
+  QSignalSpy reset(h.model, &QAbstractItemModel::modelReset);
+  const int before = timesSeen(h.rig.fake, "results");
+  QVERIFY(h.model->setData(h.model->index(2, 1), "9"));
+  QTRY_COMPARE(timesSeen(h.rig.fake, "results"), before + 1);  // the row, alone
+
+  auto pollEverything = [&] {
+    h.model->refresh(0, 10);
+    h.model->fetchMore({});
+    h.rig.board.tick();
+  };
+  pollEverything();
+  h.rig.fake.push(eventLine(1, "forget", "forgot hp"));  // somebody else's event
+  QTRY_COMPARE(turned.count(), 1);
+  pollEverything();
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(h.rig.fake, "results"), before + 1);
+
+  h.rig.fake.release("results");
+  QTRY_COMPARE(timesSeen(h.rig.fake, "set"), 1);
+  QVERIFY(!h.rig.board.working());
+  pollEverything();
+  QTest::qWait(100);
+  QCOMPARE(timesSeen(h.rig.fake, "results"), before + 1);
+
+  h.rig.fake.release("set");  // answered: the event's check of the list goes now
+  QTRY_COMPARE(timesSeen(h.rig.fake, "results"), before + 2);
+  QTRY_COMPARE(cell(h.model, 2, 1), QString("9"));
+  QCOMPARE(reset.count(), 0);
+}
+
+// R14: an event that leaves the list the same keeps it, its selection and its place
+void TestResults::aSetThatWorkedKeepsTheListAndItsSelection() {
+  ListRig h;
+  QVERIFY(h.start());
+  h.view->selectRow(2);
+  QSignalSpy reset(h.model, &QAbstractItemModel::modelReset);
+  h.rig.fake.on("set", [&](const QStringList &, const Opts &) {
+    h.list.shown[3] = "9";
+    return ok(QJsonObject{{"message", "set #3 to 9"}, {"held", true}}, "set #3 to 9");
+  });
+  QVERIFY(h.model->setData(h.model->index(2, 1), "9"));
+  QTRY_COMPARE(timesSeen(h.rig.fake, "set"), 1);
+  QTRY_COMPARE(count(after(h.rig.fake, "set"), "results"), 1);  // the event's check of the list
+  QTRY_COMPARE(cell(h.model, 2, 1), QString("9"));
+  QTRY_VERIFY(!h.model->writing());
+  QTest::qWait(100);
+  QCOMPARE(reset.count(), 0);
+  QCOMPARE(h.model->rowCount(), 200);
+  QCOMPARE(h.view->selectionModel()->selectedRows(), QModelIndexList{h.model->index(2, 0)});
+  QCOMPARE(h.rig.board.line(), QString("set #3 to 9"));
+}
+
+// R14: an event after which the core lists another number of rows: the list starts again
+void TestResults::anEventWithAnotherTotalStartsTheListAgain() {
+  ListRig h;
+  QVERIFY(h.start());
+  h.view->selectRow(2);
+  QSignalSpy reset(h.model, &QAbstractItemModel::modelReset);
+  h.list.total = 5000;
+  h.rig.fake.push(eventLine(1, "next", "5,000 matches"));
+  QTRY_COMPARE(reset.count(), 1);
+  QTRY_COMPARE(h.model->total(), qint64(5000));
+  QTRY_COMPARE(h.model->rowCount(), 200);
+  QVERIFY(!h.view->selectionModel()->hasSelection());
+  QCOMPARE(h.shown->text(), QString("showing 200 of 5,000"));
 }
 
 void TestResults::itIsThirdInTheWindowsColumn() {

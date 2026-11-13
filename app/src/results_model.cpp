@@ -12,11 +12,17 @@ namespace {
 
 const QStringList heads = {"#", "value", "kind", "address"};
 
+// where a listing has row `n`, or "" when it hasn't
+QString addressIn(const Reply &listing, qint64 n) {
+  for (const QJsonValue &v : listing.result.toObject().value("rows").toArray())
+    if (v.toObject().value("n").toInteger() == n) return v.toObject().value("addr").toString();
+  return {};
+}
+
 }  // namespace
 
 ResultsModel::ResultsModel(Board *board, QObject *parent) : QAbstractTableModel(parent), board_(board) {
   connect(board, &Board::changed, this, &ResultsModel::follow);
-  connect(board, &Board::turned, this, &ResultsModel::reload);
   // a load that was not sent (moth was working) or that failed is tried again; an error stays
   // shown until a reply replaces it
   connect(board, &Board::ticked, this, [this] {
@@ -64,7 +70,7 @@ bool ResultsModel::listable() const {
 
 // The hunt as the board has it now: a list that can't be listed is emptied at once (the game
 // closed, the hunt ended, a snapshot was taken); one that has just become listable is loaded, as
-// when the window opens mid-hunt. A step that changes the list is an event, so `turned` reloads.
+// when the window opens mid-hunt. A step that changes the list is an event, which revalidates.
 void ResultsModel::follow() {
   if (!listable()) {
     following_ = false;
@@ -90,9 +96,32 @@ void ResultsModel::clear() {
 }
 
 void ResultsModel::reload() {
+  if (writing_) {  // once the write is answered
+    owed_ = Owed::Reload;
+    return;
+  }
   clear();
   following_ = listable();
   if (following_) readPage(1);
+}
+
+void ResultsModel::revalidate(int firstRow, int lastRow) {
+  if (writing_) {  // once the write is answered, over every range asked for meanwhile
+    const bool first = owed_ == Owed::Nothing;
+    owedFirst_ = first ? firstRow : std::min(owedFirst_, firstRow);
+    owedLast_ = first ? lastRow : std::max(owedLast_, lastRow);
+    owed_ = std::max(owed_, Owed::Check);
+    return;
+  }
+  if (!listable()) {
+    following_ = false;
+    clear();
+  } else if (!listed_) {
+    reload();
+  } else {
+    readPage(1);  // a reply with another total, or a held row at another address, reloads
+    refresh(firstRow, lastRow);
+  }
 }
 
 void ResultsModel::setAll(bool all) {
@@ -104,9 +133,10 @@ void ResultsModel::setAll(bool all) {
 // One page, from row `from`. Board::read does not send a read the same as one still out; the
 // first one's reply comes instead, and whoever wants that page when it comes takes it, so a
 // reload never waits for a reply that will not come. Not sent at all (moth is working): nothing
-// waits, and the event that ends the work reloads.
+// waits, and the event that ends the work brings the list. Nothing is read while a write is under
+// way: the core's last listing must stay the write's row.
 void ResultsModel::readPage(qint64 from) {
-  if (wanted_.contains(from)) return;
+  if (writing_ || wanted_.contains(from)) return;
   Opts opts{{"from", QString::number(from)}, {"n", QString::number(page)}};
   if (all_) opts.append(QPair<QString, QString>("all", "true"));
   QPointer<ResultsModel> self(this);
@@ -126,9 +156,14 @@ void ResultsModel::took(qint64 from, bool all, const Reply &r) {
   apply(r.result.toObject());
 }
 
-// a page's rows: the ones held are updated in place (a row at another address means the list
-// changed: it is read again), and the ones that follow on are added, up to the cap
+// A page's rows: the ones held are updated in place, and the ones that follow on are added, up to
+// the cap. Another total, or a held row at another address, means another list: it is read again.
 void ResultsModel::apply(const QJsonObject &listing) {
+  const qint64 total = listing.value("total").toInteger();
+  if (listed_ && total != total_) {
+    reload();
+    return;
+  }
   QList<Row> more;
   for (const QJsonValue &v : listing.value("rows").toArray()) {
     const QJsonObject o = v.toObject();
@@ -144,7 +179,7 @@ void ResultsModel::apply(const QJsonObject &listing) {
       more.append(row);
     }
   }
-  total_ = listing.value("total").toInteger();
+  total_ = total;
   listed_ = true;
   if (!more.isEmpty()) {
     beginInsertRows({}, int(rows_.size()), int(rows_.size() + more.size() - 1));
@@ -177,7 +212,7 @@ void ResultsModel::fetchMore(const QModelIndex &parent) {
 }
 
 void ResultsModel::refresh(int firstRow, int lastRow) {
-  if (writing_ || rows_.isEmpty()) return;  // while a write is under way its row stays the core's last listed
+  if (rows_.isEmpty()) return;
   firstRow = std::max(firstRow, 0);
   lastRow = std::min(lastRow, int(rows_.size()) - 1);
   for (int p = firstRow / page; p <= lastRow / page && firstRow <= lastRow; ++p) readPage(qint64(p) * page + 1);
@@ -206,37 +241,57 @@ void ResultsModel::keep(int row, const QString &name) {
 }
 
 // A write names its row by number, and the core looks that number up in the last list it gave
-// out, which any read replaces (this window's own refreshes among them). So the row is listed
-// alone just before, and the write names the address the row showed: if the list has changed,
-// the core refuses it in its own words. On any error the list is read again.
+// out, which any read replaces (this window's own among them). So the row is listed alone first,
+// and nothing else is read until the write is answered. A row that can't be listed (moth is
+// working or starting) is not written: the line says why and the list is read again.
 bool ResultsModel::act(int row, const QString &cmd, const QStringList &more, std::function<void(const Reply &)> written) {
   if (writing_ || row < 0 || row >= rows_.size()) return false;
   const Row target = rows_[row];
-  const QStringList args = QStringList{QString::number(target.n)} + more;
-  const Opts at{{"at", target.addr}};
   Opts alone{{"from", QString::number(target.n)}, {"n", "1"}};
   if (all_) alone.append(QPair<QString, QString>("all", "true"));
+  QPointer<ResultsModel> self(this);
+  const bool asked = board_->read("results", {}, alone, [self, target, cmd, more, written](const Reply &r) {
+    if (self) self->write(target, cmd, more, r, written);
+  });
+  if (!asked) {
+    board_->say(board_->working() ? "moth is busy: " + board_->what() : QString::fromUtf8("moth is starting…"));
+    reload();
+    return false;
+  }
   writing_ = true;
   emit listChanged();
-  QPointer<ResultsModel> self(this);
-  auto send = [self, cmd, args, at, written] {
-    if (!self) return;
-    auto done = [self] {
-      self->writing_ = false;
-      emit self->listChanged();
-    };
-    if (self->board_->working()) {
-      self->board_->run(cmd, args, at);  // refused, and the line says what is running
-      done();
-      return;
-    }
-    self->board_->run(cmd, args, at, [self, written, done](const Reply &r) {
-      if (!self) return;
-      done();
-      if (!r.ok) self->reload();
-      else if (written) written(r);
-    });
-  };
-  if (!board_->read("results", {}, alone, [send](const Reply &) { send(); })) send();
   return true;
+}
+
+// The row as the core lists it now. Still at the address it was shown at: written, naming that
+// address (`--at`), so the core refuses it if the list changes before the write lands. Anywhere
+// else, or not listed, or moth now busy: not written, and the line says why.
+void ResultsModel::write(const Row &target, const QString &cmd, const QStringList &more, const Reply &listed,
+                         std::function<void(const Reply &)> written) {
+  QString why;
+  if (!listed.ok) why = listed.error;
+  else if (addressIn(listed, target.n) != target.addr)
+    why = QString("row %1 is not at %2 any more: the list changed. look again: moth results").arg(target.n).arg(target.addr);
+  else if (board_->working()) why = "moth is busy: " + board_->what();
+  if (!why.isEmpty()) {
+    board_->say(why);
+    finish(false);
+    return;
+  }
+  QPointer<ResultsModel> self(this);
+  board_->run(cmd, QStringList{QString::number(target.n)} + more, {{"at", target.addr}}, [self, written](const Reply &r) {
+    if (!self) return;
+    if (r.ok && written) written(r);
+    self->finish(r.ok);
+  });
+}
+
+// A write is over. Not written, or answered with an error: the list is read again. Written: what
+// was asked for meanwhile (an event's check, a reload) is done now.
+void ResultsModel::finish(bool ok) {
+  writing_ = false;
+  const Owed owed = std::exchange(owed_, Owed::Nothing);
+  emit listChanged();
+  if (!ok || owed == Owed::Reload) reload();
+  else if (owed == Owed::Check) revalidate(owedFirst_, owedLast_);
 }

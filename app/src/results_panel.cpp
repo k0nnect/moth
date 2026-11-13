@@ -60,7 +60,16 @@ ResultsPanel::ResultsPanel(Board *board, QWidget *parent) : QWidget(parent), boa
   connect(model_, &QAbstractItemModel::modelReset, this, &ResultsPanel::showState);
   connect(model_, &ResultsModel::listChanged, this, &ResultsPanel::showState);
   connect(board, &Board::changed, this, &ResultsPanel::showState);
-  connect(board, &Board::ticked, this, &ResultsPanel::refreshInView);
+  // each second the rows in view are read again; after an event the list is checked there, and
+  // kept when it is the same list
+  connect(board, &Board::ticked, this, [this] {
+    const auto [first, last] = rowsInView();
+    model_->refresh(first, last);
+  });
+  connect(board, &Board::turned, this, [this] {
+    const auto [first, last] = rowsInView();
+    model_->revalidate(first, last);
+  });
   showState();
 }
 
@@ -84,12 +93,11 @@ QString ResultsPanel::shownText() const {
   return "showing " + commas(rows) + " of " + commas(total);
 }
 
-void ResultsPanel::refreshInView() {
+QPair<int, int> ResultsPanel::rowsInView() const {
   const int first = view_->rowAt(0);
-  if (first < 0) return;
-  int last = view_->rowAt(view_->viewport()->height() - 1);
-  if (last < 0) last = model_->rowCount() - 1;
-  model_->refresh(first, last);
+  if (first < 0) return {0, -1};
+  const int last = view_->rowAt(view_->viewport()->height() - 1);
+  return {first, last < 0 ? model_->rowCount() - 1 : last};
 }
 
 void ResultsPanel::keepSelected(const QString &name) {

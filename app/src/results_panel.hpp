@@ -11,7 +11,8 @@ class ResultsModel;
 
 // The third panel: the hunt's results in a table named `results`, whose values can be typed over;
 // `show rarer forms`; `keep` for the selected row; and a label named `shown` that says how much
-// of the list is shown. On each tick the rows in view are read again.
+// of the list is shown. On each tick the rows in view are read again; after each event the list
+// is checked on page 1 and the rows in view (ResultsModel::revalidate).
 class ResultsPanel : public QWidget {
   Q_OBJECT
 public:
@@ -24,7 +25,7 @@ private:
   void askForName();     // thin: a small dialog for the optional name, then keepSelected
   void showState();
   QString shownText() const;
-  void refreshInView();
+  QPair<int, int> rowsInView() const;   // the first and last; (0, -1) with none
 
   Board *board_;
   ResultsModel *model_;

@@ -22,6 +22,7 @@ class TestMainWindow : public QObject {
 
 private slots:
   void itsShapeAndItsLine();
+  void theLineGrowsToShowAWholeAnswer();
   void pollsWhileShown();
   void pollingCanBeKeptOff();
 };
@@ -58,6 +59,27 @@ void TestMainWindow::itsShapeAndItsLine() {
   rig.board.say("not attached. run: moth attach --bottle <bottle> <game.exe>");
   QCOMPARE(line->text(), QString("not attached. run: moth attach --bottle <bottle> <game.exe>"));
   QCOMPARE(line->textFormat(), Qt::PlainText);
+}
+
+// R13: the user's own action shows the core's whole answer, which can be several lines
+void TestMainWindow::theLineGrowsToShowAWholeAnswer() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  auto *line = w.findChild<QLabel *>("line");
+  QVERIFY(line);
+  QVERIFY(line->wordWrap());
+  w.resize(560, 420);  // short: the table gives way, not the line
+  showOffscreen(w);
+  QVERIFY(QTest::qWaitForWindowExposed(&w));
+  const int one = line->fontMetrics().lineSpacing();
+  // the longer line raises the window's least height, which the platform warns it can't pass on
+  QTest::ignoreMessage(QtWarningMsg, "This plugin does not support propagateSizeHints()");
+  rig.board.say("set #3 to 9\nthe game put it straight back to 100. it's worked out from something else, so writing here "
+                "won't stick, whatever is typed over it and however often.\na third line");
+  QTRY_VERIFY2(line->height() >= 4 * one, qPrintable(QString("%1 high, %2 a line").arg(line->height()).arg(one)));
+  QVERIFY(line->mapTo(&w, QPoint(0, line->height())).y() <= w.centralWidget()->height());
 }
 
 void TestMainWindow::pollsWhileShown() {
