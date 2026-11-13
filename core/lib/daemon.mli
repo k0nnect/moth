@@ -1,6 +1,9 @@
 (** moth's background service: keeps the helper and the hunt alive between commands. It serves
     the client protocol on [home]/core.sock, one request per connection and one request at a
-    time, in arrival order, and appends one line per request to [home]/events.jsonl. *)
+    time, in arrival order, and appends one line per recorded request to [home]/events.jsonl.
+    A [watch] connection stays open: up to 16 watchers are sent a line as each recorded request
+    starts and its event once it ends, and one that can't take a line at once is let go. A read
+    sent with [record: false] leaves no line and tells no watcher (see docs/dev.md). *)
 
 (** starts a helper inside the named bottle *)
 type start_helper = bottle:string -> (Helper_api.helper, string) result
@@ -20,6 +23,9 @@ val default_start_helper : home:string -> start_helper
 
 (** the arguments and options a command takes; the same messages the daemon replies with *)
 val check_usage : cmd:string -> args:string list -> opts:(string * string) list -> (unit, string) result
+
+(** an event from events.jsonl as [moth log] prints it; None when the object is not an event *)
+val event_line : Yojson.Safe.t -> string option
 
 (** [home]/core.sock, or the error to show when the path is too long for a unix socket *)
 val socket_path : home:string -> (string, string) result

@@ -1028,6 +1028,261 @@ let snapshot_cap () =
               Alcotest.(check (option int)) ("MOTH_SNAPSHOT_MB=" ^ v) want (Fake_helper.last_snapshot_cap fk.script))))
     [ ("2048", Some 2048); ("abc", None); ("0", None); ("", None); ("1", Some 1); ("1048576", Some 1048576); ("1048577", None); ("-5", None); ("12abc", None); (" 2048", None) ]
 
+(* ---- stage 2a: the feed, and reads that leave no trace ---- *)
+
+let send_line s j =
+  let line = Yojson.Safe.to_string j ^ "\n" in
+  ignore (Unix.write_substring s line 0 (String.length line))
+
+(* a reply as [call] gives it *)
+let answer_of r =
+  let open Yojson.Safe.Util in
+  if member "ok" r = `Bool true then Ok (member "result" r, to_string (member "text" r)) else Error (to_string (member "error" r))
+
+(* one request with these fields on its own connection; its reply *)
+let request d fields =
+  let s = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.connect s (Unix.ADDR_UNIX (sock d.home));
+  let ic = Unix.in_channel_of_descr s in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      send_line s (`Assoc (("id", `Int 1) :: fields));
+      answer_of (Yojson.Safe.from_string (input_line ic)))
+
+let strings l = `List (List.map (fun a -> `String a) l)
+
+(* a request sent with record: false *)
+let unrecorded ?(opts = []) d cmd args =
+  request d [ ("cmd", `String cmd); ("args", strings args); ("opts", `Assoc (List.map (fun (k, v) -> (k, `String v)) opts)); ("record", `Bool false) ]
+
+(* a connection that sent watch, read a line at a time; a line must come within 5 seconds *)
+type watcher = { wfd : Unix.file_descr; wic : in_channel }
+
+let watcher ?after d =
+  let s = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.connect s (Unix.ADDR_UNIX (sock d.home));
+  Unix.setsockopt_float s Unix.SO_RCVTIMEO 5.;
+  let opts = match after with Some k -> [ ("after", `Int k) ] | None -> [] in
+  send_line s (`Assoc [ ("id", `Int 1); ("cmd", `String "watch"); ("opts", `Assoc opts) ]);
+  { wfd = s; wic = Unix.in_channel_of_descr s }
+
+let next_line w =
+  match input_line w.wic with
+  | l -> Yojson.Safe.from_string l
+  | exception End_of_file -> Alcotest.fail "the daemon let go of the watcher"
+  | exception Sys_error _ -> Alcotest.fail "the watcher heard nothing for 5 seconds"
+
+(* reads what is left until the daemon closes the connection; false when it is still open after 5
+   seconds *)
+let let_go w =
+  let buf = Bytes.create 65536 in
+  let rec go () = match input w.wic buf 0 (Bytes.length buf) with 0 -> true | _ -> go () | exception Sys_error _ -> false in
+  go ()
+
+let unwatch w = close_in_noerr w.wic
+let watching seq = `Assoc [ ("id", `Int 1); ("ok", `Bool true); ("result", `Assoc [ ("seq", `Int seq) ]); ("text", `String "") ]
+let busy actor cmd args = `Assoc [ ("busy", `Assoc [ ("actor", `String actor); ("cmd", `String cmd); ("args", strings args) ]) ]
+let event ev = `Assoc [ ("event", ev) ]
+let seq_of line = Yojson.Safe.Util.(member "event" line |> member "seq" |> to_int)
+
+(* events.jsonl, oldest first *)
+let stored d =
+  match open_in (Filename.concat d.home "events.jsonl") with
+  | exception Sys_error _ -> []
+  | ic ->
+      let rec go acc = match input_line ic with l -> go (Yojson.Safe.from_string l :: acc) | exception End_of_file -> List.rev acc in
+      Fun.protect ~finally:(fun () -> close_in ic) (fun () -> go [])
+
+let a_watcher_sees_a_find () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      let w = watcher d in
+      check_json "the reply: the newest seq" (watching 1) (next_line w);
+      Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "3" ]));
+      check_json "it starts" (busy "user" "find" [ "3" ]) (next_line w);
+      let evs = stored d in
+      check_int "events.jsonl gained a line" 2 (List.length evs);
+      check_json "it ends: the line events.jsonl gained" (event (List.nth evs 1)) (next_line w);
+      unwatch w)
+
+let watching_after () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      ignore (text (call d "status" []));
+      ignore (text (call d "status" []));
+      let w = watcher ~after:1 d in
+      check_json "the reply" (watching 3) (next_line w);
+      let evs = stored d in
+      check_json "the older of the two" (event (List.nth evs 1)) (next_line w);
+      check_json "then the newer" (event (List.nth evs 2)) (next_line w);
+      Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "3" ]));
+      check_json "then live lines" (busy "user" "find" [ "3" ]) (next_line w);
+      check_json "and the event" (event (List.nth (stored d) 3)) (next_line w);
+      unwatch w;
+      let w = watcher ~after:4 d in
+      check_json "after the newest" (watching 4) (next_line w);
+      ignore (text (call d "status" []));
+      check_json "nothing stored comes" (busy "user" "status" []) (next_line w);
+      unwatch w;
+      (* Client.watch passes each feed line on until the function says stop *)
+      let seen = ref [] in
+      Alcotest.(check (result unit string))
+        "Client.watch" (Ok ())
+        (Client.watch ~home:d.home ~after:3 (fun l ->
+             seen := l :: !seen;
+             List.length !seen < 2));
+      Alcotest.(check (list int)) "two events, oldest first" [ 4; 5 ] (List.rev_map seq_of !seen))
+
+(* the backlog is longer than a socket holds, so it goes out as the watcher reads *)
+let watching_after_many () =
+  let home = fresh_home () in
+  Unix.mkdir home 0o700;
+  let oc = open_out (Filename.concat home "events.jsonl") in
+  for seq = 1 to 1005 do
+    let ev = `Assoc [ ("seq", `Int seq); ("ts", `Float 1e9); ("actor", `String "user"); ("cmd", `String "status"); ("args", `List []); ("ok", `Bool true); ("summary", `String "not attached") ] in
+    output_string oc (Yojson.Safe.to_string ev ^ "\n")
+  done;
+  close_out oc;
+  let _, sh = fake () in
+  with_daemon ~home sh (fun d ->
+      let w = watcher ~after:0 d in
+      check_json "the reply" (watching 1005) (next_line w);
+      let rec read n acc = if n = 0 then List.rev acc else read (n - 1) (seq_of (next_line w) :: acc) in
+      Alcotest.(check (list int)) "the newest 1,000, oldest first" (List.init 1000 (fun i -> i + 6)) (read 1000 []);
+      ignore (text (call d "status" []));
+      check_json "then live lines" (busy "user" "status" []) (next_line w);
+      check_int "with the next seq" 1006 (seq_of (next_line w));
+      unwatch w)
+
+let reads_that_leave_no_trace () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 2;
+      let w = watcher d in
+      check_json "the reply" (watching 2) (next_line w);
+      check_str "status" (attached ^ "\n2 matches (2 whole number)") (text (unrecorded d "status" []));
+      Fake_helper.queue_peek f "i32" (threes 2);
+      check_int "results" 2 (List.length (lines (text (unrecorded d "results" [] ~opts:[ ("all", "true"); ("n", "200") ]))));
+      check_str "ps" "208  disco.exe\n300  explorer.exe" (text (unrecorded d "ps" [] ~opts:[ ("bottle", "uhmm") ]));
+      check_str "kept" nothing_kept (text (unrecorded d "kept" []));
+      check_int "log" 2 (List.length (lines (text (unrecorded d "log" []))));
+      check_err "an error, unrecorded too" "results -n needs a number from 1 to 200" (unrecorded d "results" [] ~opts:[ ("n", "0") ]);
+      check_int "events.jsonl as it was, watch included" 2 (List.length (stored d));
+      ignore (text (call d "status" []));
+      check_json "the watcher heard nothing until now" (busy "user" "status" []) (next_line w);
+      check_int "the seq was where it was" 3 (seq_of (next_line w));
+      check_int "one line more" 3 (List.length (stored d));
+      unwatch w)
+
+let only_reads_go_unrecorded () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      let refused = "only commands that change nothing can go unrecorded" in
+      check_err "find" refused (unrecorded d "find" [ "3" ]);
+      check_int "the helper was not called" 0 (Fake_helper.scan_calls fk.script);
+      List.iter
+        (fun (cmd, args) -> check_err cmd refused (unrecorded d cmd args))
+        [ ("attach", [ "disco.exe" ]); ("snapshot", []); ("next", [ "down" ]); ("keep", [ "1" ]); ("forget", [ "xp" ]); ("set", [ "1"; "5" ]); ("undo", []); ("detach", []); ("stop", []) ];
+      check_bool "nor for any of them" true (Fake_helper.calls fk.script = []);
+      check_int "attached once" 1 fk.attaches;
+      check_int "nothing recorded" 1 (List.length (stored d));
+      check_str "still attached, still serving" attached (text (call d "status" [])))
+
+let a_closed_game_is_recorded () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      let w = watcher d in
+      check_json "the reply" (watching 1) (next_line w);
+      fk.alive <- false;
+      check_str "status, unrecorded" "not attached. disco.exe closed." (text (unrecorded d "status" []));
+      let evs = stored d in
+      check_int "recorded all the same" 2 (List.length evs);
+      let ev = List.nth evs 1 in
+      check_str "as a status" "status" Yojson.Safe.Util.(member "cmd" ev |> to_string);
+      check_str "saying so" "not attached. disco.exe closed." Yojson.Safe.Util.(member "summary" ev |> to_string);
+      check_json "and the watcher hears it" (event ev) (next_line w);
+      check_str "status again, unrecorded" "not attached" (text (unrecorded d "status" []));
+      check_int "not recorded" 2 (List.length (stored d));
+      unwatch w)
+
+let sixteen_watchers () =
+  let _, sh = fake () in
+  with_daemon sh (fun d ->
+      let ws =
+        List.init 16 (fun i ->
+            let w = watcher d in
+            check_json (Printf.sprintf "watcher %d" (i + 1)) (watching 0) (next_line w);
+            w)
+      in
+      let w = watcher d in
+      check_json "the 17th" (`Assoc [ ("id", `Int 1); ("ok", `Bool false); ("error", `String "too many watchers") ]) (next_line w);
+      check_bool "is let go" true (let_go w);
+      unwatch w;
+      Alcotest.(check (result unit string)) "Client.watch says so" (Error "too many watchers") (Client.watch ~home:d.home (fun _ -> true));
+      unwatch (List.hd ws);
+      let w = watcher d in
+      check_json "one gone, a new one is taken" (watching 0) (next_line w);
+      check_str "a status still answers" "not attached" (text (call d "status" []));
+      List.iter unwatch (w :: List.tl ws))
+
+let a_watcher_that_never_reads () =
+  let _, sh = fake () in
+  with_daemon sh (fun d ->
+      let w = watcher d in
+      check_json "the reply, the last line it reads" (watching 0) (next_line w);
+      (* each status from this actor tells the watcher about 8 kb; 64 of them fill its socket many
+         times over *)
+      let actor = String.make 4000 'a' in
+      let t0 = Unix.gettimeofday () in
+      for _ = 1 to 64 do
+        ignore (text (call ~actor d "status" []))
+      done;
+      check_bool "they did not wait for it" true (Unix.gettimeofday () -. t0 < 5.);
+      let t0 = Unix.gettimeofday () in
+      check_str "a status" "not attached" (text (call d "status" []));
+      check_bool "answers within one second" true (Unix.gettimeofday () -. t0 < 1.);
+      check_bool "the watcher was let go" true (let_go w);
+      unwatch w)
+
+let watch_with_no_daemon () =
+  let home = fresh_home () in
+  Alcotest.(check (result unit string)) "no daemon" (Error Client.not_running) (Client.watch ~home (fun _ -> true));
+  check_bool "none started" false (Sys.file_exists home)
+
+(* a watcher hears the stop, and Client.watch returns when the daemon goes *)
+let watching_until_stop () =
+  let _, sh = fake () in
+  let d = start sh in
+  ignore (text (call d "status" []));
+  let seen = Atomic.make [] and ended = ref (Error "still watching") in
+  let t = Thread.create (fun () -> ended := Client.watch ~home:d.home ~after:0 (fun l -> Atomic.set seen (l :: Atomic.get seen); true)) () in
+  (* the stored status says it is watching *)
+  let rec wait n =
+    if Atomic.get seen = [] then begin
+      if n = 0 then Alcotest.fail "Client.watch heard nothing";
+      Thread.delay 0.01;
+      wait (n - 1)
+    end
+  in
+  wait 500;
+  check_str "stop" "stopped" (text (call d "stop" []));
+  Thread.join t;
+  Thread.join d.thread;
+  Alcotest.(check (result unit string)) "ends when the daemon goes" (Ok ()) !ended;
+  let seen = List.rev (Atomic.get seen) in
+  check_json "it heard the stop start" (busy "user" "stop" []) (List.nth seen 1);
+  check_str "and end" "stop" Yojson.Safe.Util.(List.nth seen 2 |> member "event" |> member "cmd" |> to_string);
+  check_int "and nothing else" 3 (List.length seen);
+  rm d.home
+
 let usage () =
   let check n w g = Alcotest.(check (result unit string)) n w g in
   check "unknown" (Error "unknown command: frob. run: moth help") (Daemon.check_usage ~cmd:"frob" ~args:[] ~opts:[]);
@@ -1035,8 +1290,16 @@ let usage () =
   check "next" (Error "next needs a number, or one of: down, up, same, changed") (Daemon.check_usage ~cmd:"next" ~args:[] ~opts:[]);
   check "set" (Ok ()) (Daemon.check_usage ~cmd:"set" ~args:[ "#3"; "-5" ] ~opts:[]);
   check "log" (Ok ()) (Daemon.check_usage ~cmd:"log" ~args:[] ~opts:[ ("n", "50") ]);
+  check "watch" (Ok ()) (Daemon.check_usage ~cmd:"watch" ~args:[] ~opts:[]);
+  check "watch --after 0" (Ok ()) (Daemon.check_usage ~cmd:"watch" ~args:[] ~opts:[ ("after", "0") ]);
+  check "watch takes nothing" (Error "watch takes no arguments") (Daemon.check_usage ~cmd:"watch" ~args:[ "3" ] ~opts:[]);
+  List.iter
+    (fun v -> check ("watch --after " ^ v) (Error "watch --after needs an event number") (Daemon.check_usage ~cmd:"watch" ~args:[] ~opts:[ ("after", v) ]))
+    [ "x"; "-1"; ""; "1.5"; "99999999999999999999" ];
   let _, sh = fake () in
-  with_daemon sh (fun d -> check_err "from the daemon" "unknown command: frob. run: moth help" (call d "frob" []))
+  with_daemon sh (fun d ->
+      check_err "from the daemon" "unknown command: frob. run: moth help" (call d "frob" []);
+      check_err "watch, from the daemon" "watch --after needs an event number" (request d [ ("cmd", `String "watch"); ("opts", `Assoc [ ("after", `String "x") ]) ]))
 
 let parse_args () =
   let p = Client.parse_args in
@@ -1051,6 +1314,8 @@ let parse_args () =
   same "last one wins" (inv "ps" [] [ ("bottle", "b") ] false) (p [ "ps"; "--bottle"; "a"; "--bottle"; "b" ]);
   same "unknown option" (Error "unknown option: --frob. run: moth help") (p [ "status"; "--frob" ]);
   same "missing value" (Error "--bottle needs a value") (p [ "ps"; "--bottle" ]);
+  same "after" (inv "watch" [] [ ("after", "12") ] true) (p [ "watch"; "--after"; "12"; "--json" ]);
+  same "after needs a value" (Error "--after needs a value") (p [ "watch"; "--after" ]);
   same "no command" (Error "no command. run: moth help") (p [ "--json" ])
 
 let parse_results_args () =
@@ -1119,6 +1384,19 @@ let () =
           t "autostart" autostart;
           t "autostart gives up" autostart_gives_up;
           t "signals" signals;
+        ] );
+      ( "feed",
+        [
+          t "a watcher sees a find" a_watcher_sees_a_find;
+          t "watch after an event" watching_after;
+          t "watch after: the newest 1,000" watching_after_many;
+          t "reads that leave no trace" reads_that_leave_no_trace;
+          t "only reads go unrecorded" only_reads_go_unrecorded;
+          t "a closed game is recorded" a_closed_game_is_recorded;
+          t "sixteen watchers" sixteen_watchers;
+          t "a watcher that never reads" a_watcher_that_never_reads;
+          t "Client.watch with no daemon" watch_with_no_daemon;
+          t "watch until stop" watching_until_stop;
         ] );
       ("client", [ t "parse args" parse_args; t "parse args: results options" parse_results_args; t "home" home ]);
     ]

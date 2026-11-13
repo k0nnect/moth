@@ -62,6 +62,10 @@ let say fmt = Printf.ksprintf (fun s -> Printf.eprintf "%s %s\n%!" (local_time (
 
 type target = { proc : Helper_api.attached; bottle : string; session : Session.t }
 
+(* a connection that sent watch. The feed is written to it without waiting; [backlog] is watch's
+   reply and the stored events it asked for, sent up to [sent] so far *)
+type watcher = { wfd : Unix.file_descr; backlog : string; mutable sent : int }
+
 type state = {
   home : string;
   sock : string;
@@ -75,7 +79,9 @@ type state = {
   mutable seq : int; (* the newest event's number *)
   mutable wrote : Yojson.Safe.t option; (* the write this request made, for its event *)
   mutable held : Yojson.Safe.t option; (* whether this request's set held, for its event *)
+  mutable closed : bool; (* this request found the game closed, so it is recorded however it asked *)
   mutable owned : (Unix.file_descr * Unix.file_descr) option; (* listener and lock, while serving *)
+  mutable watchers : watcher list; (* oldest first *)
 }
 
 let not_attached = "not attached. run: moth attach --bottle <bottle> <game.exe>"
@@ -314,6 +320,7 @@ let status st =
       match h.status () with
       | Ok None ->
           st.target <- None;
+          st.closed <- true;
           ignore (h.detach ());
           Ok (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String t.proc.name) ], sprintf "not attached. %s closed." t.proc.name)
       | Error { code = "helper_lost"; _ } -> Error "lost contact with moth's helper. attach again."
@@ -373,11 +380,51 @@ let read_events home =
       in
       Fun.protect ~finally:(fun () -> close_in ic) (fun () -> go [])
 
-let last_seq home = match read_events home with ev :: _ -> Yojson.Safe.Util.(to_int (member "seq" ev)) | [] -> 0
+let seq_of ev = Yojson.Safe.Util.(to_int (member "seq" ev))
+let last_seq home = match read_events home with ev :: _ -> seq_of ev | [] -> 0
 let first_line s = match String.index_opt s '\n' with Some i -> String.sub s 0 i | None -> s
 
+(* ---- the feed ---- *)
+
+let close_quietly fd = try Unix.close fd with Unix.Unix_error _ -> ()
+
+let let_go st w =
+  st.watchers <- List.filter (fun x -> x != w) st.watchers;
+  close_quietly w.wfd
+
+let owed w = w.sent < String.length w.backlog
+
+(* as much of the backlog as the socket takes now *)
+let send_backlog st w =
+  match Unix.write_substring w.wfd w.backlog w.sent (String.length w.backlog - w.sent) with
+  | n -> w.sent <- w.sent + n
+  | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> ()
+  | exception Unix.Unix_error _ -> let_go st w
+
+(* a watcher has nothing more to say after watch: what it sends is dropped, and its end (or a
+   half-close) lets it go *)
+let hear st w =
+  let buf = Bytes.create 512 in
+  match Unix.read w.wfd buf 0 (Bytes.length buf) with
+  | 0 -> let_go st w
+  | _ -> ()
+  | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> ()
+  | exception Unix.Unix_error _ -> let_go st w
+
+(* A line to every watcher, whole and at once. A watcher whose socket can't take all of it now, or
+   that is still owed part of its backlog, is let go (it watches again from the newest event it
+   has), so a request never waits on a watcher. *)
+let feed st j =
+  let line = Yojson.Safe.to_string j ^ "\n" in
+  let n = String.length line in
+  List.iter
+    (fun w ->
+      let whole = (not (owed w)) && match Unix.write_substring w.wfd line 0 n with k -> k = n | exception Unix.Unix_error _ -> false in
+      if not whole then let_go st w)
+    st.watchers
+
 (* one line of events.jsonl: the command, its arguments and its options (when any were given),
-   how it went, and for a write, whether it held and what it wrote *)
+   how it went, and for a write, whether it held and what it wrote. Watchers are sent it after. *)
 let record st ~actor ~cmd ~args ~opts result =
   st.seq <- st.seq + 1;
   let ok, summary = match result with Ok (_, text) -> (true, first_line text) | Error e -> (false, first_line e) in
@@ -395,10 +442,11 @@ let record st ~actor ~cmd ~args ~opts result =
       @ (match st.held with Some h -> [ ("held", h) ] | None -> [])
       @ match st.wrote with Some w -> [ ("write", w) ] | None -> [])
   in
-  try
-    let oc = open_out_gen [ Open_wronly; Open_creat; Open_append; Open_binary ] 0o600 (in_home st.home "events.jsonl") in
-    Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () -> output_string oc (Yojson.Safe.to_string ev ^ "\n"); close_out oc)
-  with Sys_error m -> say "couldn't write the event log: %s" m
+  (try
+     let oc = open_out_gen [ Open_wronly; Open_creat; Open_append; Open_binary ] 0o600 (in_home st.home "events.jsonl") in
+     Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () -> output_string oc (Yojson.Safe.to_string ev ^ "\n"); close_out oc)
+   with Sys_error m -> say "couldn't write the event log: %s" m);
+  feed st (`Assoc [ ("event", ev) ])
 
 let log st opts =
   let n = match List.assoc_opt "n" opts with Some s -> int_of_string s | None -> 20 in
@@ -457,6 +505,9 @@ let check_usage ~cmd ~args ~opts =
   | "log" ->
       let* () = none in
       need (whole "n" (fun _ -> true)) "log -n needs a whole number"
+  | "watch" ->
+      let* () = none in
+      need (whole "after" (fun _ -> true)) "watch --after needs an event number"
   | _ -> Error (sprintf "unknown command: %s. run: moth help" cmd)
 
 let relations = [ ("down", Session.Down); ("up", Session.Up); ("same", Session.Same); ("changed", Session.Changed) ]
@@ -520,7 +571,8 @@ let handle st ~cmd ~args ~opts =
 
 (* ---- the protocol ---- *)
 
-type request = { rid : Yojson.Safe.t; actor : string; cmd : string; args : string list; opts : (string * string) list }
+(* [record]: false when the request asked to leave no trace *)
+type request = { rid : Yojson.Safe.t; actor : string; cmd : string; args : string list; opts : (string * string) list; record : bool }
 
 let parse_request line =
   match Yojson.Safe.from_string line with
@@ -533,7 +585,8 @@ let parse_request line =
           let actor = match List.assoc_opt "actor" f with Some (`String a) when a <> "" -> a | _ -> "user" in
           let args = match List.assoc_opt "args" f with Some (`List l) -> List.filter_map text l | _ -> [] in
           let opts = match List.assoc_opt "opts" f with Some (`Assoc l) -> List.filter_map (fun (k, v) -> Option.map (fun s -> (k, s)) (text v)) l | _ -> [] in
-          Ok { rid; actor; cmd; args; opts }
+          let record = List.assoc_opt "record" f <> Some (`Bool false) in
+          Ok { rid; actor; cmd; args; opts; record }
       | _ -> Error (rid, "bad request: no cmd"))
   | _ -> Error (`Null, "bad request: not an object")
 
@@ -541,22 +594,62 @@ let reply rid = function
   | Ok (result, text) -> `Assoc [ ("id", rid); ("ok", `Bool true); ("result", result); ("text", `String text) ]
   | Error e -> `Assoc [ ("id", rid); ("ok", `Bool false); ("error", `String e) ]
 
-let answer st line =
-  match parse_request line with
+let send fd j =
+  let s = Yojson.Safe.to_string j ^ "\n" in
+  try ignore (Unix.write_substring fd s 0 (String.length s)) with Unix.Unix_error _ -> ()
+
+let internal_error st cmd e =
+  let e = Printexc.to_string e in
+  say "internal error in %s: %s" cmd e;
+  sprintf "moth hit an internal error: %s. see %s" e (in_home st.home "core.log")
+
+(* the commands that change nothing, so may be asked to leave no trace *)
+let reads = [ "bottles"; "ps"; "status"; "results"; "kept"; "log"; "games" ]
+
+(* A recorded request is told to watchers as it starts and again, as its event, once it ends. An
+   unrecorded one takes no seq and tells nobody, unless it is a status that found the game closed. *)
+let answer st = function
   | Error (rid, msg) -> reply rid (Error msg)
+  | Ok r when not (r.record || List.mem r.cmd reads) -> reply r.rid (Error "only commands that change nothing can go unrecorded")
   | Ok r ->
-      let result =
-        try handle st ~cmd:r.cmd ~args:r.args ~opts:r.opts
-        with e ->
-          let e = Printexc.to_string e in
-          say "internal error in %s: %s" r.cmd e;
-          Error (sprintf "moth hit an internal error: %s. see %s" e (in_home st.home "core.log"))
-      in
+      if r.record then feed st (`Assoc [ ("busy", `Assoc [ ("actor", `String r.actor); ("cmd", `String r.cmd); ("args", `List (List.map (fun a -> `String a) r.args)) ]) ]);
+      let result = try handle st ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
       settle st;
-      record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
+      if r.record || st.closed then record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
       st.wrote <- None;
       st.held <- None;
+      st.closed <- false;
       reply r.rid result
+
+let max_watchers = 16
+let max_backlog = 1000
+
+(* [watch]: its reply, then the stored events after [after] (the newest 1,000 at most, oldest
+   first) as event lines, then the feed. Never recorded. True when [fd] became a watcher; when
+   refused it has its error and is the caller's to close. *)
+let add_watcher st fd r =
+  match check_usage ~cmd:r.cmd ~args:r.args ~opts:r.opts with
+  | Error e ->
+      send fd (reply r.rid (Error e));
+      false
+  | Ok () when List.length st.watchers >= max_watchers ->
+      send fd (reply r.rid (Error "too many watchers"));
+      false
+  | Ok () ->
+      let stored =
+        match List.assoc_opt "after" r.opts with
+        | None -> []
+        | Some k ->
+            let k = int_of_string k in
+            List.rev (List.filteri (fun i _ -> i < max_backlog) (List.filter (fun ev -> seq_of ev > k) (read_events st.home)))
+      in
+      let line j = Yojson.Safe.to_string j ^ "\n" in
+      let backlog = line (reply r.rid (Ok (`Assoc [ ("seq", `Int st.seq) ], ""))) :: List.map (fun ev -> line (`Assoc [ ("event", ev) ])) stored in
+      Unix.set_nonblock fd;
+      let w = { wfd = fd; backlog = String.concat "" backlog; sent = 0 } in
+      st.watchers <- st.watchers @ [ w ];
+      send_backlog st w;
+      true
 
 let max_request = 1 lsl 20
 
@@ -581,10 +674,12 @@ let read_request fd =
   in
   go ()
 
-(* one request per connection; a client that sends nothing is dropped after 10 seconds *)
+(* one request per connection, except that a watcher's stays open for the feed; a client that
+   sends nothing is dropped after 10 seconds *)
 let serve st fd =
+  let watching = ref false in
   Fun.protect
-    ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ())
+    ~finally:(fun () -> if not !watching then close_quietly fd)
     (fun () ->
       (try
          Unix.setsockopt_float fd Unix.SO_RCVTIMEO 10.;
@@ -593,16 +688,24 @@ let serve st fd =
       match read_request fd with
       | None -> ()
       | Some line -> (
-          let s = Yojson.Safe.to_string (answer st line) ^ "\n" in
-          try ignore (Unix.write_substring fd s 0 (String.length s)) with Unix.Unix_error _ -> ()))
+          match parse_request line with
+          | Ok ({ cmd = "watch"; _ } as r) -> ( try watching := add_watcher st fd r with e -> send fd (reply r.rid (Error (internal_error st r.cmd e))))
+          | parsed -> send fd (answer st parsed)))
 
+(* Requests are served one at a time. Watchers wait in the same select: one that has gone is let
+   go before the next connection is taken (so its place is free), and one still owed its backlog
+   is sent more as its socket takes it. *)
 let rec loop st listener wake =
   if st.owned <> None then
-    match Unix.select [ listener; wake ] [] [] (-1.) with
+    let watcher_fds = List.map (fun w -> w.wfd) st.watchers in
+    let owing = List.filter_map (fun w -> if owed w then Some w.wfd else None) st.watchers in
+    match Unix.select (listener :: wake :: watcher_fds) owing [] (-1.) with
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop st listener wake
-    | ready, _, _ ->
+    | ready, writable, _ ->
         if not (List.mem wake ready) then begin
-          (match Unix.accept ~cloexec:true listener with fd, _ -> serve st fd | exception Unix.Unix_error _ -> ());
+          List.iter (fun w -> if List.mem w.wfd ready then hear st w) st.watchers;
+          List.iter (fun w -> if List.mem w.wfd writable then send_backlog st w) st.watchers;
+          if List.mem listener ready then (match Unix.accept ~cloexec:true listener with fd, _ -> serve st fd | exception Unix.Unix_error _ -> ());
           loop st listener wake
         end
 
@@ -640,7 +743,9 @@ let run ~home ~start_helper =
       seq = last_seq home;
       wrote = None;
       held = None;
+      closed = false;
       owned = Some (listener, lock);
+      watchers = [];
     }
   in
   (* a signal wakes the loop through a pipe, so a request being served finishes first *)
@@ -652,6 +757,9 @@ let run ~home ~start_helper =
   Fun.protect
     ~finally:(fun () ->
       shutdown st;
+      (* only now, so a stop's event reaches them; the socket is gone, so none can watch again *)
+      List.iter (fun w -> close_quietly w.wfd) st.watchers;
+      st.watchers <- [];
       List.iter (fun (s, b) -> Sys.set_signal s b) before;
       Unix.close wake_r;
       Unix.close wake_w;

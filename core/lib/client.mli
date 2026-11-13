@@ -22,9 +22,15 @@ val call :
   unit ->
   (Yojson.Safe.t * string, string) result
 
+(** sends [watch] (with [after], when given), then calls the function with each feed line, the
+    whole object, until it returns false or the daemon closes the connection; then [Ok ()]. An
+    error reply (such as [too many watchers]) is the error. It never starts a daemon: with none
+    answering it is [Error not_running]. *)
+val watch : home:string -> ?after:int -> (Yojson.Safe.t -> bool) -> (unit, string) result
+
 type invocation = { cmd : string; args : string list; opts : (string * string) list; json : bool }
 
-(** [moth <cmd> [args] [--bottle <b>] [--all] [--json] [-n <n>] [--from <row>] [--near <v>]]
-    without the program name. Options may come anywhere; an argument like [-5] or [-.5] is a
-    number, not an option. *)
+(** [moth <cmd> [args] [--bottle <b>] [--all] [--json] [-n <n>] [--from <row>] [--near <v>]
+    [--after <seq>]] without the program name. Options may come anywhere; an argument like [-5]
+    or [-.5] is a number, not an option. *)
 val parse_args : string list -> (invocation, string) result

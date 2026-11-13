@@ -55,7 +55,8 @@ let parse_reply line =
       | _ -> Error (match member "error" r with `String e -> e | _ -> bad_reply))
   | _ | (exception Yojson.Json_error _) -> Error bad_reply
 
-let exchange ~home fd request =
+(* sends the request and reads its reply, which [k] takes with the connection still open *)
+let converse ~home fd request k =
   let ic = Unix.in_channel_of_descr fd in
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
@@ -65,9 +66,11 @@ let exchange ~home fd request =
         ignore (Unix.write_substring fd line 0 (String.length line));
         input_line ic
       with
-      | reply -> parse_reply reply
+      | reply -> k ic (parse_reply reply)
       | exception (End_of_file | Sys_error _ | Unix.Unix_error _) ->
           Error (sprintf "lost contact with moth's background service. see %s" (core_log home)))
+
+let exchange ~home fd request = converse ~home fd request (fun _ reply -> reply)
 
 (* removes a stale socket and starts a daemon, then waits up to 5 seconds for it to answer. While
    a daemon holds home's lock (it is starting or stopping) the socket is left alone and no second
@@ -106,6 +109,25 @@ let call ?(autostart = true) ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~a
   in
   exchange ~home fd request
 
+(* every feed line after watch's reply, until [f] says stop or the daemon closes the connection.
+   A line cut short (the daemon let go of this watcher mid-line) is not json, and ends it too. *)
+let watch ~home ?after f =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let* path = Daemon.socket_path ~home in
+  match connect path with
+  | None -> Error not_running
+  | Some fd ->
+      let opts = match after with Some k -> [ ("after", `String (string_of_int k)) ] | None -> [] in
+      let request = `Assoc [ ("id", `Int 1); ("cmd", `String "watch"); ("args", `List []); ("opts", `Assoc opts) ] in
+      let rec follow ic =
+        match Yojson.Safe.from_string (input_line ic) with
+        | line -> if f line then follow ic else Ok ()
+        | exception (End_of_file | Sys_error _ | Yojson.Json_error _) -> Ok ()
+      in
+      converse ~home fd request (fun ic reply ->
+          let* _ = reply in
+          follow ic)
+
 type invocation = { cmd : string; args : string list; opts : (string * string) list; json : bool }
 
 let is_option a = String.length a > 1 && a.[0] = '-' && not (match a.[1] with '0' .. '9' | '.' -> true | _ -> false)
@@ -116,7 +138,7 @@ let parse_args argv =
     | [] -> ( match List.rev words with [] -> Error "no command. run: moth help" | cmd :: args -> Ok { cmd; args; opts; json })
     | "--json" :: rest -> go words opts true rest
     | "--all" :: rest -> go words (set "all" "true" opts) json rest
-    | (("--bottle" | "-n" | "--from" | "--near") as o) :: rest -> (
+    | (("--bottle" | "-n" | "--from" | "--near" | "--after") as o) :: rest -> (
         match rest with
         | v :: rest -> go words (set (if o = "-n" then "n" else String.sub o 2 (String.length o - 2)) v opts) json rest
         | [] -> Error (o ^ " needs a value"))

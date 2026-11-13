@@ -33,6 +33,12 @@ Build output (`_build/`, `_opam/`, `build/`, `bin/`) is gitignored.
 
 `moth kept --json` gives each kept value's `set_to` and `put_back`. `set_to` is what the value's newest write wrote, shown as the value shows numbers, or null when there is none. Its newest write is the newest that `undo` can still reverse at its address and as its value type, made by row or by name, before or after `keep`. `put_back` is true when the value reads as it did before that write: the bytes there now are the ones the write replaced, not the ones it wrote (never when it can't be read). The text form says `you set it to <set_to>; it is back to what it was before.` after the value's line. Neither says why; the game working the value out again and ordinary play look the same.
 
+## the feed, and reads that leave no trace
+
+A client can follow what moth does, whoever asks it. `watch` (opts: `after`, an event number) is answered `{"id":..,"ok":true,"result":{"seq":N},"text":""}`, N being the newest recorded event, and the connection then stays open. Each recorded request sends `{"busy":{"actor":..,"cmd":..,"args":[..]}}` as it starts and `{"event":{..}}` once it ends, the object being the line `events.jsonl` gained. With `after` = k, the stored events after k come first as event lines, oldest first, the newest 1,000 at most. Sixteen watchers at most; the next is answered `too many watchers`. The daemon never waits for a watcher: one whose socket can't take a line at once is closed, and should watch again with `after` set to the newest `seq` it has. A last line without a newline was cut off there; ignore it. The connection also closes when the daemon stops, after the stop's own event. `moth watch [--after <seq>] [--json]` prints the feed, an event as `moth log` does and a start as `working: <cmd> <args> (<actor>)`, watches again by itself if it is dropped, and ends with `moth stopped`.
+
+A request with `"record": false` is answered as usual but takes no event number, adds no line to `events.jsonl` and tells no watcher: for polling. Only `bottles`, `ps`, `status`, `results`, `kept`, `log` and `games` may ask; any other command is refused, unrecorded, with `only commands that change nothing can go unrecorded`. One exception: a `status` that finds the game closed is recorded anyway, and watchers get its event with no `busy` line before it. The command line never sends `record`; `watch` is never recorded.
+
 ## engine speed
 
     make bench-native   # builds build/native/moth_bench and runs it
