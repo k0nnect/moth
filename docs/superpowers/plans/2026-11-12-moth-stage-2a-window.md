@@ -528,3 +528,52 @@ Settled by the toolkit test, so they are not open questions:
 Still to be tried there: a waiter armed for hours, what happens to half-typed text when a note arrives, scrollback, selection, paste and the mouse.
 
 Not in stage 2 at all: a guess at what each result is and restart-proof paths (stage 3), toggles that hold a value (stage 4), the overlay (stage 5; the toolkit test found that an ordinary window does not show over Disco Elysium's fullscreen).
+
+---
+
+## Amendments after the build and the whole-branch review
+
+What was built differs from the text above in these places. Where they disagree, this section is what the code does.
+
+### Protocols, as built
+
+| item | as built |
+| --- | --- |
+| `record:false`, the exception | Any unrecorded request that makes the daemon let go of the game or the helper that holds it (the closed-game `status`; `target_gone` or `helper_lost` on any read) is recorded after all, and reaches watchers with no `busy` line before it. `watch` itself may be sent with `record:false`. |
+| `record:false` and row numbers | An unrecorded `results` read never changes the listing that `set <#n>` and `keep <#n>` without `--at` look their row up in. Only recorded `results` requests do. |
+| `--at <0xaddr>` | With `--at`, row n is looked up afresh in the current hunt, in the ordering a plain `results` uses, and the remembered listing is neither read nor changed. `--kind <interp_id>` (optional) must match the row's kind too; `--all` selects the ordering that includes the rarer forms. A row that is not there answers `no result #n`; another address or kind answers the row-moved text. `--kind` and `--all` on `set`/`keep` without `--at` are usage errors (`--kind goes with --at`, `--all goes with --at`). |
+| who starts the service | A request sent with `record` false never starts the daemon. Recorded requests do, and the window does once when it opens. |
+
+### The window, as built
+
+- `Board::read` returns `bool`: false when the read was dropped (a request is running, or the service is starting) and no reply will come.
+- `Board::run` allows one request of the user's own at a time and shows the core's whole answer (every line) in the window's line; `Board::busyText()` is the one busy sentence.
+- An event is always followed by a fresh `status` read, and `Board::turned` fires once per event after it.
+- On `turned` the results list checks page 1 and the rows in view: the same total and addresses keep the list, its selection and its scroll position; anything else resets it. `reload()` is the unconditional reset, used after any error answer to a row write.
+- A row write from the list sends `at`, `kind` and (when rarer forms are shown) `all`, with nothing read first.
+- The poll never replaces a value that is being typed over, in either table.
+- Bottle submenus look in one bottle at a time and the line says `looking in <bottle>…`.
+- The launch wait ends when the program shows as attached. Its give-up text is `<name> did not show up in <bottle> after 90 seconds. see <moth home>/launch.log, or pick it once it is running.`
+- After `moth stop` from elsewhere the line says `moth's background service was stopped. it starts again with your next action.`
+- Object names: panels `gameBar`, `searchBar`, `resultsPanel`, `keptPanel`; tables `results` and `kept`.
+- `app/.clangd` and `CMAKE_EXPORT_COMPILE_COMMANDS` were added so an editor finds Qt.
+
+### Integration, as built
+
+Scenarios 35 (two hands on rows: the command line lists `--near` and writes a row while the window polls) and 36 (the game goes away with the window open) were added. `it_app` has a third mode, `gone`, and types through a real cell editor.
+
+### Task 9, changes
+
+- Step 4's `bin/moth status` shows nothing new in the window (the text is the same as the idle line). Use `bin/moth bottles`, and add the case the review found: with the window open, `bin/moth results --near <a kept name>` and then `bin/moth set <#n> <number>` from the terminal; the value changes at the address that listing showed.
+- Look at: the `kind` column's width (it cuts off `whole number (8-byte)`), and the counts appearing in the search bar, above the list and in the line after a step.
+
+### Deferred to stage 2b or later
+
+- `moth watch` dropped before it has printed an event reconnects without `after` and can skip events; `moth wait` will be built on it.
+- No request has a time limit in `CoreClient`; a window pointed at a service older than this branch is refused `watch` every second and its polls are recorded.
+- Another client's failed command shows as bare error text in the line.
+- The daemon writes replies blocking, with a 10-second limit; a client that stops reading can hold the others.
+- Opening a bottle's submenu still starts wine in that bottle; answering `ps` without that needs a core change.
+- `default_launch` does not report a failure in the detached child.
+- A second `attach` can be sent in the few milliseconds after the first during a launch wait (harmless: same process, one extra log line).
+- The smaller items the task reviews and the final review marked "can wait" are in the build ledger's list.
