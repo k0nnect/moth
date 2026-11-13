@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # for an editor: see .clangd
 
 add_compile_options(-Wall -Wextra)
 
@@ -17,6 +18,7 @@ add_library(moth_window STATIC
   src/core_client.cpp
   src/board.cpp
   src/main_window.cpp
+  src/game_bar.cpp
 )
 target_include_directories(moth_window PUBLIC src)
 target_link_libraries(moth_window PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network)
@@ -35,6 +37,7 @@ set(MOTH_APP_TESTS
   test_core_client
   test_board
   test_main_window
+  test_game_bar
 )
 foreach(name IN LISTS MOTH_APP_TESTS)
   add_executable(${name} test/${name}.cpp)

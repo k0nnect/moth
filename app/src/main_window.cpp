@@ -5,6 +5,7 @@
 #include <QVBoxLayout>
 
 #include "board.hpp"
+#include "game_bar.hpp"
 
 MainWindow::MainWindow(Board *board) : board_(board) {
   setWindowTitle("moth");
@@ -15,6 +16,7 @@ MainWindow::MainWindow(Board *board) : board_(board) {
   auto *outer = new QVBoxLayout(columnWidget);
   column_ = new QVBoxLayout;
   outer->addLayout(column_, 1);
+  column_->addWidget(new GameBar(board, columnWidget));
   line_ = new QLabel(columnWidget);
   line_->setObjectName("line");
   line_->setTextFormat(Qt::PlainText);  // the core's words as they are: `<bottle>` is not markup
