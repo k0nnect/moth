@@ -78,9 +78,10 @@ void Board::run(const QString &cmd, const QStringList &args, const Opts &opts, s
   });
 }
 
-void Board::read(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done) {
-  if (working_ || starting_) return;
+bool Board::read(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> done) {
+  if (working_ || starting_) return false;
   ask(cmd, args, opts, std::move(done));
+  return true;
 }
 
 // an unrecorded read, unless the same one is still out

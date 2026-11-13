@@ -21,6 +21,7 @@ private slots:
   void aRefusedWatchIsSaid();
   void readsWaitWhileARequestRuns();
   void ticksDoNotPileUp();
+  void readSaysWhetherAReplyWillCome();
   void huntFromStatus();
 };
 
@@ -308,10 +309,22 @@ void TestBoard::readsWaitWhileARequestRuns() {
   rig.fake.push(busyLine("agent", "find", {"100"}));
   QTRY_VERIFY(rig.board.working());
   int answered = 0;
-  rig.board.read("results", {}, {{"n", "200"}}, [&](const Reply &) { ++answered; });
+  QVERIFY(!rig.board.read("results", {}, {{"n", "200"}}, [&](const Reply &) { ++answered; }));  // dropped: no reply will come
   QTest::qWait(200);
   QCOMPARE(timesSeen(rig.fake, "results"), 0);
   QCOMPARE(answered, 0);
+}
+
+void TestBoard::readSaysWhetherAReplyWillCome() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.hold("results");
+  int answered = 0;
+  QVERIFY(rig.board.read("results", {}, {}, [&](const Reply &) { ++answered; }));  // sent
+  QTRY_COMPARE(timesSeen(rig.fake, "results"), 1);
+  QVERIFY(rig.board.read("results", {}, {}, [&](const Reply &) { ++answered; }));  // an identical one is out
+  rig.fake.release("results");
+  QTRY_COMPARE(answered, 1);
 }
 
 void TestBoard::ticksDoNotPileUp() {

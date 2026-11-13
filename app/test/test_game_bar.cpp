@@ -50,6 +50,8 @@ private slots:
   void busyDisablesBothButtons();
   void theMenuListsBottlesAndRememberedGames();
   void aBottleSubmenuListsProgramsOrTheCoresText();
+  void aReopenedMenuEndsFilled();
+  void aMenuOpenedWhileBusyShowsWhy();
   void itIsFirstInTheWindowsColumn();
 };
 
@@ -217,6 +219,35 @@ void TestGameBar::aBottleSubmenuListsProgramsOrTheCoresText() {
   QTRY_COMPARE(seenOf(rig.fake, "attach").size(), 1);
   QCOMPARE(seenOf(rig.fake, "attach")[0].args, QStringList{"game.exe"});
   QCOMPARE(seenOf(rig.fake, "attach")[0].opts, (Opts{{"bottle", "uhmm"}}));
+}
+
+void TestGameBar::aReopenedMenuEndsFilled() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.on("bottles", [](const QStringList &, const Opts &) { return ok(QJsonArray{"uhmm"}); });
+  rig.fake.on("games", [](const QStringList &, const Opts &) { return ok(QJsonArray{}); });
+  rig.fake.hold("bottles");
+  GameBar bar(&rig.board);
+  bar.fillMenu();
+  QTRY_COMPARE(timesSeen(rig.fake, "bottles"), 1);
+  bar.fillMenu();  // reopened while the first read is out
+  QCOMPARE(texts(bar.menu()), QStringList{QString::fromUtf8("looking…")});
+  rig.fake.release("bottles");
+  QTRY_COMPARE(texts(bar.menu()), (QStringList{"uhmm", "---", QString::fromUtf8("another game…")}));
+}
+
+void TestGameBar::aMenuOpenedWhileBusyShowsWhy() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  GameBar bar(&rig.board);
+  rig.fake.push({{"busy", QJsonObject{{"actor", "agent"}, {"cmd", "find"}, {"args", QJsonArray{"100"}}}}});
+  QTRY_VERIFY(rig.board.working());
+  bar.fillMenu();
+  QCOMPARE(texts(bar.menu()), QStringList{"moth is busy: find 100 (agent)"});
+  QVERIFY(!bar.menu()->actions().at(0)->isEnabled());
+  QMenu sub;
+  bar.fillBottle(&sub, "uhmm");
+  QCOMPARE(texts(&sub), QStringList{"moth is busy: find 100 (agent)"});
 }
 
 void TestGameBar::itIsFirstInTheWindowsColumn() {

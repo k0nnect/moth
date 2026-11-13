@@ -125,49 +125,64 @@ void GameBar::look() {
   });
 }
 
+QString GameBar::notSent() const {
+  return board_->working() ? "moth is busy: " + board_->what() : QString::fromUtf8("moth is starting…");
+}
+
+// whichever reply comes fills the menu, however many times it was opened meanwhile
 void GameBar::fillMenu() {
   menu_->clear();
-  const int gen = ++menuGeneration_;
-  menu_->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
+  separator_ = nullptr;
   QPointer<GameBar> self(this);
-  board_->read("bottles", {}, {}, [self, gen](const Reply &r) {
-    if (!self || gen != self->menuGeneration_) return;
-    QMenu *m = self->menu_;
-    m->clear();
-    if (!r.ok) {
-      m->addAction(r.error)->setEnabled(false);
-    } else {
-      for (const QJsonValue &b : r.result.toArray()) {
-        const QString bottle = b.toString();
-        QMenu *sub = m->addMenu(bottle);
-        connect(sub, &QMenu::aboutToShow, self.data(), [self, sub, bottle] { if (self) self->fillBottle(sub, bottle); });
-      }
+  if (!board_->read("bottles", {}, {}, [self](const Reply &r) { if (self) self->fillTop(r); })) {
+    menu_->addAction(notSent())->setEnabled(false);
+    return;
+  }
+  menu_->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
+}
+
+void GameBar::fillTop(const Reply &r) {
+  menu_->clear();
+  if (!r.ok) {
+    menu_->addAction(r.error)->setEnabled(false);
+  } else {
+    QPointer<GameBar> self(this);
+    for (const QJsonValue &b : r.result.toArray()) {
+      const QString bottle = b.toString();
+      QMenu *sub = menu_->addMenu(bottle);
+      connect(sub, &QMenu::aboutToShow, this, [self, sub, bottle] { if (self) self->fillBottle(sub, bottle); });
     }
-    m->addSeparator();
-    self->board_->read("games", {}, {}, [self, gen](const Reply &g) {
-      if (!self || gen != self->menuGeneration_) return;
-      QMenu *m = self->menu_;
-      if (!g.ok) {
-        m->addAction(g.error)->setEnabled(false);
-      } else {
-        for (const QJsonValue &v : g.result.toArray()) {
-          const QJsonObject o = v.toObject();
-          const QString name = o.value("name").toString(), bottle = o.value("bottle").toString(),
-                        path = o.value("path").toString();
-          m->addAction(name + dot + bottle, self.data(), [self, bottle, path] { if (self) self->launch(bottle, path); });
-        }
-      }
-      m->addAction(QString::fromUtf8("another game…"), self.data(), [self] { if (self) self->askForAnotherGame(); });
-    });
-  });
+  }
+  separator_ = menu_->addSeparator();
+  QPointer<GameBar> self(this);
+  if (!board_->read("games", {}, {}, [self](const Reply &g) { if (self) self->fillGames(g); }))
+    menu_->addAction(notSent())->setEnabled(false);
+}
+
+// what follows the separator is replaced, so a late reply never doubles the entries
+void GameBar::fillGames(const Reply &g) {
+  if (!separator_) return;
+  const auto actions = menu_->actions();
+  for (int i = actions.indexOf(separator_) + 1; i < actions.size(); ++i) menu_->removeAction(actions[i]);
+  QPointer<GameBar> self(this);
+  if (!g.ok) {
+    menu_->addAction(g.error)->setEnabled(false);
+  } else {
+    for (const QJsonValue &v : g.result.toArray()) {
+      const QJsonObject o = v.toObject();
+      const QString name = o.value("name").toString(), bottle = o.value("bottle").toString(),
+                    path = o.value("path").toString();
+      menu_->addAction(name + dot + bottle, this, [self, bottle, path] { if (self) self->launch(bottle, path); });
+    }
+  }
+  menu_->addAction(QString::fromUtf8("another game…"), this, [self] { if (self) self->askForAnotherGame(); });
 }
 
 void GameBar::fillBottle(QMenu *submenu, const QString &bottle) {
   submenu->clear();
-  submenu->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
   QPointer<GameBar> self(this);
   QPointer<QMenu> sub(submenu);
-  board_->read("ps", {}, {{"bottle", bottle}}, [self, sub, bottle](const Reply &r) {
+  const bool sent = board_->read("ps", {}, {{"bottle", bottle}}, [self, sub, bottle](const Reply &r) {
     if (!self || !sub) return;
     sub->clear();
     if (!r.ok) {
@@ -181,12 +196,14 @@ void GameBar::fillBottle(QMenu *submenu, const QString &bottle) {
       sub->addAction(name, self.data(), [self, bottle, name] { if (self) self->attach(bottle, name); });
     }
   });
+  if (sent) submenu->addAction(QString::fromUtf8("looking…"))->setEnabled(false);
+  else submenu->addAction(notSent())->setEnabled(false);
 }
 
 void GameBar::askForAnotherGame() {
   const QString path = QFileDialog::getOpenFileName(this, "pick a game", QString(), "programs (*.exe *.EXE)");
   if (path.isEmpty()) return;
-  board_->read("bottles", {}, {}, [self = QPointer<GameBar>(this), path](const Reply &r) {
+  const bool sent = board_->read("bottles", {}, {}, [self = QPointer<GameBar>(this), path](const Reply &r) {
     if (!self) return;
     QStringList bottles;
     for (const QJsonValue &b : r.result.toArray()) bottles << b.toString();
@@ -198,4 +215,5 @@ void GameBar::askForAnotherGame() {
     const QString bottle = QInputDialog::getItem(self, "pick a bottle", "bottle", bottles, 0, false, &ok);
     if (ok) self->launch(bottle, path);
   });
+  if (!sent) board_->say(notSent());
 }

@@ -40,8 +40,10 @@ public:
            std::function<void(const Reply &)> then = {});
   // an unrecorded read. Dropped (and `done` never called) while working, while the service is
   // being started at the board's start, or when a read with the same command, arguments and
-  // options is still out. It never starts the service.
-  void read(const QString &cmd, const QStringList &args, const Opts &opts,
+  // options is still out. It never starts the service. Returns true when the read was sent or an
+  // identical one is out (a reply will come), false when it was dropped for working or starting
+  // (no reply will come).
+  bool read(const QString &cmd, const QStringList &args, const Opts &opts,
             std::function<void(const Reply &)> done);
   void tick();               // the once-a-second poll; the window calls it from a timer while visible
 signals:

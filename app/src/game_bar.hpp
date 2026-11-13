@@ -3,6 +3,8 @@
 #include <QTimer>
 #include <QWidget>
 
+#include "core_client.hpp"
+
 class Board;
 class QLabel;
 class QMenu;
@@ -31,6 +33,9 @@ private:
   void startWaiting(const QString &bottle, const QString &name);
   void stopWaiting();
   void look();
+  QString notSent() const;    // why a read was dropped: busy, or the service is starting
+  void fillTop(const Reply &bottles);
+  void fillGames(const Reply &games);
   void askForAnotherGame();   // thin: a file dialog and a bottle list, then launch
 
   Board *board_;
@@ -43,5 +48,5 @@ private:
   int generation_ = 0;        // bumps whenever a wait ends or starts, so a late answer is ignored
   bool waiting_ = false;
   QString waitBottle_, waitName_;
-  int menuGeneration_ = 0;
+  QAction *separator_ = nullptr;   // in the menu, between the bottles and the remembered games
 };
