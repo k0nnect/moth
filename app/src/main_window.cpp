@@ -6,6 +6,8 @@
 
 #include "board.hpp"
 #include "game_bar.hpp"
+#include "results_panel.hpp"
+#include "search_bar.hpp"
 
 MainWindow::MainWindow(Board *board) : board_(board) {
   setWindowTitle("moth");
@@ -17,6 +19,8 @@ MainWindow::MainWindow(Board *board) : board_(board) {
   column_ = new QVBoxLayout;
   outer->addLayout(column_, 1);
   column_->addWidget(new GameBar(board, columnWidget));
+  column_->addWidget(new SearchBar(board, columnWidget));
+  column_->addWidget(new ResultsPanel(board, columnWidget), 1);
   line_ = new QLabel(columnWidget);
   line_->setObjectName("line");
   line_->setTextFormat(Qt::PlainText);  // the core's words as they are: `<bottle>` is not markup

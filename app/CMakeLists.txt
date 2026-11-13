@@ -19,6 +19,9 @@ add_library(moth_window STATIC
   src/board.cpp
   src/main_window.cpp
   src/game_bar.cpp
+  src/search_bar.cpp
+  src/results_model.cpp
+  src/results_panel.cpp
 )
 target_include_directories(moth_window PUBLIC src)
 target_link_libraries(moth_window PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network)
@@ -38,6 +41,8 @@ set(MOTH_APP_TESTS
   test_board
   test_main_window
   test_game_bar
+  test_search_bar
+  test_results
 )
 foreach(name IN LISTS MOTH_APP_TESTS)
   add_executable(${name} test/${name}.cpp)
