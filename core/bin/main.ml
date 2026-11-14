@@ -142,7 +142,7 @@ let wait ~session =
   in
   let rec again () =
     if not (session_alive () && mine ()) then exit 0;
-    match Client.call ~autostart:false ~record:false ~home ~actor:"agent" ~cmd:"status" ~args:[] ~opts:[] () with
+    match Client.call ~autostart:false ~record:false ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
     | Error _ ->
         Unix.sleepf 1.;
         again ()

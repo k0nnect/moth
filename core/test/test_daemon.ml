@@ -1958,6 +1958,19 @@ let wait_with_no_daemon () =
           check_bool "exits 2 once the person acts" true (exit_within w 4. = Some 2);
           check_bool "with the note" true (String.starts_with ~prefix:"[moth] the person did this in moth:" (read_all w.err))))
 
+let wait_hears_the_game_closed () =
+  let fk, sh = fake () in
+  with_waiters (fun () ->
+      with_daemon ~home:(spaced_home ()) sh (fun d ->
+          ignore (text (attach d));
+          let dir = session_dir d.home in
+          Out_channel.with_open_bin (Filename.concat dir "cursor") (fun oc -> output_string oc (string_of_int (newest_seq d)));
+          fk.alive <- false;
+          (* the waiter's own status read finds the game closed, and that is recorded *)
+          let w = spawn_wait ~home:d.home ~session:dir in
+          check_bool "exits 2" true (exit_within w 4. = Some 2);
+          check_str "with the closed game in its note" "[moth] the person did this in moth:\n- status: not attached. disco.exe closed.\n" (read_all w.err)))
+
 let wait_needs_a_session () =
   with_waiters (fun () ->
       let exe = Lazy.force moth_exe in
@@ -2067,6 +2080,7 @@ let () =
           t "two waiters on one session: the newer tells" two_waiters;
           t "a session that is gone" a_dead_session;
           t "no daemon, then a daemon" wait_with_no_daemon;
+          t "the game closed under its own look" wait_hears_the_game_closed;
           t "no session" wait_needs_a_session;
         ] );
       ("client", [ t "parse args" parse_args; t "parse args: results options" parse_results_args; t "home" home ]);

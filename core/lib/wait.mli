@@ -9,7 +9,7 @@ val start : cursor:int -> quiet:bool -> t
 (** a feed line (a [busy] line or an event), seen at [now]. An event counts when its [seq] is
     above the cursor, its actor is not [agent], its [act] is true and its command is not [quiet],
     and moth is not quiet. A [quiet] event, from anyone, sets the quiet state when it succeeded;
-    turning quiet off replays nothing. *)
+    turning quiet on drops what is held, and turning it off replays nothing. *)
 val line : t -> now:float -> Yojson.Safe.t -> unit
 
 type verdict = Keep_waiting | Tell of { notes : string; cursor : int }

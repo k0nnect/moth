@@ -85,6 +85,16 @@ let quiet_on_off () =
   Wait.line w ~now:22. (ev 4 "next" [ "4" ]);
   check_v "alone" (told (heading ^ "\n- next 4: found 5 places") 4) (Wait.check w ~now:24.)
 
+let quiet_drops_what_is_held () =
+  let w = fresh () in
+  Wait.line w ~now:0. (ev 1 "find" [ "3" ]);
+  Wait.line w ~now:0.5 (ev 2 "quiet" [ "on" ]);
+  check_v "nothing to tell" Wait.Keep_waiting (Wait.check w ~now:3.);
+  Alcotest.(check int) "cursor moved past it" 2 (Wait.cursor w);
+  Wait.line w ~now:4. (ev 3 "quiet" [ "off" ]);
+  Wait.line w ~now:5. (ev 4 "next" [ "4" ]);
+  check_v "only the next" (told (heading ^ "\n- next 4: found 5 places") 4) (Wait.check w ~now:7.)
+
 let quiet_from_the_agent_counts () =
   let w = fresh () in
   Wait.line w ~now:0. (ev ~actor:"agent" 1 "quiet" [ "on" ]);
@@ -141,6 +151,7 @@ let () =
           t "a steady stream is told at ten seconds" ten_seconds;
           t "agent, reads and quiet are never told" never_told;
           t "quiet drops, and off replays nothing" quiet_on_off;
+          t "going quiet drops what was held" quiet_drops_what_is_held;
           t "quiet from anyone, only when it worked" quiet_from_the_agent_counts;
           t "a failure says so" failed;
           t "more than twelve are cut" many;
