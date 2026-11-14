@@ -264,6 +264,13 @@ Each stage gets its own detailed plan, written when the stage starts. Each stage
 
 Only after stage 6: the public face, the licence choice, and publishing.
 
+**Changed by Chris on 2026-11-13: stage 6 is dropped.** His words: "can we skip stage 6 i really dont care about it". What follows from that (Claude's reading, his to correct):
+
+- The build order ends at stage 5. "Nothing public until everything is nailed" now means stages 1 to 5.
+- Goal 6 (every single-player game in his bottles, and unlocked native Mac apps) is no longer part of the release bar. moth is proven on the games each stage is tested on, which so far is Disco Elysium.
+- The helper's macOS back end, the native stand-in program and the Sims 4 stretch were all stage 6 work and are not built.
+- Section 12's open question about the four games whose folders were not found no longer needs an answer.
+
 ## 10. How it gets verified
 
 - **A stand-in target.** A small Windows test program with known values in every form moth claims to handle (each number size, decimals, scaled values, unaligned values, values behind chains of pointers, values that move between runs). It runs in a scratch bottle (`uhmm` was used for the probes) so the engine can be tested automatically without a real game.
