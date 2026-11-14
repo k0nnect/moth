@@ -696,8 +696,8 @@ What was built differs from the text above in these places. Where they disagree,
 | `proto` on every request | `moth` and the window send `"proto": 2` with every request and every `watch`. The service refuses, unrun and unrecorded, a request with none or another number: `this moth is from another build than its background service. stop the service and it starts again by itself: moth stop`. `stop` and `status` are always served. The stage 2a command line can therefore only run `status` and `stop` against this service. |
 | what the agent is refused | From actor `agent` the service refuses: `set <#n>` and `keep <#n>` without `--at` (`give the row's address too, so the write cannot land on another row: add --at <the address moth results showed for it>`); `launch` of a bottle and path that `moth games` does not list, or with any argument after the path; `quiet on` and `quiet off` (`quiet is the person's switch`). `moth agent` run under `MOTH_ACTOR=agent` exits 1 with `this is already the agent's session`. The actor is what the client says it is; these limits stop a well-meaning agent, not a hostile program. |
 | `quiet on` | also drops whatever `moth wait` is holding, so a step made just before going quiet is not told. |
-| `moth wait` | exits 2 only when it prints a note; a usage error or an unexpected failure exits 1; everything else 0. It never starts the service, retries every second while none answers, and still tells what it holds. Its own status read is sent as actor `user`, unrecorded. The session's files are `<dir>/cursor` (`N` or `N quiet`) and `<dir>/waiter` (a pid; the newest waiter wins), both mode 0600. `MOTH_WAIT_TIMEOUT` shortens its receive limit for tests. |
-| `moth agent` | checks in this order: not the agent's own shell, no arguments, the program (`MOTH_CLAUDE`, else `claude` on `PATH`), the service's `proto`. It then writes `<home>/agent/<pid>/` with `settings.json`, `instructions.md` and `cursor` (the newest event's number, so the first waiter tells what happened while the agent was starting), and runs the agent in `<home>/agent/work`. The hook's `timeout` is 86400. |
+| `moth wait` | exits 2 only when it prints a note; a usage error or an unexpected failure exits 1; everything else 0. It never starts the service, retries every second while none answers, and still tells what it holds. Its own status read is sent as actor `user`, unrecorded. The session's files are `<dir>/cursor` (`N` or `N quiet`) and `<dir>/waiter` (a pid; the newest waiter wins), both mode 0600. `MOTH_WAIT_TIMEOUT` shortens its receive limit for tests. It exits 0 when the service turns out to be from another build. |
+| `moth agent` | checks in this order: not the agent's own shell, no arguments, the program (`MOTH_CLAUDE`, else `claude` on `PATH`), the service's `proto`. It then writes `<home>/agent/<pid>/` with `settings.json`, `instructions.md` and `cursor` (the newest event's number, so the first waiter tells what happened while the agent was starting), and runs the agent in `<home>/agent/work`. The waiter is armed from two hooks with the same command, `UserPromptSubmit` and `Stop` (each `asyncRewake`, `timeout` 86400): a turn that is interrupted runs no `Stop` hook, and a turn started by a note runs `UserPromptSubmit` like a typed one. The quiet state in the cursor is read after its number. |
 | `Client` | `call ?autostart ?record ?timeout`, `watch ?after ?started ?idle ?timeout`. |
 | the stale check | the window counts a service with no `proto`, or another, as stale; a failed status read and a dropped feed clear it. The stale sentence holds the line even while a request runs. |
 
@@ -722,7 +722,7 @@ The lines about rows in Task 3's text were replaced, and one was added:
 
 ### Integration, as built
 
-The stand-in agent is an OCaml program (`core/integration/stub_agent.ml`): it reads the hook command from the settings file and runs it with exactly the settings' `env`. `it_app term` takes the text to wait for and refuses to run without `MOTH_CLAUDE`. Scenario 41 was added (the window closed with an agent up that ignores the hang-up leaves nothing running). Scenarios 38, 39 and 41 run in a home whose path has a space.
+The stand-in agent is an OCaml program (`core/integration/stub_agent.ml`): it reads the hook command from the settings file and runs it with exactly the settings' `env`. `it_app term` takes the text to wait for and refuses to run without `MOTH_CLAUDE`. Scenario 41 was added (the window closed with an agent up that ignores the hang-up leaves nothing running), and scenario 42 (every turn interrupted: the steps are still told). The stand-in runs both hooks each turn, as Claude Code does. Scenarios 38, 39 and 41 run in a home whose path has a space.
 
 ### Rulings made during the build
 
@@ -749,12 +749,13 @@ The stand-in agent is an OCaml program (`core/integration/stub_agent.ml`): it re
 | R22 | the agent may not `launch` what the person never launched, pass a game arguments, switch `quiet`, or start a nested `moth agent` | the agent cannot start a game for the first time |
 | R23 | the agent's row writes need `--at` | the instructions text changed |
 | R24 | `proto` on every request | the 2a command line stops working against this service, except `status` and `stop` |
+| R25 | the waiter is armed when a turn starts as well as when it ends (found with the real Claude Code: Escape on a turn a note started left no waiter) | two hook runs a turn |
 
 Decided and only noted: two agent sessions on one home are allowed; login shells other than sh, bash and zsh are not supported; the agent may `moth stop` and `moth detach`; `claude --resume` run by hand has none of moth's settings.
 
 ### Task 10, changes
 
-Step 1 also tries: whether the `Stop` hook runs after a turn is interrupted with Escape, and whether a hook on `SessionStart` with `asyncRewake` could arm the waiter instead. `~/.claude/settings.json` is compared by checksum; `~/.claude.json` is judged by reading its diff, because Claude Code rewrites it on every run.
+Step 1 also tried what happens after a turn is interrupted with Escape. Result: no hook runs on an interrupt, which led to R25; the second session with the real Claude Code confirmed the fix. `~/.claude/settings.json` is compared by checksum; `~/.claude.json` is judged by reading its diff, because Claude Code rewrites it on every run.
 
 To look at with Chris, beside steps 2 to 9:
 
@@ -768,11 +769,11 @@ To look at with Chris, beside steps 2 to 9:
 
 ### Known limits, kept
 
-- After a turn is interrupted, and after 24 hours idle, nothing is told until the person types to the agent.
+- After 24 hours idle nothing is told until the person types to the agent.
+- If an older waiter tells at the very moment a newer one takes over, one step could be told twice. Never seen.
 - Control+C before the agent is up can end the terminal; Return starts it again.
-- A step made in the few milliseconds between `moth agent`'s status read and its first watch is not told, and a `quiet on` made in them is missed for that session.
+- A step made in the few milliseconds between `moth agent`'s status read and its first watch is not told.
 - `moth agent` needs a free watcher place (16 at most) to read where the log stands.
-- A waiter of this build cannot tell that the service is from a later build: it asks again every second until its session ends. To be fixed when the protocol number next changes.
 - `Daemon.protocol` stayed 2, so a `moth` built on this branch before the fix wave takes this service for its own build and is then refused. No such build is in use.
 - Under zsh the 700th Control+Z in one agent session ends the terminal (zsh's limit on nested functions).
 - The agent's refused `launch` names `<bottle> <path>` in general, not the ones asked for.
