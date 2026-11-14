@@ -256,7 +256,7 @@ let results_set_undo () =
   check_bool "only the rows the page needs" true (peeks f = [ ("i32", 0, 1) ]);
   queue_write f ~prev:(Vint 85L) ~prev_bits:0x55L;
   queue_read f (Vint 999L);
-  check_str "set" "set #1 to 999 (was 85)" (set_text (Session.set s ~row:1 "999"));
+  check_str "set" "set #1 (0x10008) to 999 (was 85)" (set_text (Session.set s ~row:1 "999"));
   check_bool "wrote" true (last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
   check_bool "recorded" true (Session.writes s = [ (0x10008L, "i32", Vint 85L, Vint 999L) ]);
   queue_write f ~prev:(Vint 999L);
@@ -282,10 +282,10 @@ let undo_order () =
   ignore (ok (first_page s));
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
   queue_read f (Vint 250L);
-  check_str "first" "set #1 to 2.50 (was 1.00)" (set_text (Session.set s ~row:1 "2.5"));
+  check_str "first" "set #1 (0x5000) to 2.50 (was 1.00)" (set_text (Session.set s ~row:1 "2.5"));
   queue_write f ~prev:(Vint 250L) ~prev_bits:250L;
   queue_read f (Vint 900L);
-  check_str "second" "set #1 to 9.00 (was 2.50)" (set_text (Session.set s ~row:1 "9"));
+  check_str "second" "set #1 (0x5000) to 9.00 (was 2.50)" (set_text (Session.set s ~row:1 "9"));
   check_bool "newest first" true (Session.writes s = [ (0x5000L, "i32", Vint 250L, Vint 900L); (0x5000L, "i32", Vint 100L, Vint 250L) ]);
   queue_write f ~prev:(Vint 900L);
   check_str "undo newest" "restored #1 to 2.50" (said (Session.undo s));
@@ -303,7 +303,7 @@ let undo_puts_bytes_back () =
   queue_write f ~prev:(Vfloat Float.nan) ~prev_bits:0x7fc00001L;
   queue_read f (Vfloat 5.);
   let d = ok (Session.set s ~row:1 "5") in
-  check_str "set" "set #1 to 5 (was nan)" d.text;
+  check_str "set" "set #1 (0x7000) to 5 (was nan)" d.text;
   check_bool "the write" true (d.w = { where = 0x7000L; wtype = "f32"; bits_before = 0x7fc00001L; bits_after = 0x40a00000L });
   check_bool "wrote the value" true (last_write f = (0x7000L, "f32", Put_value (Vfloat 5.)));
   queue_write f ~prev:(Vfloat 5.) ~prev_bits:0x40a00000L;
@@ -323,7 +323,7 @@ let listing_follows_hunt () =
   check_bool "dead end" true (ok (Session.next_number s "5")).dead_end;
   queue_write f ~prev:(Vint 100L);
   queue_read f (Vint 7L);
-  check_str "a dead end keeps the listing" "set #2 to 7 (was 100)" (set_text (Session.set s ~row:2 "7"));
+  check_str "a dead end keeps the listing" "set #2 (0x2000) to 7 (was 100)" (set_text (Session.set s ~row:2 "7"));
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   ignore (ok (Session.next_number s "100"));
   check_err "a step replaces the listing" "no result #2. run: moth results" (Session.set s ~row:2 "7")
@@ -633,7 +633,7 @@ let a_write_the_game_puts_back () =
   let d = ok (Session.set s ~row:1 "9") in
   check_held "held" (Some false) d.held;
   check_str "text"
-    "set #1 to 9 (was 6)\nthe game put it straight back to 6. it's worked out from something else, so writing here won't stick."
+    "set #1 (0x10) to 9 (was 6)\nthe game put it straight back to 6. it's worked out from something else, so writing here won't stick."
     d.text;
   check_bool "still undoable" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ])
 
@@ -648,7 +648,7 @@ let a_write_that_holds () =
   queue_read f (Vfloat (Int32.float_of_bits (Int32.bits_of_float 0.1)));
   let d = ok (Session.set s ~row:1 "0.1") in
   check_held "held" (Some true) d.held;
-  check_str "the stage 1 line" "set #1 to 0.1 (was 100)" d.text;
+  check_str "the stage 1 line" "set #1 (0x7000) to 0.1 (was 100)" d.text;
   check_bool "read back where it wrote, as its type" true
     (List.exists (function Read { addr = 0x7000L; vtype = "f32" } -> true | _ -> false) (calls f))
 
@@ -662,7 +662,7 @@ let a_write_the_game_keeps_changing () =
   queue_read f (Vint 7L);
   let d = ok (Session.set s ~row:1 "9") in
   check_held "held" (Some false) d.held;
-  check_str "text" "set #1 to 9 (was 6)\nit already reads 7: the game keeps changing it." d.text;
+  check_str "text" "set #1 (0x10) to 9 (was 6)\nit already reads 7: the game keeps changing it." d.text;
   check_bool "still undoable" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ])
 
 let a_write_that_cannot_be_read_back () =
@@ -675,7 +675,7 @@ let a_write_that_cannot_be_read_back () =
   queue_error f "read" { code = "read_failed"; message = "couldn't read 0x10" };
   let d = ok (Session.set s ~row:1 "9") in
   check_held "not known" None d.held;
-  check_str "a second line says why" "set #1 to 9 (was 6)\nmoth couldn't read it back to check." d.text;
+  check_str "a second line says why" "set #1 (0x10) to 9 (was 6)\nmoth couldn't read it back to check." d.text;
   check_bool "still undoable" true (Session.writes s = [ (0x10L, "i32", Vint 6L, Vint 9L) ])
 
 (* R15: a read-back that could not happen is neither held nor not held, and a second line says
@@ -697,7 +697,7 @@ let a_write_that_could_not_be_checked () =
       queue_error f "read" e;
       let d = ok (Session.set s ~row:1 "9") in
       check_held (n "held") None d.held;
-      check_str (n "text") ("set #1 to 9 (was 6)\n" ^ why) d.text;
+      check_str (n "text") ("set #1 (0x10) to 9 (was 6)\n" ^ why) d.text;
       check_bool (n "the write") true (d.w = { where = 0x10L; wtype = "i32"; bits_before = 6L; bits_after = 9L });
       if ends then (
         check_bool (n "hunt cleared") true (Session.current s = None);
@@ -788,7 +788,7 @@ let a_write_check_when_things_fail () =
   queue_error f "read" gone;
   let d = ok (Session.set s ~row:1 "9") in
   check_held "not known" None d.held;
-  check_str "a second line says why" "set #1 to 9 (was 6)\nthe game closed right after, so moth couldn't check it." d.text;
+  check_str "a second line says why" "set #1 (0x10) to 9 (was 6)\nthe game closed right after, so moth couldn't check it." d.text;
   check_bool "the write is reported" true (d.w = { where = 0x10L; wtype = "i32"; bits_before = 6L; bits_after = 9L });
   check_bool "waited once, after the write" true (!settles = [ "after the write" ]);
   check_err "hunt cleared" no_hunt (Session.next_number s "5");
@@ -880,7 +880,7 @@ let near_an_address () =
   check_bool "its own address first, then below before above" true (aways l = [ 0; -8; 8 ] && ns l = [ 1; 2; 3 ]);
   queue_write f ~prev:(Vint 5L) ~prev_bits:5L;
   queue_read f (Vint 9L);
-  check_str "set takes the near listing" "set #1 to 9 (was 5)" (set_text (Session.set s ~row:1 "9"));
+  check_str "set takes the near listing" "set #1 (0x6c551068) to 9 (was 5)" (set_text (Session.set s ~row:1 "9"));
   check_bool "at the address" true (last_write f = (0x6c551068L, "i32", Put_value (Vint 9L)))
 
 let near_nothing () =
@@ -940,7 +940,7 @@ let rows_that_cannot_be_read () =
   queue_peek f "i32" [ it (at 1) (Vint 77L); it (at 2) (Vint 77L); hole (at 3); hole (at 4) ];
   ignore (ok (Session.results s ~all:false ~from:1 ~limit:4 ~near:None));
   queue_error f "read" { code = "read_failed"; message = "cannot read 0x20ff8" };
-  check_str "kept as any row" "kept #3 as v1 (?, whole number)" (ok (Session.keep_row s ~row:3 ~name:None));
+  check_str "kept as any row" "kept #3 (0x20ff8) as v1 (?, whole number)" (ok (Session.keep_row s ~row:3 ~name:None));
   queue_error f "write" { code = "write_failed"; message = "cannot write 0x20ff8" };
   check_err "set as any row: the write says why it failed" "cannot write 0x20ff8" (Session.set s ~row:3 "9");
   check_bool "written where the row is" true (last_write f = (at 3, "i32", Put_value (Vint 9L)));
@@ -982,7 +982,7 @@ let only_the_latest_listing () =
   check_int "nothing written" 0 (write_calls f);
   queue_write f ~prev:(Vint 5L) ~prev_bits:5L;
   queue_read f (Vint 9L);
-  check_str "a row of the latest" "set #6 to 9 (was 5)" (set_text (Session.set s ~row:6 "9"));
+  check_str "a row of the latest" "set #6 (0x1014) to 9 (was 5)" (set_text (Session.set s ~row:6 "9"));
   check_bool "at its position" true (last_write f = (at 5, "i32", Put_value (Vint 9L)))
 
 let a_kept_row_outlives_the_hunt () =
@@ -992,7 +992,7 @@ let a_kept_row_outlives_the_hunt () =
   queue_peek f "i32" [ it 0x6c551068L (Vint 15L) ];
   ignore (ok (first_page s));
   queue_read f (Vint 15L);
-  check_str "kept" "kept #1 as xp (15, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "xp")));
+  check_str "kept" "kept #1 (0x6c551068) as xp (15, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "xp")));
   check_err "a row not listed" "no result #2. run: moth results" (Session.keep_row s ~row:2 ~name:(Some "hp"));
   queue_scan f [ gi "i32" 40 ];
   ignore (ok (Session.find s "20"));
@@ -1228,7 +1228,7 @@ let a_snapshot_too_big () =
   check_bool "the hunt is still there" true (before <> None && Session.current s = before);
   queue_write f ~prev:(Vint 100L) ~prev_bits:100L;
   queue_read f (Vint 7L);
-  check_str "and its listing" "set #1 to 7 (was 100)" (set_text (Session.set s ~row:1 "7"));
+  check_str "and its listing" "set #1 (0x10) to 7 (was 100)" (set_text (Session.set s ~row:1 "7"));
   queue_narrow f ~applied:true [ gi "i32" 1 ];
   check_int "and its steps" 1 (ok (Session.next_number s "7")).main;
   (* no hunt before: none after *)
@@ -1433,10 +1433,10 @@ let money_listed () =
 let keep_reads_the_value_now () =
   let s, f = money_listed () in
   queue_read f (Vint 20000L);
-  check_str "the value read now" "kept #1 as money (200.00, whole number ×100)" (ok (Session.keep_row s ~row:1 ~name:(Some "money")));
+  check_str "the value read now" "kept #1 (0x2a0) as money (200.00, whole number ×100)" (ok (Session.keep_row s ~row:1 ~name:(Some "money")));
   check_bool "read there, as its type" true (reads f = [ (0x2a0L, "i32") ]);
   queue_error f "read" { code = "read_failed"; message = "cannot read 0x2a0" };
-  check_str "the listing's value when it can't be read" "kept #1 as cash (106.98, whole number ×100)"
+  check_str "the listing's value when it can't be read" "kept #1 (0x2a0) as cash (106.98, whole number ×100)"
     (ok (Session.keep_row s ~row:1 ~name:(Some "cash")));
   queue_read f (Vint 20000L);
   queue_read f (Vint 20000L);
@@ -1540,9 +1540,9 @@ let a_write_by_row () =
   ignore (ok (first_page s));
   queue_write f ~prev:(Vint 13L) ~prev_bits:13L;
   queue_read f (Vint 20L);
-  check_str "set" "set #1 to 20 (was 13)" (set_text (Session.set s ~row:1 "20"));
+  check_str "set" "set #1 (0x10) to 20 (was 13)" (set_text (Session.set s ~row:1 "20"));
   queue_read f (Vint 20L);
-  check_str "kept, reading the value just written" "kept #1 as conc (20, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "conc")));
+  check_str "kept, reading the value just written" "kept #1 (0x10) as conc (20, whole number)" (ok (Session.keep_row s ~row:1 ~name:(Some "conc")));
   queue_read f (Vint 20L);
   let k = List.hd (ok (Session.kept s)) in
   check_bool "set, then kept: the write" true (k.set_to = Some "20" && (not k.put_back) && k.kshown = "20");

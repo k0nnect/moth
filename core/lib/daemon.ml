@@ -314,10 +314,15 @@ let set_done st (d : Session.set_done) =
   st.held <- Some held;
   (`Assoc [ ("message", `String d.text); ("held", held) ], d.text)
 
+(* the client protocol number, in [status --json] as proto *)
+let protocol = 2
+
 (* Asks the helper whether the game is still there. When it has exited, the target goes, and its
    hunt, kept values and writes with it; the helper stays, and lets go of the game's candidates
    now rather than at the next attach (if it can't, the answer is the same). *)
 let status st =
+  let with_proto = function Ok (`Assoc f, t) -> Ok (`Assoc (f @ [ ("proto", `Int protocol) ]), t) | r -> r in
+  with_proto @@
   match (st.target, st.conn) with
   | Some t, Some (_, h) -> (
       match h.status () with
@@ -491,7 +496,7 @@ let feed st j =
 
 (* one line of events.jsonl: the command, its arguments and its options (when any were given),
    how it went, and for a write, whether it held and what it wrote. Watchers are sent it after. *)
-let record st ~actor ~cmd ~args ~opts result =
+let record st ~actor ~act ~cmd ~args ~opts result =
   st.seq <- st.seq + 1;
   let ok, summary = match result with Ok (_, text) -> (true, first_line text) | Error e -> (false, first_line e) in
   let ev =
@@ -500,6 +505,7 @@ let record st ~actor ~cmd ~args ~opts result =
          ("seq", `Int st.seq);
          ("ts", `Float (Float.round (Unix.gettimeofday () *. 1000.) /. 1000.));
          ("actor", `String actor);
+         ("act", `Bool act);
          ("cmd", `String cmd);
          ("args", `List (List.map (fun a -> `String a) args));
        ]
@@ -707,7 +713,7 @@ let answer st = function
       let result = try handle st ~record:r.record ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
       let lost_the_game = st.closed || st.lost || st.gone in
       settle st;
-      if r.record || lost_the_game then record st ~actor:r.actor ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
+      if r.record || lost_the_game then record st ~actor:r.actor ~act:(lost_the_game || not (List.mem r.cmd reads)) ~cmd:r.cmd ~args:r.args ~opts:r.opts result;
       st.wrote <- None;
       st.held <- None;
       st.closed <- false;

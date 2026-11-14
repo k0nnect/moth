@@ -111,22 +111,67 @@ let call ?(autostart = true) ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~a
 
 (* every feed line after watch's reply, until [f] says stop or the daemon closes the connection.
    A line cut short (the daemon let go of this watcher mid-line) is not json, and ends it too. *)
-let watch ~home ?after f =
+let watch ~home ?after ?started ?idle f =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let* path = Daemon.socket_path ~home in
   match connect path with
   | None -> Error not_running
   | Some fd ->
+      Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) @@ fun () ->
       let opts = match after with Some k -> [ ("after", `String (string_of_int k)) ] | None -> [] in
       let request = `Assoc [ ("id", `Int 1); ("cmd", `String "watch"); ("args", `List []); ("opts", `Assoc opts) ] in
-      let rec follow ic =
-        match Yojson.Safe.from_string (input_line ic) with
-        | line -> if f line then follow ic else Ok ()
-        | exception (End_of_file | Sys_error _ | Yojson.Json_error _) -> Ok ()
+      let lost = Error (sprintf "lost contact with moth's background service. see %s" (core_log home)) in
+      (* lines are read by hand, so that [idle] gets its say whenever half a second passes with
+         nothing to read: [`Line l], [`Idle] or [`Eof] *)
+      let pending = Buffer.create 4096 and chunk = Bytes.create 4096 in
+      let rec next ~idling =
+        let held = Buffer.contents pending in
+        match String.index_opt held '\n' with
+        | Some j ->
+            Buffer.clear pending;
+            Buffer.add_string pending (String.sub held (j + 1) (String.length held - j - 1));
+            `Line (String.sub held 0 j)
+        | None -> (
+            match Unix.select [ fd ] [] [] 0.5 with
+            | [], _, _ -> if idling then `Idle else next ~idling
+            | _ -> (
+                match Unix.read fd chunk 0 (Bytes.length chunk) with
+                | 0 -> `Eof
+                | n ->
+                    Buffer.add_subbytes pending chunk 0 n;
+                    next ~idling
+                | exception Unix.Unix_error (Unix.EINTR, _, _) -> next ~idling
+                | exception Unix.Unix_error _ -> `Eof)
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> next ~idling)
       in
-      converse ~home fd request (fun ic reply ->
-          let* _ = reply in
-          follow ic)
+      let line = Yojson.Safe.to_string request ^ "\n" in
+      let sent = try ignore (Unix.write_substring fd line 0 (String.length line)); true with Unix.Unix_error _ -> false in
+      if not sent then lost
+      else
+        (* the reply is waited for as long as converse waits: no idle turns before it *)
+        match next ~idling:false with
+        | `Eof -> lost
+        | `Idle -> lost
+        | `Line reply ->
+            let* result, _ = parse_reply reply in
+            (match (started, result) with
+            | Some k, `Assoc fields -> ( match List.assoc_opt "seq" fields with Some (`Int n) -> k n | _ -> ())
+            | _ -> ());
+            let rec follow () =
+              match next ~idling:true with
+              | `Eof -> Ok ()
+              | `Idle -> if (match idle with Some i -> i () | None -> true) then follow () else Ok ()
+              | `Line l -> (
+                  match Yojson.Safe.from_string l with
+                  | j -> if f j then follow () else Ok ()
+                  | exception Yojson.Json_error _ -> Ok ())
+            in
+            follow ()
+
+let actor_of_env = function
+  | None | Some "" | Some "user" -> Ok "user"
+  | Some "agent" -> Ok "agent"
+  | Some _ -> Error "MOTH_ACTOR must be user or agent"
 
 type invocation = { cmd : string; args : string list; opts : (string * string) list; json : bool }
 

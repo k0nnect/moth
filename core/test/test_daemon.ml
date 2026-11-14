@@ -162,7 +162,7 @@ let before_attach () =
       check_err "before attach" not_attached (call d "find" [ "100" ]);
       List.iter (fun (cmd, args) -> check_err cmd not_attached (call d cmd args)) [ ("next", [ "85" ]); ("results", []); ("set", [ "1"; "5" ]); ("undo", []) ];
       check_str "status" "not attached" (text (call d "status" []));
-      check_json "status json" (`Assoc [ ("attached", `Null); ("hunt", `Null) ]) (json (call d "status" []));
+      check_json "status json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("proto", `Int 2) ]) (json (call d "status" []));
       check_str "detach" "not attached" (text (call d "detach" [])))
 
 let attaching () =
@@ -173,7 +173,7 @@ let attaching () =
       check_strs "one helper, in the bottle" [ "uhmm" ] fk.started;
       check_str "status" attached (text (call d "status" []));
       check_json "status json"
-        (`Assoc [ ("attached", `Assoc [ ("pid", `Int 208); ("name", `String "disco.exe"); ("bits", `Int 64); ("bottle", `String "uhmm") ]); ("hunt", `Null) ])
+        (`Assoc [ ("attached", `Assoc [ ("pid", `Int 208); ("name", `String "disco.exe"); ("bits", `Int 64); ("bottle", `String "uhmm") ]); ("hunt", `Null); ("proto", `Int 2) ])
         (json (call d "status" []));
       check_err "not running" "nope.exe isn't running in uhmm. start the game first." (attach d ~what:"nope.exe");
       check_err "no such pid" "pid 999 isn't running in uhmm." (attach d ~what:"999");
@@ -302,7 +302,7 @@ let hunt () =
       check_bool "wrote" true (Fake_helper.last_write f = (0x10008L, "i32", Put_value (Vint 999L)));
       Fake_helper.queue_write f ~prev:(Vint 999L);
       Fake_helper.queue_read f (Vint 5L);
-      check_json "set without #" (`Assoc [ ("message", `String "set #2 to 5 (was 999)"); ("held", `Bool true) ]) (json (call d "set" [ "2"; "5" ]));
+      check_json "set without #" (`Assoc [ ("message", `String "set #2 (0x2000) to 5 (was 999)"); ("held", `Bool true) ]) (json (call d "set" [ "2"; "5" ]));
       Fake_helper.queue_write f ~prev:(Vint 5L);
       check_str "undo" "restored #2 to 999" (text (call d "undo" []));
       let set_usage = "set needs a result number or a kept name, and a number: moth set <#n|name> <number>" in
@@ -387,7 +387,7 @@ let events () =
       check_str "actor" "agent" (index 0 ev |> member "actor" |> to_string);
       check_str "newest first" "status" (index 0 ev |> member "cmd" |> to_string);
       check_str "summary is the first line" attached (index 0 ev |> member "summary" |> to_string);
-      check_strs "fields" [ "seq"; "ts"; "actor"; "cmd"; "args"; "ok"; "summary" ] (keys (index 0 ev));
+      check_strs "fields" [ "seq"; "ts"; "actor"; "act"; "cmd"; "args"; "ok"; "summary" ] (keys (index 0 ev));
       check_int "seq" 4 (index 0 ev |> member "seq" |> to_int);
       check_bool "ts" true (index 0 ev |> member "ts" |> to_number > 1e9);
       check_bool "error logged" false (index 1 ev |> member "ok" |> to_bool);
@@ -440,7 +440,7 @@ let write_record () =
       check_json "set, whole number" (wrote "0x10008" "i32" "0x0000003c" "0x000003e7") (write 3);
       check_json "set, decimal" (wrote "0x2000" "f32" "0x42700000" "0xbfc00000") (write 2);
       check_json "undo" (wrote "0x2000" "f32" "0xbfc00000" "0x42700000") (write 1);
-      check_strs "fields" [ "seq"; "ts"; "actor"; "cmd"; "args"; "ok"; "summary"; "write" ] (keys (index 1 ev));
+      check_strs "fields" [ "seq"; "ts"; "actor"; "act"; "cmd"; "args"; "ok"; "summary"; "write" ] (keys (index 1 ev));
       check_bool "nothing written, no record" true (write 0 = `Null);
       check_bool "other commands, no record" true (write 4 = `Null))
 
@@ -673,8 +673,8 @@ let keep_by_name () =
       Fake_helper.queue_peek f "i32" [ { addr = 0x10008L; v = Some (Vint 60L) } ];
       ignore (text (call d "results" []));
       let r = call d "keep" [ "#1"; "xp" ] in
-      check_str "keep" "kept #1 as xp (60, whole number)" (text r);
-      check_json "keep json" (`Assoc [ ("message", `String "kept #1 as xp (60, whole number)") ]) (json r);
+      check_str "keep" "kept #1 (0x10008) as xp (60, whole number)" (text r);
+      check_json "keep json" (`Assoc [ ("message", `String "kept #1 (0x10008) as xp (60, whole number)") ]) (json r);
       Fake_helper.queue_read f (Vint 60L);
       Fake_helper.queue_read f (Vint 60L);
       check_str "kept" "xp  60  0x10008  whole number" (text (call d "kept" []));
@@ -762,8 +762,8 @@ let keep_a_bare_number () =
       hunt_for_three d f 2;
       Fake_helper.queue_peek f "i32" (threes 2);
       ignore (text (call d "results" []));
-      check_str "keep 1 xp" "kept #1 as xp (3, whole number)" (text (call d "keep" [ "1"; "xp" ]));
-      check_str "keep 1" "kept #1 as v1 (3, whole number)" (text (call d "keep" [ "1" ]));
+      check_str "keep 1 xp" "kept #1 (0x1000) as xp (3, whole number)" (text (call d "keep" [ "1"; "xp" ]));
+      check_str "keep 1" "kept #1 (0x1000) as v1 (3, whole number)" (text (call d "keep" [ "1" ]));
       check_err "keep 2 5: the name rule" name_msg (call d "keep" [ "2"; "5" ]);
       check_err "a row not listed" "no result #15. run: moth results" (call d "keep" [ "15" ]);
       let usage = "keep needs a result, or an address and the number it shows: moth keep <#n> [name], or moth keep <0xaddr> <number> [name]" in
@@ -784,7 +784,7 @@ let set_put_back () =
       Fake_helper.queue_write f ~prev:(Vint 6L) ~prev_bits:6L;
       Fake_helper.queue_read f (Vint 6L);
       let r = call d "set" [ "#1"; "9" ] in
-      let two = "set #1 to 9 (was 6)\nthe game put it straight back to 6. it's worked out from something else, so writing here won't stick." in
+      let two = "set #1 (0x10008) to 9 (was 6)\nthe game put it straight back to 6. it's worked out from something else, so writing here won't stick." in
       check_str "two lines" two (text r);
       check_json "held false" (`Assoc [ ("message", `String two); ("held", `Bool false) ]) (json r))
 
@@ -805,7 +805,7 @@ let a_write_that_could_not_be_checked () =
           Fake_helper.queue_write f ~prev:(Vint 61L) ~prev_bits:0x3dL;
           Fake_helper.queue_error f "read" { code; message = "" };
           let r = call d "set" [ "#1"; "999" ] in
-          let two = "set #1 to 999 (was 61)\n" ^ why in
+          let two = "set #1 (0x10008) to 999 (was 61)\n" ^ why in
           check_str (code ^ ": two lines") two (text r);
           check_json (code ^ ": held null") (`Assoc [ ("message", `String two); ("held", `Null) ]) (json r);
           check_err (code ^ ": the next command") not_attached (call d "undo" []);
@@ -849,9 +849,9 @@ let events_say_more () =
       check_json "held" (`Bool true) (held 2);
       check_json "already reads 8" (`Bool false) (held 3);
       check_json "put straight back" (`Bool false) (held 4);
-      check_strs "a set's fields" [ "seq"; "ts"; "actor"; "cmd"; "args"; "ok"; "summary"; "held"; "write" ] (keys (index 4 ev));
+      check_strs "a set's fields" [ "seq"; "ts"; "actor"; "act"; "cmd"; "args"; "ok"; "summary"; "held"; "write" ] (keys (index 4 ev));
       check_json "the options" (`Assoc [ ("n", `String "5"); ("from", `String "1") ]) (member "opts" (index 5 ev));
-      check_strs "where they go" [ "seq"; "ts"; "actor"; "cmd"; "args"; "opts"; "ok"; "summary" ] (keys (index 5 ev));
+      check_strs "where they go" [ "seq"; "ts"; "actor"; "act"; "cmd"; "args"; "opts"; "ok"; "summary" ] (keys (index 5 ev));
       check_json "an error's options too" (`Assoc [ ("n", `String "0") ]) (member "opts" (index 0 ev));
       check_bool "none given, none listed" false (List.mem "opts" (keys (index 6 ev)));
       check_bool "nor held, for another command" false (List.mem "held" (keys (index 5 ev))))
@@ -871,7 +871,7 @@ let closed_game () =
       fk.alive <- false;
       let r = call d "status" [] in
       check_str "closed" "not attached. disco.exe closed." (text r);
-      check_json "closed json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String "disco.exe") ]) (json r);
+      check_json "closed json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String "disco.exe"); ("proto", `Int 2) ]) (json r);
       check_int "the helper let go of the game" 1 fk.detaches;
       check_err "kept" not_attached (call d "kept" []);
       check_err "results" not_attached (call d "results" []);
@@ -1079,7 +1079,7 @@ let at_guards_a_row () =
       row3 ();
       Fake_helper.queue_write f ~prev:(Vint 3L);
       Fake_helper.queue_read f (Vint 9L);
-      check_str "set at its address" "set #3 to 9 (was 3)" (text (call d "set" [ "3"; "9" ] ~opts:(at "0x1008")));
+      check_str "set at its address" "set #3 (0x1008) to 9 (was 3)" (text (call d "set" [ "3"; "9" ] ~opts:(at "0x1008")));
       check_bool "row 3 alone" true (Fake_helper.last_peek f "i32" = (2, 1));
       check_bool "wrote" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
       row3 ();
@@ -1090,7 +1090,7 @@ let at_guards_a_row () =
       check_str "nothing kept" nothing_kept (text (call d "kept" []));
       row3 ();
       Fake_helper.queue_read f (Vint 9L);
-      check_str "keep at its address" "kept #3 as hp (9, whole number)" (text (call d "keep" [ "3"; "hp" ] ~opts:(at "0x1008")));
+      check_str "keep at its address" "kept #3 (0x1008) as hp (9, whole number)" (text (call d "keep" [ "3"; "hp" ] ~opts:(at "0x1008")));
       let row_only = "--at goes with a row number" in
       check_err "set by name" row_only (call d "set" [ "hp"; "9" ] ~opts:(at "0x10"));
       check_err "keep by address" row_only (call d "keep" [ "0x1008"; "9" ] ~opts:(at "0x1008"));
@@ -1279,6 +1279,110 @@ let only_reads_go_unrecorded () =
       check_int "nothing recorded" 1 (List.length (stored d));
       check_str "still attached, still serving" attached (text (call d "status" [])))
 
+(* ---- who spoke, and whether it acted ---- *)
+
+let act_of ev = Yojson.Safe.Util.(member "act" ev |> to_bool)
+let cmd_of ev = Yojson.Safe.Util.(member "cmd" ev |> to_string)
+
+let an_agent_is_named () =
+  let _, sh = fake () in
+  with_daemon sh (fun d ->
+      let w = watcher d in
+      check_json "the reply" (watching 0) (next_line w);
+      ignore (text (call ~actor:"agent" d "attach" [ "disco.exe" ] ~opts:[ ("bottle", "uhmm") ]));
+      check_json "its busy line carries it" (busy "agent" "attach" [ "disco.exe" ]) (next_line w);
+      let ev = List.hd (stored d) in
+      check_str "its event carries it" "agent" Yojson.Safe.Util.(member "actor" ev |> to_string);
+      unwatch w)
+
+let events_say_whether_they_acted () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      let acts = ref [] in
+      let run cmd args =
+        ignore (call d cmd args);
+        acts := !acts @ [ (cmd, act_of (List.nth (stored d) (List.length (stored d) - 1))) ]
+      in
+      run "games" [];
+      run "bottles" [];
+      run "status" [];
+      ignore (text (attach d));
+      Fake_helper.queue_scan f [ gi "i32" 3 ];
+      run "find" [ "3" ];
+      Fake_helper.queue_peek f "i32" (threes 3);
+      run "results" [];
+      Fake_helper.queue_read f (Vint 3L);
+      run "keep" [ "1"; "hp" ];
+      Fake_helper.queue_read f (Vint 3L);
+      run "kept" [];
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 9L);
+      run "set" [ "hp"; "9" ];
+      Fake_helper.queue_write f ~prev:(Vint 9L);
+      run "undo" [];
+      run "log" [];
+      run "forget" [ "hp" ];
+      run "status" [];
+      run "detach" [];
+      let want =
+        [ ("games", false); ("bottles", false); ("status", false); ("find", true); ("results", false); ("keep", true); ("kept", false);
+          ("set", true); ("undo", true); ("log", false); ("forget", true); ("status", false); ("detach", true) ]
+      in
+      check_bool "which acted" true (!acts = want);
+      let attach_ev = List.find (fun ev -> cmd_of ev = "attach") (stored d) in
+      check_bool "attach acted" true (act_of attach_ev))
+
+let a_closed_game_acts () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      fk.alive <- false;
+      ignore (unrecorded d "status" []);
+      let ev = List.nth (stored d) 1 in
+      check_str "a status" "status" (cmd_of ev);
+      check_bool "that let go of the game, so it acted" true (act_of ev))
+
+let status_says_its_protocol () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      let proto r = Yojson.Safe.Util.(json r |> member "proto") in
+      check_json "not attached" (`Int 2) (proto (call d "status" []));
+      ignore (text (attach d));
+      check_json "no hunt" (`Int 2) (proto (call d "status" []));
+      Fake_helper.queue_scan f [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "3" ]));
+      check_json "a hunt" (`Int 2) (proto (call d "status" []));
+      check_int "Daemon.protocol" 2 Daemon.protocol;
+      fk.alive <- false;
+      check_json "just closed" (`Int 2) (proto (call d "status" [])))
+
+let client_watch_hooks () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      ignore (text (attach d));
+      Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+      ignore (text (call d "find" [ "3" ]));
+      (* started comes with the reply's seq, before the stored events it is followed by *)
+      let order = ref [] in
+      let r =
+        Client.watch ~home:d.home ~after:0
+          ~started:(fun n -> order := !order @ [ Printf.sprintf "started %d" n ])
+          (fun line ->
+            order := !order @ [ Printf.sprintf "line %d" (seq_of line) ];
+            List.length !order < 3)
+      in
+      check_bool "ended" true (r = Ok ());
+      check_strs "started first" [ "started 2"; "line 1"; "line 2" ] !order;
+      (* idle is called while nothing happens, and false ends the watch *)
+      let t0 = Unix.gettimeofday () in
+      let idles = ref 0 in
+      let r = Client.watch ~home:d.home ~idle:(fun () -> incr idles; !idles < 2) (fun _ -> true) in
+      check_bool "ended by idle" true (r = Ok ());
+      check_int "called twice" 2 !idles;
+      check_bool "within a second or so" true (Unix.gettimeofday () -. t0 < 2.))
+
 let a_closed_game_is_recorded () =
   let fk, sh = fake () in
   with_daemon sh (fun d ->
@@ -1423,14 +1527,14 @@ let a_poll_leaves_the_rows () =
       check_str "the window's #1" "0x1000" (first_addr (unrecorded d "results" [] ~opts:[ ("from", "1"); ("n", "200") ]));
       Fake_helper.queue_write f ~prev:(Vint 3L);
       Fake_helper.queue_read f (Vint 9L);
-      check_str "set 1 9" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ]));
+      check_str "set 1 9" "set #1 (0x1008) to 9 (was 3)" (text (call d "set" [ "1"; "9" ]));
       check_bool "written where the command line was shown #1" true (Fake_helper.last_write f = (0x1008L, "i32", Put_value (Vint 9L)));
       (* the window reads another page: the command line's #3 is still there *)
       Fake_helper.queue_peek f "i32" [ List.nth (threes 3) 1 ];
       ignore (json (unrecorded d "results" [] ~opts:[ ("from", "2"); ("n", "1") ]));
       Fake_helper.queue_write f ~prev:(Vint 3L);
       Fake_helper.queue_read f (Vint 9L);
-      check_str "set 3 9" "set #3 to 9 (was 3)" (text (call d "set" [ "3"; "9" ]));
+      check_str "set 3 9" "set #3 (0x1000) to 9 (was 3)" (text (call d "set" [ "3"; "9" ]));
       check_bool "written at its #3" true (Fake_helper.last_write f = (0x1000L, "i32", Put_value (Vint 9L))))
 
 (* with --at, row n is found afresh in the hunt as results lists it without --near (--all as
@@ -1448,7 +1552,7 @@ let a_row_found_afresh () =
       (* nothing listed yet: row 1 is the first whole number *)
       Fake_helper.queue_peek f "i32" [ three 0x1000L ];
       wrote 9L;
-      check_str "set, nothing listed" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(at "0x1000")));
+      check_str "set, nothing listed" "set #1 (0x1000) to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(at "0x1000")));
       check_bool "its row alone" true (Fake_helper.last_peek f "i32" = (0, 1));
       check_bool "written there" true (Fake_helper.last_write f = (0x1000L, "i32", Put_value (Vint 9L)));
       (* a recorded listing: its #1 is 0x1004 *)
@@ -1457,11 +1561,11 @@ let a_row_found_afresh () =
       (* with --all the rarer forms count too, fewest matches first: row 1 is the 1-byte one *)
       Fake_helper.queue_peek f "u8" [ three 0x2001L ];
       wrote 9L;
-      check_str "set, all" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(at "0x2001" @ all)));
+      check_str "set, all" "set #1 (0x2001) to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(at "0x2001" @ all)));
       check_bool "the 1-byte one" true (Fake_helper.last_write f = (0x2001L, "u8", Put_value (Vint 9L)));
       Fake_helper.queue_peek f "i32" [ three 0x1000L ];
       Fake_helper.queue_read f (Vint 9L);
-      check_str "keep, all" "kept #2 as hp (9, whole number)" (text (call d "keep" [ "2"; "hp" ] ~opts:(at "0x1000" @ all)));
+      check_str "keep, all" "kept #2 (0x1000) as hp (9, whole number)" (text (call d "keep" [ "2"; "hp" ] ~opts:(at "0x1000" @ all)));
       check_bool "row 2 is the first whole number" true (Fake_helper.last_peek f "i32" = (0, 1));
       (* past the end: no row, and nothing asked of the helper *)
       let calls = List.length (Fake_helper.calls f) in
@@ -1470,7 +1574,7 @@ let a_row_found_afresh () =
       check_int "nothing asked" calls (List.length (Fake_helper.calls f));
       (* without --at, the recorded listing's rows, as they were *)
       wrote 7L;
-      check_str "set 2 7" "set #2 to 7 (was 3)" (text (call d "set" [ "2"; "7" ]));
+      check_str "set 2 7" "set #2 (0x1004) to 7 (was 3)" (text (call d "set" [ "2"; "7" ]));
       check_bool "the listing's #2" true (Fake_helper.last_write f = (0x1004L, "i32", Put_value (Vint 7L)));
       check_err "the listing has no #1" "no result #1. run: moth results" (call d "set" [ "1"; "7" ]))
 
@@ -1491,7 +1595,7 @@ let a_row_of_another_kind () =
       Fake_helper.queue_peek f "i32" (threes 1);
       Fake_helper.queue_write f ~prev:(Vint 3L);
       Fake_helper.queue_read f (Vint 9L);
-      check_str "as its own kind" "set #1 to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(pin "i32")));
+      check_str "as its own kind" "set #1 (0x1000) to 9 (was 3)" (text (call d "set" [ "1"; "9" ] ~opts:(pin "i32")));
       check_bool "written" true (Fake_helper.last_write f = (0x1000L, "i32", Put_value (Vint 9L))))
 
 let kind_and_all_go_with_at () =
@@ -1750,6 +1854,11 @@ let () =
           t "reads that leave no trace" reads_that_leave_no_trace;
           t "only reads go unrecorded" only_reads_go_unrecorded;
           t "a closed game is recorded" a_closed_game_is_recorded;
+          t "an agent is named" an_agent_is_named;
+          t "events say whether they acted" events_say_whether_they_acted;
+          t "a closed game acts" a_closed_game_acts;
+          t "Client.watch: started and idle" client_watch_hooks;
+          t "status says its protocol" status_says_its_protocol;
           t "unrecorded results, target_gone: recorded" (a_read_that_loses_the_game "results" (answers_next "peek" "target_gone") game_closed);
           t "unrecorded results, helper_lost: recorded" (a_read_that_loses_the_game "results" (answers_next "peek" "helper_lost") lost_contact);
           t "unrecorded kept, target_gone: recorded" (a_read_that_loses_the_game ~keeping:true "kept" (answers_next "read" "target_gone") game_closed);

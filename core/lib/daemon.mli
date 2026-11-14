@@ -45,3 +45,6 @@ val clear_stale_socket : home:string -> bool
 (** the program under CrossOver's wine, detached in its own session, stdin from /dev/null, its
     output appended to [home]/launch.log *)
 val default_launch : home:string -> launch
+
+(** the client protocol number [status --json] gives as [proto]; a service that gives none is 1 *)
+val protocol : int

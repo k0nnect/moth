@@ -535,7 +535,7 @@ let pages () =
       let shared = List.filter (fun r -> List.exists (fun q -> q.addr = r.addr) first.rows) second.rows in
       check (shared = []) "results --from 6 -n 5 repeats addresses of the first page: %s" (show_rows shared);
       let said = to_string (member "message" (moth [ "set"; "#7"; "4" ])) in
-      check (String.starts_with ~prefix:"set #7 to 4 " said) "set #7 4 said %S" said;
+      check (String.starts_with ~prefix:"set #7 (0x" said && contains said " to 4 ") "set #7 4 said %S" said;
       (* row 7 is wherever the fewest-first order puts it, often a float of wine's own: put it back *)
       ignore (moth [ "undo" ]))
 
@@ -908,7 +908,7 @@ let two_hands () =
             | [] -> failf "nothing listed near points' address 0x%Lx" points.addr);
             Unix.sleepf 2.;
             let said = to_string (member "message" (moth ~timeout:60. [ "set"; "1"; "4" ])) in
-            check (String.starts_with ~prefix:"set #1 to 4" said) "moth set 1 4 said: %s" said;
+            check (String.starts_with ~prefix:(Printf.sprintf "set #1 (0x%Lx) to 4" points.addr) said) "moth set 1 4 said: %s" said;
             expect t "points" "4";
             wrote := true
         | _ -> ()

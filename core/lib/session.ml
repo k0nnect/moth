@@ -492,7 +492,7 @@ let row_for ?at ?kind ?(all = false) t row =
 (* writes the number at [addr] as [i] and records it for undo; then, a moment later, the raw
    bytes there say whether the game kept it. [label] names it in the texts: "#2", or a kept
    value's name. *)
-let write_checked t ~label (i : Interp.t) addr text =
+let write_checked ?(named_at = false) t ~label (i : Interp.t) addr text =
   match Result.bind (Value.parse text) (Interp.encode i) with
   | Error e -> Error e
   | Ok next ->
@@ -503,7 +503,8 @@ let write_checked t ~label (i : Interp.t) addr text =
           t.undo <- made :: t.undo;
           forget_last t;
           let w = { where = addr; wtype = vtype; bits_before = r.prev_bits; bits_after = Wire.bits_of_value ~vtype next } in
-          let text = Printf.sprintf "set %s to %s (was %s)" label (Interp.decode i next) (Interp.decode i r.prev) in
+          let who = if named_at then Printf.sprintf "%s (0x%Lx)" label addr else label in
+          let text = Printf.sprintf "set %s to %s (was %s)" who (Interp.decode i next) (Interp.decode i r.prev) in
           t.settle ();
           (* held: read back as written, or not; None when it couldn't be read back. The write
              landed either way, so it is reported; a read-back that lost the game or the helper
@@ -532,7 +533,7 @@ let write_checked t ~label (i : Interp.t) addr text =
 let set ?at ?kind ?all t ~row text =
   match row_for ?at ?kind ?all t row with
   | Error e -> Error e
-  | Ok l -> write_checked t ~label:(Printf.sprintf "#%d" row) l.li l.laddr text
+  | Ok l -> write_checked ~named_at:true t ~label:(Printf.sprintf "#%d" row) l.li l.laddr text
 
 let undo t =
   match t.undo with
@@ -591,7 +592,7 @@ let keep_row ?at ?kind ?all t ~row ~name =
                  when it can't be read *)
               let shown = match read_as t l.li l.laddr with Some v -> Interp.decode l.li v | None -> l.lshown in
               add_kept t name l.li l.laddr;
-              Ok (Printf.sprintf "kept #%d as %s (%s, %s)" row name shown (Interp.describe l.li))))
+              Ok (Printf.sprintf "kept #%d (0x%Lx) as %s (%s, %s)" row l.laddr name shown (Interp.describe l.li))))
 
 let keep_at t ~addr text ~name =
   match new_name t name with

@@ -50,7 +50,8 @@ let feed_text line =
   with Type_error _ -> None
 
 (* [moth watch]: the feed until the daemon goes. If the daemon lets go of it while still running
-   (it fell behind), it watches again from the newest event it printed. *)
+   (it fell behind), it watches again from the newest event it printed, or from the seq its first
+   reply gave when it printed none. *)
 let watch ~json ~after =
   let home = Client.home () in
   let newest = ref after in
@@ -62,7 +63,7 @@ let watch ~json ~after =
     true
   in
   let rec follow ~first =
-    match Client.watch ~home ?after:!newest show with
+    match Client.watch ~home ?after:!newest ~started:(fun seq -> if !newest = None then newest := Some seq) show with
     | Ok () -> follow ~first:false
     | Error m when m = Client.not_running && not first ->
         print_endline (if json then Yojson.Safe.to_string (`Assoc [ ("message", `String "moth stopped") ]) else "moth stopped")
@@ -78,6 +79,7 @@ let () =
       let home = Client.home () in
       try Daemon.run ~home ~start_helper:(Daemon.default_start_helper ~home) ~launch:(Daemon.default_launch ~home) with Failure m -> fail 1 m)
   | argv -> (
+      let actor = match Client.actor_of_env (Sys.getenv_opt "MOTH_ACTOR") with Ok a -> a | Error m -> fail 2 m in
       match Client.parse_args argv with
       | Error m -> fail 2 m
       | Ok { cmd = "help"; args = []; _ } -> print_string usage
@@ -89,7 +91,7 @@ let () =
           | Ok () -> (
               let print result text = print_endline (if inv.json then Yojson.Safe.to_string result else text) in
               (* stopping must not start a daemon just to stop it *)
-              match Client.call ~autostart:(inv.cmd <> "stop") ~home:(Client.home ()) ~actor:"user" ~cmd:inv.cmd ~args:inv.args ~opts:inv.opts () with
+              match Client.call ~autostart:(inv.cmd <> "stop") ~home:(Client.home ()) ~actor ~cmd:inv.cmd ~args:inv.args ~opts:inv.opts () with
               | Ok (result, text) -> print result text
               | Error m when inv.cmd = "stop" && m = Client.not_running -> print (`Assoc [ ("message", `String m) ]) m
               | Error m -> fail 1 m)))
