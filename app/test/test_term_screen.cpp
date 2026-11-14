@@ -135,6 +135,36 @@ private slots:
     t.feed("\x07");
     QCOMPARE(bell.count(), 1);
   }
+  void anUnendingTitleIsCapped() {
+    Scr t;
+    QSignalSpy changed(&t.s, &TermScreen::titleChanged);
+    t.feed("\x1b]2;");
+    for (int i = 0; i < 1024; ++i) t.feed(QByteArray(1024, 'x'));  // 1 MB, never ended
+    t.feed("\x07");
+    QCOMPARE(changed.count(), 1);
+    QVERIFY(t.s.title().size() <= 4096);
+    QVERIFY(t.s.title().size() >= 1000);
+  }
+  void aCursorOnlyMoveDamagesBothRows() {
+    Scr t;
+    t.feed("abc");
+    QSignalSpy d(&t.s, &TermScreen::damaged);
+    t.feed("\x1b[10;5H");
+    bool row0 = false, row9 = false;
+    for (const auto &a : d) {
+      row0 |= a[0].toInt() <= 0 && a[1].toInt() >= 0;
+      row9 |= a[0].toInt() <= 9 && a[1].toInt() >= 9;
+    }
+    QVERIFY(row0 && row9);
+  }
+  void resizeClampsAndReportsRealRows() {
+    Scr t;
+    QSignalSpy d(&t.s, &TermScreen::damaged);
+    t.s.resize(0, 0);
+    QCOMPARE(t.s.rows(), 1);
+    QCOMPARE(t.s.cols(), 1);
+    QCOMPARE(d.last()[1].toInt(), 0);
+  }
   void cursorVisibility() {
     Scr t;
     QVERIFY(t.s.cursorVisible());
@@ -192,10 +222,26 @@ private slots:
     QCOMPARE(t.key(Qt::Key_A, Qt::NoModifier, ""), QByteArray("a"));  // no text: the key itself
     QCOMPARE(t.key(Qt::Key_Shift, Qt::ShiftModifier, ""), QByteArray());
   }
-  void optionLeft() {
+  void optionArrowsMoveByWord() {
     Scr t;
-    // xterm's encoding of Alt+Left. (macOS Terminal sends ESC b; the brief expected that)
-    QCOMPARE(t.key(Qt::Key_Left, Qt::AltModifier), QByteArray("\x1b[1;3D"));
+    QCOMPARE(t.key(Qt::Key_Left, Qt::AltModifier), QByteArray("\x1b" "b"));
+    QCOMPARE(t.key(Qt::Key_Right, Qt::AltModifier), QByteArray("\x1b" "f"));
+    QCOMPARE(t.key(Qt::Key_Left, Qt::AltModifier | Qt::ShiftModifier), QByteArray("\x1b[1;4D"));
+    QCOMPARE(t.key(Qt::Key_Up, Qt::AltModifier), QByteArray("\x1b[1;3A"));
+  }
+  void controlKeysAreC0Bytes() {
+    Scr t;
+    QCOMPARE(t.key(Qt::Key_I, Qt::ControlModifier, "\t"), QByteArray("\t"));
+    QCOMPARE(t.key(Qt::Key_J, Qt::ControlModifier, "\n"), QByteArray("\n"));
+    QCOMPARE(t.key(Qt::Key_M, Qt::ControlModifier, "\r"), QByteArray("\r"));
+    QCOMPARE(t.key(Qt::Key_BracketLeft, Qt::ControlModifier, ""), QByteArray("\x1b"));
+    QCOMPARE(t.key(Qt::Key_At, Qt::ControlModifier, ""), QByteArray(1, '\0'));
+    QCOMPARE(t.key(Qt::Key_Space, Qt::ControlModifier, " "), QByteArray(1, '\0'));
+    QCOMPARE(t.key(Qt::Key_Backslash, Qt::ControlModifier, ""), QByteArray("\x1c"));
+    QCOMPARE(t.key(Qt::Key_Underscore, Qt::ControlModifier, ""), QByteArray("\x1f"));
+    QCOMPARE(t.key(Qt::Key_Question, Qt::ControlModifier, ""), QByteArray("\x7f"));
+    QCOMPARE(t.key(Qt::Key_C, Qt::ControlModifier | Qt::AltModifier, ""), QByteArray("\x1b\x03"));
+    QCOMPARE(t.key(Qt::Key_Backspace, Qt::ControlModifier), QByteArray("\x7f"));
   }
   void paste() {
     Scr t;
@@ -204,6 +250,8 @@ private slots:
     t.feed("\x1b[?2004h");
     t.s.paste("a\nb");
     QCOMPARE(t.take(), QByteArray("\x1b[200~a\rb\x1b[201~"));
+    t.s.paste("a\x1b[201~rm -rf\n");
+    QCOMPARE(t.take(), QByteArray("\x1b[200~a[201~rm -rf\r\x1b[201~"));  // no ESC to end it early
     t.s.paste(QString::fromUtf8("é\r\nx"));
     QCOMPARE(t.take(), QByteArray("\x1b[200~\xc3\xa9\rx\x1b[201~"));
   }

@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <sys/types.h>
 
 class QSocketNotifier;
 class QTimer;
@@ -42,6 +43,7 @@ private:
 
   int master_ = -1;
   pid_t pid_ = 0;
+  bool ending_ = false;         // the child has been found gone: nothing more is written
   QByteArray pending_;          // input the pty would not take yet
   QSocketNotifier *readNotifier_ = nullptr, *writeNotifier_ = nullptr;
   QTimer *poll_ = nullptr;      // the child can end with the pty still held open by another process

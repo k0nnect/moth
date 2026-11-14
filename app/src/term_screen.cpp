@@ -53,6 +53,8 @@ VTermKey vtermKey(int qtKey) {
   return VTERM_KEY_NONE;
 }
 
+constexpr int kTitleLimit = 4096;
+
 bool blankCell(const VTermScreenCell &c) {
   return c.chars[0] == 0 && VTERM_COLOR_IS_DEFAULT_BG(&c.bg) && !c.attrs.reverse;
 }
@@ -78,9 +80,15 @@ TermScreen::~TermScreen() { vterm_free(vt_); }
 
 void TermScreen::feed(const QByteArray &bytes) {
   pushed_ = false;
+  const QPoint before = cursor();
   vterm_input_write(vt_, bytes.constData(), static_cast<size_t>(bytes.size()));
   vterm_screen_flush_damage(screen_);
   if (pushed_) emit scrolled();
+  const QPoint after = cursor();
+  if (after != before) {  // the cursor is drawn, so its old and new rows need painting
+    emit damaged(before.y(), before.y());
+    if (after.y() != before.y()) emit damaged(after.y(), after.y());
+  }
 }
 
 int TermScreen::rows() const {
@@ -100,7 +108,7 @@ void TermScreen::resize(int rows, int cols) {
   vterm_set_size(vt_, std::max(rows, 1), std::max(cols, 1));
   vterm_screen_flush_damage(screen_);
   if (pushed_) emit scrolled();
-  emit damaged(0, rows - 1);
+  emit damaged(0, this->rows() - 1);
 }
 
 int TermScreen::scrollback() const { return static_cast<int>(history_.size()); }
@@ -181,6 +189,13 @@ QString TermScreen::title() const { return title_; }
 void TermScreen::key(int qtKey, Qt::KeyboardModifiers mods, const QString &text) {
   VTermModifier m = vtermMods(mods);
   if (qtKey == Qt::Key_Backtab) m = static_cast<VTermModifier>(m | VTERM_MOD_SHIFT);
+  // Alt+arrow is how a Mac terminal asks for a word at a time: ESC b and ESC f
+  if (mods == Qt::AltModifier && (qtKey == Qt::Key_Left || qtKey == Qt::Key_Right)) {
+    emit reply(qtKey == Qt::Key_Left ? QByteArray("\x1b" "b") : QByteArray("\x1b" "f"));
+    return;
+  }
+  // Ctrl+Backspace is Backspace, as Terminal.app sends it
+  if (qtKey == Qt::Key_Backspace) m = static_cast<VTermModifier>(m & ~VTERM_MOD_CTRL);
   const VTermKey special = vtermKey(qtKey);
   if (special != VTERM_KEY_NONE) {
     vterm_keyboard_key(vt_, special, m);
@@ -188,9 +203,21 @@ void TermScreen::key(int qtKey, Qt::KeyboardModifiers mods, const QString &text)
   }
   // a printable character is sent with Alt and Control only: Shift is already in the character
   const VTermModifier cm = static_cast<VTermModifier>(m & ~VTERM_MOD_SHIFT);
-  if ((m & VTERM_MOD_CTRL) && qtKey >= Qt::Key_A && qtKey <= Qt::Key_Z) {
-    vterm_keyboard_unichar(vt_, static_cast<uint32_t>('a' + (qtKey - Qt::Key_A)), cm);
-    return;
+  // Control with a letter or one of @ [ \ ] ^ _ Space ? is a C0 byte. libvterm would send these as
+  // CSI-u sequences (ESC [ 105 ; 5 u for Ctrl+I), which shells and prompts do not read.
+  if (m & VTERM_MOD_CTRL) {
+    const bool letter = qtKey >= Qt::Key_A && qtKey <= Qt::Key_Z;
+    const bool symbol = qtKey == Qt::Key_At || qtKey == Qt::Key_BracketLeft ||
+                        qtKey == Qt::Key_Backslash || qtKey == Qt::Key_BracketRight ||
+                        qtKey == Qt::Key_AsciiCircum || qtKey == Qt::Key_Underscore ||
+                        qtKey == Qt::Key_Space || qtKey == Qt::Key_Question;
+    if (letter || symbol) {
+      QByteArray out;
+      if (m & VTERM_MOD_ALT) out += '\x1b';
+      out += qtKey == Qt::Key_Question ? '\x7f' : static_cast<char>(qtKey & 0x1f);
+      emit reply(out);
+      return;
+    }
   }
   bool sent = false;
   for (const char32_t c : text.toUcs4()) {
@@ -206,7 +233,9 @@ void TermScreen::key(int qtKey, Qt::KeyboardModifiers mods, const QString &text)
 }
 
 void TermScreen::paste(const QString &text) {
-  QByteArray bytes = text.toUtf8();
+  QString clean = text;
+  clean.remove(QChar(0x1b));  // an ESC could end the bracket early, and what follows would be typed
+  QByteArray bytes = clean.toUtf8();
   bytes.replace("\r\n", "\r");
   bytes.replace('\n', '\r');
   vterm_keyboard_start_paste(vt_);  // writes the opening mark only when the program asked for it
@@ -252,9 +281,10 @@ int TermScreen::onSetTermProp(VTermProp prop, VTermValue *val, void *selfp) {
     case VTERM_PROP_MOUSE: self->mouse_ = val->number != VTERM_PROP_MOUSE_NONE; break;
     case VTERM_PROP_TITLE: {
       if (val->string.initial) self->titleBuf_.clear();
-      self->titleBuf_ += QString::fromUtf8(val->string.str, static_cast<qsizetype>(val->string.len));
+      if (self->titleBuf_.size() < kTitleLimit)  // a title that never ends must not grow for ever
+        self->titleBuf_ += QString::fromUtf8(val->string.str, static_cast<qsizetype>(val->string.len));
       if (val->string.final) {
-        self->title_ = self->titleBuf_;
+        self->title_ = self->titleBuf_.left(kTitleLimit);
         emit self->titleChanged();
       }
       break;

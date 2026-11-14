@@ -1,4 +1,5 @@
 #include <QtTest>
+#include <QTemporaryDir>
 #include <csignal>
 #include <unistd.h>
 
@@ -57,9 +58,12 @@ private slots:
     Run r;
     QByteArray atExit;
     QObject::connect(&r.pty, &Pty::exited, &r.pty, [&] { atExit = r.out; });
-    QVERIFY(r.start("/bin/sh", {"-c", "i=0; while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); done"}));
+    // prints a lot and exits at once: some of it is still in the pty when the exit is seen
+    QVERIFY(r.start("/bin/sh", {"-c", "i=0; while [ $i -lt 2000 ]; do echo line$i; i=$((i+1)); done"}));
     QVERIFY(r.waitExit());
-    QVERIFY(atExit.contains("line299"));
+    QTest::qWait(100);
+    QVERIFY(atExit.contains("line1999"));
+    QCOMPARE(atExit, r.out);
   }
   void signalledChildIs128PlusSignal() {
     Run r;
@@ -80,6 +84,29 @@ private slots:
     QElapsedTimer t;
     t.start();
     while (!processGone(pid) && t.elapsed() < 1000) QTest::qWait(10);
+    QVERIFY(processGone(pid));
+  }
+  void theDestructorReturnsWithOutputNobodyRead() {
+    qint64 pid = 0;
+    auto r = std::make_unique<Run>();
+    QVERIFY(r->start("/bin/sh", {"-c", "sleep 0.2; printf hello; sleep 60"}));
+    pid = r->pty.pid();
+    usleep(600000);  // not qWait: nothing may read the output
+    QElapsedTimer t;
+    t.start();
+    r.reset();
+    QVERIFY2(t.elapsed() < 1000, qPrintable(QString::number(t.elapsed())));
+    QVERIFY(processGone(pid));
+  }
+  void theDestructorReturnsWhileTheChildWritesOnHangup() {
+    auto r = std::make_unique<Run>();
+    QVERIFY(r->start("/bin/sh", {"-c", "trap 'printf bye; sleep 60' HUP; sleep 60 & wait"}));
+    const qint64 pid = r->pty.pid();
+    QTest::qWait(300);
+    QElapsedTimer t;
+    t.start();
+    r.reset();
+    QVERIFY2(t.elapsed() < 1500, qPrintable(QString::number(t.elapsed())));
     QVERIFY(processGone(pid));
   }
   void aChildThatIgnoresHangupIsKilled() {
@@ -120,10 +147,12 @@ private slots:
   }
   void environmentReachesTheChild() {
     Run r;
-    QVERIFY(r.start("/bin/sh", {"-c", "printf %s \"$MOTH_HOME\""}, 24, 80,
+    qputenv("MOTH_TEST_ONLY_HERE", "leaks");
+    QVERIFY(r.start("/bin/sh", {"-c", "printf %s \"$MOTH_HOME|$MOTH_TEST_ONLY_HERE|$HOME\""}, 24, 80,
                     {"MOTH_HOME=/tmp/with space/moth", "PATH=/usr/bin:/bin"}));
     QVERIFY(r.waitExit());
-    QCOMPARE(r.out, QByteArray("/tmp/with space/moth"));
+    qunsetenv("MOTH_TEST_ONLY_HERE");
+    QCOMPARE(r.out, QByteArray("/tmp/with space/moth||"));  // ours is not passed on
   }
   void theChildLeadsItsOwnGroupOnATerminal() {
     Run r;
@@ -133,6 +162,38 @@ private slots:
     const QStringList ids = QString::fromLatin1(r.out).split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
     QCOMPARE(ids.size(), 3);  // tty, pid, pgid: the child leads its own group
     QCOMPARE(ids[1], ids[2]);
+  }
+  void theLineIsInUtf8Mode() {
+    Run r;
+    QVERIFY(r.start("/bin/sh", {"-c", "stty -a"}));
+    QVERIFY(r.waitExit());
+    QVERIFY2(r.out.contains("iutf8") && !r.out.contains("-iutf8"), r.out.constData());
+  }
+  void aRelativeProgramMeansTheSameFileBeforeAndAfterTheChdir() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QVERIFY(QDir::setCurrent(dir.path()));
+    QFile f("tool.sh");
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write("#!/bin/sh\nprintf ran\n");
+    f.close();
+    f.setPermissions(f.permissions() | QFileDevice::ExeUser);
+    Run r;
+    QVERIFY(r.pty.start("./tool.sh", {}, plainEnv, "/", 24, 80));  // the child runs in /
+    QVERIFY(r.waitExit());
+    QCOMPARE(r.out, QByteArray("ran"));
+    QDir::setCurrent("/");
+  }
+  void startingAgainAfterAnExitWorks() {
+    Run r;
+    QVERIFY(r.start("/bin/sh", {"-c", "printf one"}));
+    QVERIFY(r.waitExit());
+    r.exits.clear();
+    r.out.clear();
+    QVERIFY(r.start("/bin/sh", {"-c", "printf two; exit 4"}));
+    QVERIFY(r.waitExit());
+    QCOMPARE(r.out, QByteArray("two"));
+    QCOMPARE(r.exits, QList<int>{4});
   }
   void aProgramOnThePathIsFound() {
     Run r;
@@ -163,8 +224,8 @@ private slots:
   }
   void aLargeWriteIsQueued() {
     Run r;
-    QVERIFY(r.start("/bin/sh", {"-c", "stty raw -echo; head -c 200000 | wc -c"}));
-    QTest::qWait(200);
+    QVERIFY(r.start("/bin/sh", {"-c", "stty raw -echo; printf ready; head -c 200000 | wc -c"}));
+    QVERIFY(r.waitOut("ready"));
     r.pty.write(QByteArray(200000, 'a'));
     QVERIFY(r.waitOut("200000", 8000));
   }

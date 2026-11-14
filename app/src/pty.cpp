@@ -41,25 +41,33 @@ winsize sizeOf(int rows, int cols) {
 Pty::Pty(QObject *parent) : QObject(parent) {}
 
 Pty::~Pty() {
-  if (pid_ <= 0) {
-    if (master_ >= 0) ::close(master_);
-    return;
-  }
+  // Let go of the line first. On macOS a session leader's exit waits for the tty's output to be
+  // read, so with unread output the child cannot be reaped until the master is closed; closing it
+  // also hangs up the line.
+  delete readNotifier_;
+  delete writeNotifier_;
+  readNotifier_ = writeNotifier_ = nullptr;
+  if (master_ >= 0) ::close(master_);
+  master_ = -1;
+  if (pid_ <= 0) return;
   int status = 0;
-  if (waitpid(pid_, &status, WNOHANG) != pid_) {
+  auto reaped = [&] { return waitpid(pid_, &status, WNOHANG) == pid_; };
+  bool gone = reaped();
+  if (!gone) {
     kill(-pid_, SIGHUP);
     kill(-pid_, SIGCONT);  // a stopped child would not see the hangup
-    bool gone = false;
     for (int waited = 0; waited < 500 && !gone; waited += 5) {
-      gone = waitpid(pid_, &status, WNOHANG) == pid_;
+      gone = reaped();
       if (!gone) usleep(5000);
     }
-    if (!gone) {
-      kill(-pid_, SIGKILL);
-      while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+  }
+  if (!gone) {
+    kill(-pid_, SIGKILL);
+    for (int waited = 0; waited < 1000 && !gone; waited += 5) {  // never wait for ever
+      gone = reaped();
+      if (!gone) usleep(5000);
     }
   }
-  if (master_ >= 0) ::close(master_);
 }
 
 QString Pty::find(const QString &program, const QStringList &env) const {
@@ -79,11 +87,12 @@ bool Pty::start(const QString &program, const QStringList &args, const QStringLi
   if (pid_ > 0) return false;
   const QString exe = find(program, env);
   QFileInfo fi(exe);
+  fi = QFileInfo(fi.absoluteFilePath());  // the app's folder, as the child will not be in it
   if (exe.isEmpty() || !fi.isFile() || !fi.isExecutable()) return false;
   if (!cwd.isEmpty() && !QFileInfo(cwd).isDir()) return false;
 
   // everything the child needs, built before the fork
-  const QByteArray exeB = QFile::encodeName(exe);
+  const QByteArray exeB = QFile::encodeName(fi.absoluteFilePath());
   const QByteArray cwdB = QFile::encodeName(cwd.isEmpty() ? QStringLiteral(".") : cwd);
   QList<QByteArray> argStore{exeB};
   for (const QString &a : args) argStore << a.toUtf8();
@@ -96,13 +105,24 @@ bool Pty::start(const QString &program, const QStringList &args, const QStringLi
   envp << nullptr;
 
   winsize ws = sizeOf(rows, cols);
+  // the kernel's own defaults, and UTF-8 on, so that Backspace in a line editor erases a character
+  // (read from a fresh pty, then IUTF8 added)
+  termios tio{};
+  int m = -1, sl = -1;
+  if (openpty(&m, &sl, nullptr, nullptr, nullptr) == 0) {
+    tcgetattr(sl, &tio);
+    ::close(m);
+    ::close(sl);
+  }
+  tio.c_iflag |= IUTF8;
   int fd = -1;
-  const pid_t pid = forkpty(&fd, nullptr, nullptr, &ws);
+  const pid_t pid = forkpty(&fd, nullptr, &tio, &ws);
   if (pid < 0) return false;
   if (pid == 0) childMain(cwdB.constData(), argv.data(), envp.data());
 
   master_ = fd;
   pid_ = pid;
+  ending_ = false;
   fcntl(master_, F_SETFD, FD_CLOEXEC);
   fcntl(master_, F_SETFL, fcntl(master_, F_GETFL) | O_NONBLOCK);
   readNotifier_ = new QSocketNotifier(master_, QSocketNotifier::Read, this);
@@ -121,7 +141,7 @@ bool Pty::running() const { return pid_ > 0; }
 qint64 Pty::pid() const { return pid_ > 0 ? pid_ : 0; }
 
 void Pty::write(const QByteArray &bytes) {
-  if (pid_ <= 0 || bytes.isEmpty()) return;
+  if (pid_ <= 0 || ending_ || bytes.isEmpty()) return;
   pending_ += bytes;
   flush();
 }
@@ -184,14 +204,21 @@ void Pty::drain() {
 }
 
 void Pty::finish(int raw) {
+  ending_ = true;  // the child is gone: whatever a slot writes now has nowhere to go
   poll_->stop();
   readNotifier_->setEnabled(false);
   writeNotifier_->setEnabled(false);
+  pending_.clear();
   drain();
   pid_ = 0;
-  pending_.clear();
   ::close(master_);
   master_ = -1;
+  // not deleted here: this may run inside one of their own signals
+  readNotifier_->deleteLater();
+  writeNotifier_->deleteLater();
+  poll_->deleteLater();
+  readNotifier_ = writeNotifier_ = nullptr;
+  poll_ = nullptr;
   int code = 0;
   if (WIFEXITED(raw)) code = WEXITSTATUS(raw);
   else if (WIFSIGNALED(raw)) code = 128 + WTERMSIG(raw);

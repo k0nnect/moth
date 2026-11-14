@@ -54,7 +54,7 @@ public:
   void wheel(int row, int col, int steps);       // positive is up; sent only when mouseWanted()
 signals:
   void damaged(int firstRow, int lastRow);
-  void scrolled();                               // the scrollback grew
+  void scrolled();                               // the scrollback grew, or was cleared
   void reply(const QByteArray &bytes);           // what must be written to the program
   void titleChanged();
   void bell();
