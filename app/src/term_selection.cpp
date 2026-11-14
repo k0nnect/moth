@@ -6,7 +6,7 @@
 
 namespace {
 
-TermCell cellAt(const TermScreen &s, TermPoint p) { return s.cell(p.line - s.scrollback(), p.col); }
+TermCell cellAt(const TermScreen &s, TermPoint p) { return s.cell(TermSelection::rowOf(s, p.line), p.col); }
 
 // never written, or a space. The second half of a wide character is not: it goes with the first
 bool whitespace(const TermCell &c) { return c.width != 0 && c.text.trimmed().isEmpty(); }
@@ -18,7 +18,7 @@ bool stepBack(const TermScreen &s, TermPoint &p) {
     --p.col;
     return true;
   }
-  if (p.line <= TermSelection::topLine(s) || !s.wrapped(p.line - 1 - s.scrollback())) return false;
+  if (p.line <= TermSelection::topLine(s) || !s.wrapped(TermSelection::rowOf(s, p.line) - 1)) return false;
   --p.line;
   p.col = s.cols() - 1;
   return true;
@@ -30,7 +30,7 @@ bool stepOn(const TermScreen &s, TermPoint &p) {
     ++p.col;
     return true;
   }
-  if (p.line >= TermSelection::bottomLine(s) || !s.wrapped(p.line - s.scrollback())) return false;
+  if (p.line >= TermSelection::bottomLine(s) || !s.wrapped(TermSelection::rowOf(s, p.line))) return false;
   ++p.line;
   p.col = 0;
   return true;
@@ -56,14 +56,23 @@ TermPoint clamped(const TermScreen &s, TermPoint p) {
 
 }  // namespace
 
-int TermSelection::topLine(const TermScreen &s) { return s.altScreen() ? s.scrollback() : 0; }
-int TermSelection::bottomLine(const TermScreen &s) { return s.scrollback() + s.rows() - 1; }
+qint64 TermSelection::topLine(const TermScreen &s) {
+  return s.linesDropped() + (s.altScreen() ? s.scrollback() : 0);
+}
+
+qint64 TermSelection::bottomLine(const TermScreen &s) {
+  return s.linesDropped() + s.scrollback() + s.rows() - 1;
+}
+
+int TermSelection::rowOf(const TermScreen &s, qint64 line) {
+  return static_cast<int>(line - s.linesDropped() - s.scrollback());
+}
 
 void TermSelection::start(const TermScreen &s, TermPoint p, Unit unit) {
   unit_ = unit;
   anchor_ = head_ = clamped(s, p);
   started_ = true;
-  grown_ = false;
+  grown_ = everything_ = false;
   spanUnits(s);
 }
 
@@ -74,19 +83,20 @@ void TermSelection::extend(const TermScreen &s, TermPoint p) {
   spanUnits(s);
 }
 
-void TermSelection::all(const TermScreen &s) {
-  unit_ = Unit::Cell;
-  anchor_ = {topLine(s), 0};
-  head_ = {bottomLine(s), s.cols() - 1};
-  started_ = grown_ = true;
-  spanUnits(s);
+void TermSelection::all() {
+  started_ = grown_ = false;
+  everything_ = true;
 }
 
-void TermSelection::clear() { started_ = grown_ = false; }
-bool TermSelection::empty() const { return !started_ || (unit_ == Unit::Cell && !grown_); }
+void TermSelection::clear() { started_ = grown_ = everything_ = false; }
+bool TermSelection::empty() const { return !everything_ && (!started_ || (unit_ == Unit::Cell && !grown_)); }
+bool TermSelection::everything() const { return everything_; }
 TermPoint TermSelection::first() const { return first_; }
 TermPoint TermSelection::last() const { return last_; }
-bool TermSelection::contains(TermPoint p) const { return !empty() && first_ <= p && p <= last_; }
+
+bool TermSelection::contains(TermPoint p) const {
+  return everything_ || (!empty() && first_ <= p && p <= last_);
+}
 
 // first_ and last_: the press and the pointer in reading order, widened to whole words or rows, and
 // to all of a wide character the first cell is half of
@@ -105,14 +115,21 @@ void TermSelection::spanUnits(const TermScreen &s) {
 
 QString TermSelection::text(const TermScreen &s) const {
   if (empty()) return {};
+  if (!everything_) return textBetween(s, first_, last_);
+  QString all = textBetween(s, {topLine(s), 0}, {bottomLine(s), s.cols() - 1});
+  while (all.endsWith('\n')) all.chop(1);  // the empty rows below the last text
+  return all;
+}
+
+QString TermSelection::textBetween(const TermScreen &s, TermPoint first, TermPoint last) {
   QString out;
-  for (int line = first_.line; line <= last_.line; ++line) {
-    const int row = line - s.scrollback();
-    const int from = line == first_.line ? first_.col : 0;
-    const int to = line == last_.line ? last_.col : s.cols() - 1;
+  for (qint64 line = first.line; line <= last.line; ++line) {
+    const int row = rowOf(s, line);
+    const int from = line == first.line ? first.col : 0;
+    const int to = line == last.line ? last.col : s.cols() - 1;
     // a row that wrapped goes on into the next with nothing between. From its end only the cells
     // never written are dropped (a wide character that did not fit leaves one); a space there is text
-    const bool wraps = line < last_.line && s.wrapped(row);
+    const bool wraps = line < last.line && s.wrapped(row);
     QString part;
     qsizetype kept = 0;  // part's length up to the last cell kept
     for (int col = from; col <= to; ++col) {
@@ -122,7 +139,7 @@ QString TermSelection::text(const TermScreen &s) const {
       if (wraps ? !c.text.isEmpty() : !whitespace(c)) kept = part.size();
     }
     out += part.left(kept);
-    if (line < last_.line && !wraps) out += '\n';
+    if (line < last.line && !wraps) out += '\n';
   }
   return out;
 }

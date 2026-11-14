@@ -33,7 +33,9 @@ struct TermCell;
 // to the program brings it back to the bottom. On the alternate screen there is nothing to look
 // back at: the wheel sends the program Up and Down. A drag selects (a double click a word, a triple
 // click a row), drawn reversed, kept on its text while the view scrolls and dropped when that text
-// changes. A program that asks for the mouse gets presses, drags and the wheel, unless Option is held.
+// changes or leaves the scrollback; Command+A selects everything, whatever comes after. A program
+// that asks for the mouse gets presses, drags and (while the view is at the bottom) the wheel,
+// unless Option is held.
 class TerminalView : public QAbstractScrollArea {
   Q_OBJECT
 public:
@@ -78,6 +80,8 @@ private:
   };
   // who the buttons held are for: their drags and releases go where the press went
   enum class MouseOwner { None, Program, View };
+  // what the wheel does: looks back, steps the program's wheel, or sends it Up and Down
+  enum class WheelGoes { View, Program, Keys };
 
   // size. A row here is a row of the view: the screen's row less how far the view looks back
   void fitToViewport();
@@ -85,11 +89,13 @@ private:
   QRect cursorRectangle() const;                          // the cursor's cell, in this widget
 
   // looking back
-  int topLine() const;      // the line at the top of the view, counted from the oldest
+  qint64 topLine() const;   // the line at the top of the view, as TermPoint counts lines
+  int viewRow(qint64 line) const;  // where a line is in the view (-1 above, rows() below)
   int scrollLimit() const;  // how many lines back the view can go
   void scrollTo(int linesBack);
   void syncScrollBar();
   void scrollbackChanged();
+  void altScreenChanged();
   void screenDamaged(int firstRow, int lastRow);
 
   // painting
@@ -138,9 +144,9 @@ private:
 
   int scrollPos_ = 0;          // lines the view looks back from the bottom; 0: the screen itself
   int scrollback_ = 0;         // the screen's scrollback() when last looked at,
-  qint64 dropped_ = 0;         // its linesDropped(),
-  bool altScreen_ = false;     // and its altScreen()
+  qint64 dropped_ = 0;         // and its linesDropped()
   qreal wheelLines_ = 0;       // what the wheel has turned and nothing has been done for, in lines
+  WheelGoes wheelGoes_ = WheelGoes::View;  // and what it did then
 
   TermSelection selection_;
   MouseOwner mouseOwner_ = MouseOwner::None;

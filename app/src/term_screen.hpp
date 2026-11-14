@@ -65,6 +65,7 @@ public:
 signals:
   void damaged(int firstRow, int lastRow);
   void scrolled();                               // the scrollback grew, or was cleared
+  void altScreenChanged();                       // on or off the alternate screen, after the feed
   void reply(const QByteArray &bytes);           // what must be written to the program
   void titleChanged();
   void bell();
@@ -94,6 +95,7 @@ private:
   std::deque<Line> history_;                     // oldest first
   qint64 dropped_ = 0;                           // lines gone from the front of the history
   bool pushed_ = false;                          // a line went to the history during this feed
+  bool switched_ = false;                        // on or off the alternate screen during this feed
   int resizingFrom_ = 0;                         // during a resize the rows there were; 0 otherwise
   int resizePushes_ = 0;                         // lines the resize has pushed so far
   bool cursorVisible_ = true, altScreen_ = false, mouse_ = false;

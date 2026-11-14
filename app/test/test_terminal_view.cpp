@@ -122,11 +122,28 @@ void doubleClick(TerminalView &v, QPoint p) {
   mouse(v, QEvent::MouseButtonRelease, p);
 }
 
-// a wheel's notches (120 each), or a trackpad's pixels; up is positive
-void wheel(TerminalView &v, QPoint p, int angle, int pixels = 0) {
-  QWheelEvent e(QPointF(p), v.viewport()->mapToGlobal(QPointF(p)), QPoint(0, pixels), QPoint(0, angle),
-                Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+void sendWheel(TerminalView &v, QPoint p, QPoint pixels, QPoint angle, Qt::ScrollPhase phase) {
+  QWheelEvent e(QPointF(p), v.viewport()->mapToGlobal(QPointF(p)), pixels, angle, Qt::NoButton,
+                Qt::NoModifier, phase, false);
   QApplication::sendEvent(v.viewport(), &e);
+}
+
+// a mouse wheel's notches, up positive, as macOS's Qt delivers them: 120 each, and pixels too (20
+// for each line macOS would scroll), with no scroll phase
+void wheel(TerminalView &v, QPoint p, int notches) {
+  sendWheel(v, p, QPoint(0, 20 * notches), QPoint(0, 120 * notches), Qt::NoScrollPhase);
+}
+
+// a trackpad's move, up positive: pixels, in a scroll phase (and Qt's angle for them, two a pixel)
+void trackpad(TerminalView &v, QPoint p, int pixels) {
+  sendWheel(v, p, QPoint(0, pixels), QPoint(0, 2 * pixels), Qt::ScrollUpdate);
+}
+
+// all the bytes a screen sent to its program while a spy watched
+QByteArray sentBy(const QSignalSpy &spy) {
+  QByteArray all;
+  for (const QList<QVariant> &args : spy) all += args.at(0).toByteArray();
+  return all;
 }
 
 // the clipboard as it was, put back when the test ends
@@ -650,7 +667,7 @@ private slots:
     QCOMPARE(bar->pageStep(), 24);
     QCOMPARE(topRow(t.view), QString("line 178"));
     const QPoint middle = t.view.viewport()->rect().center();
-    wheel(t.view, middle, 120);  // a notch up: three lines back
+    wheel(t.view, middle, 1);  // a notch up: three lines back
     QCOMPARE(topRow(t.view), QString("line 175"));
     QCOMPARE(bar->value(), bar->maximum() - 3);
     const Picture back(t.view);
@@ -667,9 +684,9 @@ private slots:
     bar->setValue(bar->maximum() - 3);
     QCOMPARE(topRow(t.view), QString("line 185"));
     // a trackpad: its pixels, a line for each cell's height, the rest kept for the next
-    wheel(t.view, middle, 0, cellHeight(t.view) / 2 + 1);
+    trackpad(t.view, middle, cellHeight(t.view) / 2 + 1);
     QCOMPARE(bar->value(), bar->maximum() - 3);
-    wheel(t.view, middle, 0, cellHeight(t.view) / 2 + 1);
+    trackpad(t.view, middle, cellHeight(t.view) / 2 + 1);
     QCOMPARE(bar->value(), bar->maximum() - 4);
     // Command+C is the view's own: the view stays. A key for the program brings it to the bottom
     QVERIFY(commandKey(t.view, Qt::Key_C));
@@ -744,7 +761,7 @@ private slots:
     QVERIFY(commandKey(t.view, Qt::Key_A));
     const QString all = t.view.selectedText();
     QVERIFY(all.startsWith("line 1\nline 2\n"));
-    QVERIFY(all.contains("\nline 49\nline 50\n"));
+    QVERIFY(all.endsWith("\nline 49\nline 50"));  // and no empty row after
   }
   void aProgramThatAsksForTheMouseGetsItAndOptionSelects() {
     Term t;
@@ -754,7 +771,7 @@ private slots:
     QCOMPARE(t.view.selectedText(), QString());
     drag(t.view, at(t.view, 0, 1), at(t.view, 0, 3), Qt::AltModifier);  // the view's: nothing sent
     QCOMPARE(t.view.selectedText(), QString("ead"));
-    wheel(t.view, at(t.view, 2, 4), 120);  // a notch up, at row 2 column 4
+    wheel(t.view, at(t.view, 2, 4), 1);  // a notch up, at row 2 column 4
     QCOMPARE(dumped(t.view), QString("1b 5b 3c 30 3b 32 3b 31 4d 1b 5b 3c 30 3b 34 3b 31 6d "
                                      "1b 5b 3c 36 34 3b 35 3b 33 4d"));
     // a program that asks for drags gets them too
@@ -773,8 +790,8 @@ private slots:
     QVERIFY(s->scrollback() > 50);
     const QScrollBar *bar = t.view.verticalScrollBar();
     QCOMPARE(bar->maximum(), 0);  // nothing to look back at on this screen
-    wheel(t.view, at(t.view, 3, 3), 120);   // three Up keys
-    wheel(t.view, at(t.view, 3, 3), -120);  // three Down keys
+    wheel(t.view, at(t.view, 3, 3), 1);   // three Up keys
+    wheel(t.view, at(t.view, 3, 3), -1);  // three Down keys
     QCOMPARE(bar->maximum(), 0);
     QCOMPARE(bar->value(), 0);
     QVERIFY(commandKey(t.view, Qt::Key_A));  // everything there is to see: this screen
@@ -788,22 +805,27 @@ private slots:
       QVERIFY(t.shown());
       QVERIFY(t.run("/usr/bin/yes", {}));
       pid = t.view.pid();
-      // a timer every 10 ms that never waits more than 50 ms fires at least 20 times a second throughout
+      // a timer every 10 ms fires at least 20 times in every second of the flood, and never waits
+      // more than 250 ms (one stall of a loaded machine is not the window stopping)
       QElapsedTimer clock;
-      qint64 last = 0, longest = 0;
+      QList<qint64> ticks;
       QTimer tick;
       tick.setInterval(10);
-      QObject::connect(&tick, &QTimer::timeout, &tick, [&] {
-        longest = std::max(longest, clock.elapsed() - last);
-        last = clock.elapsed();
-      });
+      QObject::connect(&tick, &QTimer::timeout, &tick, [&] { ticks << clock.elapsed(); });
       QEventLoop loop;
       QTimer::singleShot(2000, &loop, &QEventLoop::quit);
       clock.start();
       tick.start();
       loop.exec();
-      longest = std::max(longest, clock.elapsed() - last);
-      QVERIFY2(longest <= 50, qPrintable(QString("the event loop waited %1 ms").arg(longest)));
+      const qint64 end = clock.elapsed();
+      qint64 last = 0, longest = 0;
+      for (const qint64 ms : ticks) longest = std::max(longest, ms - std::exchange(last, ms));
+      longest = std::max(longest, end - last);
+      QVERIFY2(longest <= 250, qPrintable(QString("the event loop waited %1 ms").arg(longest)));
+      for (qint64 from = 0; from + 1000 <= end; from += 50) {
+        const auto fired = std::count_if(ticks.begin(), ticks.end(), [&](qint64 ms) { return ms >= from && ms < from + 1000; });
+        QVERIFY2(fired >= 20, qPrintable(QString("%1 ticks in the second from %2 ms").arg(fired).arg(from)));
+      }
       QCOMPARE(t.view.screen()->scrollback(), TermScreen::kScrollbackLimit);
       QVERIFY(t.view.running());
     }
@@ -838,7 +860,7 @@ private slots:
     t.view.screen()->feed(numberedLines(101, 110));
     QCOMPARE(topRow(t.view), QString("line 1"));
     QCOMPARE(t.view.selectedText(), QString("line 1\nline 2"));
-    wheel(t.view, t.view.viewport()->rect().center(), -120);
+    wheel(t.view, t.view.viewport()->rect().center(), -1);
     QCOMPARE(topRow(t.view), QString("line 4"));
     QCOMPARE(t.view.selectedText(), QString("line 1\nline 2"));
   }
@@ -858,6 +880,213 @@ private slots:
     const QString text = t.view.selectedText();
     QVERIFY2(text.startsWith(topRow(t.view) + "\n"), qPrintable(text));
     QVERIFY2(text.endsWith("\nline 82\nl"), qPrintable(text));
+  }
+  void aWheelNotchIsThreeLinesWhateverPixelsMacOsGivesIt() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    s->feed(numberedLines(1, 100));
+    const QPoint middle = t.view.viewport()->rect().center();
+    wheel(t.view, middle, 1);  // looking back: three lines
+    QCOMPARE(bar->value(), bar->maximum() - 3);
+    wheel(t.view, middle, -1);
+    QCOMPARE(bar->value(), bar->maximum());
+    QSignalSpy sent(s, &TermScreen::reply);
+    s->feed("\x1b[?1000h\x1b[?1006h");  // a program that asked for the mouse: one step
+    wheel(t.view, at(t.view, 2, 4), 1);
+    QCOMPARE(sentBy(sent), QByteArray("\x1b[<64;5;3M"));
+    s->feed("\x1b[?1000l\x1b[?1049h");  // the alternate screen: three Up keys
+    sent.clear();
+    wheel(t.view, middle, 1);
+    QCOMPARE(sentBy(sent), QByteArray("\x1b[A\x1b[A\x1b[A"));
+  }
+  void whatIsLeftOfATurnGoesWhenTheWheelTurnsBackOrDoesSomethingElse() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    s->feed(numberedLines(1, 100));
+    const QPoint middle = t.view.viewport()->rect().center();
+    const int ch = cellHeight(t.view), most = ch * 9 / 10, some = ch * 2 / 10, half = ch / 2;
+    trackpad(t.view, middle, most);   // most of a line up
+    trackpad(t.view, middle, -some);  // a little down: what was left of the way up goes
+    trackpad(t.view, middle, half);   // half a line up: nothing yet
+    QCOMPARE(bar->value(), bar->maximum());
+    trackpad(t.view, middle, -half);
+    trackpad(t.view, middle, most);   // most of a line up, looking back
+    QSignalSpy sent(s, &TermScreen::reply);
+    s->feed("\x1b[?1049h");
+    trackpad(t.view, middle, half);   // then half a line as Up keys: nothing yet
+    QCOMPARE(sentBy(sent), QByteArray());
+  }
+  void losingTheFocusEndsADrag() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    QVERIFY(t.focused());
+    t.view.screen()->feed(numberedLines(1, 100));
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    mouse(t.view, QEvent::MouseButtonPress, at(t.view, 5, 0));
+    mouse(t.view, QEvent::MouseMove, QPoint(at(t.view, 0, 0).x(), -5));  // past the top: it scrolls
+    QVERIFY(QTest::qWaitFor([&] { return bar->value() <= bar->maximum() - 2; }, 2000));
+    t.view.clearFocus();  // a dialog, another application: the release never comes
+    QVERIFY(!t.view.hasFocus());
+    const int stopped = bar->value();
+    QTest::qWait(200);
+    QCOMPARE(bar->value(), stopped);
+    const QString selected = t.view.selectedText();
+    mouse(t.view, QEvent::MouseMove, at(t.view, 10, 3));  // the drag is over
+    QCOMPARE(t.view.selectedText(), selected);
+  }
+  void aWheelOrAClickOverThePaddingReachesNoParent() {
+    struct Parent : QWidget {
+      int wheels = 0, presses = 0;
+      void wheelEvent(QWheelEvent *e) override {
+        ++wheels;
+        e->accept();
+      }
+      void mousePressEvent(QMouseEvent *e) override {
+        ++presses;
+        e->accept();
+      }
+    } parent;
+    auto *view = new TerminalView(&parent);
+    view->setGeometry(10, 10, 400, 300);
+    parent.resize(420, 320);
+    parent.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&parent));
+    const QPointF padding(1, 1);  // the view's own, outside its viewport
+    QWheelEvent wheel(padding, view->mapToGlobal(padding), QPoint(0, 20), QPoint(0, 120), Qt::NoButton,
+                      Qt::NoModifier, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(view, &wheel);
+    QMouseEvent press(QEvent::MouseButtonPress, padding, view->mapToGlobal(padding), Qt::LeftButton,
+                      Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(view, &press);
+    QCOMPARE(parent.wheels, 0);
+    QCOMPARE(parent.presses, 0);
+  }
+  void outputWhileLookingBackRepaintsNothingThatStays() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    t.view.screen()->feed(numberedLines(1, 200));
+    QScrollBar *bar = t.view.verticalScrollBar();
+    bar->setValue(50);  // far back: no row of the screen in view
+    QTest::qWait(100);
+    const int before = t.view.paints();
+    const QString top = topRow(t.view);
+    t.view.screen()->feed(numberedLines(201, 210));
+    QTest::qWait(100);
+    QCOMPARE(topRow(t.view), top);
+    QCOMPARE(t.view.paints(), before);
+  }
+  void goingOnOrOffTheAlternateScreenShowsAtOnceAndDropsTheSelection() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    s->feed(numberedLines(1, 100));
+    wheel(t.view, t.view.viewport()->rect().center(), 1);
+    drag(t.view, at(t.view, 0, 0), at(t.view, 0, 3));  // in the scrollback
+    QCOMPARE(t.view.selectedText(), QString("line"));
+    s->feed("\x1b[?1047h");  // on: nothing to look back at, and that text is not shown
+    QCOMPARE(bar->maximum(), 0);
+    QCOMPARE(bar->value(), 0);
+    QCOMPARE(t.view.selectedText(), QString());
+    s->feed("\x1b[Halt");
+    drag(t.view, at(t.view, 0, 0), at(t.view, 0, 2));
+    QCOMPARE(t.view.selectedText(), QString("alt"));
+    s->feed("\x1b[?1047l");  // off: the scrollback again, at the bottom
+    QCOMPARE(bar->maximum(), s->scrollback());
+    QCOMPARE(bar->value(), bar->maximum());
+    QCOMPARE(t.view.selectedText(), QString());
+    s->feed("\x1b[?1049h");
+    QCOMPARE(bar->maximum(), 0);
+    s->feed("\x1b[?1049l");
+    QCOMPARE(bar->maximum(), s->scrollback());
+    s->feed("\x1b[?47h");  // libvterm 0.3.3 has no mode 47: the screen stays, and so does the view
+    QVERIFY(!s->altScreen());
+    QCOMPARE(bar->maximum(), s->scrollback());
+  }
+  void whileLookingBackTheWheelIsTheViews() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    QScrollBar *bar = t.view.verticalScrollBar();
+    s->feed(numberedLines(1, 100));
+    s->feed("\x1b[?1000h\x1b[?1006h");
+    bar->setValue(bar->maximum() - 6);  // looking back, by the scroll bar
+    QSignalSpy sent(s, &TermScreen::reply);
+    wheel(t.view, at(t.view, 2, 4), -1);  // down: three lines nearer the bottom
+    QCOMPARE(bar->value(), bar->maximum() - 3);
+    wheel(t.view, at(t.view, 2, 4), -1);
+    QCOMPARE(bar->value(), bar->maximum());
+    QCOMPARE(sentBy(sent), QByteArray());
+    wheel(t.view, at(t.view, 2, 4), 1);  // at the bottom it is the program's
+    QCOMPARE(sentBy(sent), QByteArray("\x1b[<64;5;3M"));
+    QCOMPARE(bar->value(), bar->maximum());
+  }
+  void atTheLimitTheLinesInViewAndTheSelectionStayUntilTheyLeave() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    QScrollBar *bar = t.view.verticalScrollBar();
+    const int limit = TermScreen::kScrollbackLimit;
+    s->feed(numberedLines(1, limit + 100));  // line 78 is the oldest left
+    QCOMPARE(s->scrollback(), limit);
+    bar->setValue(10);
+    QCOMPARE(topRow(t.view), QString("line 88"));
+    drag(t.view, at(t.view, 0, 0), at(t.view, 1, 6));
+    QCOMPARE(t.view.selectedText(), QString("line 88\nline 89"));
+    s->feed(numberedLines(limit + 101, limit + 105));  // five more leave: 88 is still there
+    QCOMPARE(bar->value(), 5);
+    QCOMPARE(topRow(t.view), QString("line 88"));
+    QCOMPARE(t.view.selectedText(), QString("line 88\nline 89"));
+    s->feed(numberedLines(limit + 106, limit + 115));  // and now it has left
+    QCOMPARE(bar->value(), 0);
+    QCOMPARE(topRow(t.view), QString("line 93"));
+    QCOMPARE(t.view.selectedText(), QString());
+  }
+  void clearingTheScrollbackWhileLookingBackComesBackToTheBottom() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    s->feed(numberedLines(1, 100));
+    wheel(t.view, t.view.viewport()->rect().center(), 1);
+    QCOMPARE(bar->value(), bar->maximum() - 3);
+    s->feed("\x1b[3J");
+    QCOMPARE(s->scrollback(), 0);
+    QCOMPARE(bar->maximum(), 0);
+    QCOMPARE(bar->value(), 0);
+    QCOMPARE(topRow(t.view), s->text(0));
+  }
+  void commandASelectsEverythingAndOutputDoesNotEndIt() {
+    KeptClipboard kept;
+    Term t;
+    QVERIFY(t.shown());
+    TermScreen *s = t.view.screen();
+    s->feed("old\r\n");
+    QVERIFY(commandKey(t.view, Qt::Key_A));
+    s->feed("new\r\n");  // output, over rows that are selected
+    QVERIFY(commandKey(t.view, Qt::Key_C));
+    QCOMPARE(QGuiApplication::clipboard()->text(), QString("old\nnew"));
+    const Picture pic(t.view);  // drawn as everything selected
+    QCOMPARE(pic.colour(pic.cells(10, 30).topLeft()), foreground);
+    mouse(t.view, QEvent::MouseButtonPress, at(t.view, 0, 0));  // a press ends it
+    mouse(t.view, QEvent::MouseButtonRelease, at(t.view, 0, 0));
+    QCOMPARE(t.view.selectedText(), QString());
+    QVERIFY(commandKey(t.view, Qt::Key_A));
+    const QPointF p(at(t.view, 3, 3));
+    QMouseEvent right(QEvent::MouseButtonPress, p, t.view.viewport()->mapToGlobal(p), Qt::RightButton,
+                      Qt::RightButton, Qt::NoModifier);
+    QApplication::sendEvent(t.view.viewport(), &right);  // any press
+    QCOMPARE(t.view.selectedText(), QString());
+    QMouseEvent rightUp(QEvent::MouseButtonRelease, p, t.view.viewport()->mapToGlobal(p), Qt::RightButton,
+                        Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(t.view.viewport(), &rightUp);
+    QVERIFY(commandKey(t.view, Qt::Key_A));
+    s->feed("\x1b[?1049h");  // and so does the alternate screen
+    QCOMPARE(t.view.selectedText(), QString());
   }
 };
 

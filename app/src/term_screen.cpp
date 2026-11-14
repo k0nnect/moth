@@ -79,10 +79,11 @@ TermScreen::TermScreen(int rows, int cols, QObject *parent) : QObject(parent) {
 TermScreen::~TermScreen() { vterm_free(vt_); }
 
 void TermScreen::feed(const QByteArray &bytes) {
-  pushed_ = false;
+  pushed_ = switched_ = false;
   const QPoint before = cursor();
   vterm_input_write(vt_, bytes.constData(), static_cast<size_t>(bytes.size()));
   vterm_screen_flush_damage(screen_);
+  if (switched_) emit altScreenChanged();
   if (pushed_) emit scrolled();
   const QPoint after = cursor();
   if (after != before) {  // the cursor is drawn, so its old and new rows need painting
@@ -304,7 +305,10 @@ int TermScreen::onSetTermProp(VTermProp prop, VTermValue *val, void *selfp) {
       self->cursorVisible_ = val->boolean;
       emit self->damaged(self->cursor().y(), self->cursor().y());
       break;
-    case VTERM_PROP_ALTSCREEN: self->altScreen_ = val->boolean; break;
+    case VTERM_PROP_ALTSCREEN:
+      self->switched_ = self->switched_ || self->altScreen_ != val->boolean;
+      self->altScreen_ = val->boolean;
+      break;
     case VTERM_PROP_MOUSE: self->mouse_ = val->number != VTERM_PROP_MOUSE_NONE; break;
     case VTERM_PROP_TITLE: {
       if (val->string.initial) self->titleBuf_.clear();
@@ -328,6 +332,9 @@ int TermScreen::onBell(void *self) {
 
 int TermScreen::onPushLine(int cols, const VTermScreenCell *cells, void *selfp) {
   auto *self = static_cast<TermScreen *>(selfp);
+  // libvterm pushes the rows of the screen shown: in a resize on the alternate screen those are the
+  // full-screen program's, which are not the shell's history
+  if (self->altScreen_) return 1;
   int used = cols;
   while (used > 0 && blankCell(cells[used - 1])) --used;
   self->history_.push_back(Line{{cells, cells + used}, self->pushedLineWrapped()});
@@ -341,10 +348,9 @@ int TermScreen::onPushLine(int cols, const VTermScreenCell *cells, void *selfp) 
 
 // whether the line libvterm is pushing into the history went on in the next. libvterm 0.3.3 gives
 // the cells and not the line's flags (a row's flag says it continues the row above), so they are read
-// where they stand, on the screen shown (the one whose rows libvterm pushes). In a scroll they have
-// already moved up with the rows: the line after the one going is on row 0 (right when one line
-// scrolls at a time, as output does; when several scroll at once, only for the last). In a resize
-// they have not moved, and the lines go from the top in order.
+// where they stand. In a scroll they have already moved up with the rows: the line after the one
+// going is on row 0 (right when one line scrolls at a time, as output does; when several scroll at
+// once, only for the last). In a resize they have not moved, and the lines go from the top in order.
 bool TermScreen::pushedLineWrapped() {
   if (resizingFrom_ == 0) return vterm_state_get_lineinfo(state_, 0)->continuation;
   const int next = ++resizePushes_;

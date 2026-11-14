@@ -51,9 +51,7 @@ private slots:
            "aaaaaaaaaabb\r\n"                                    // wraps
            "xxxxx yyy z\r\n" +                                   // wraps after a space
            QString::fromUtf8("aaaaaaaaa日\r\n").toUtf8());        // 日 does not fit: wraps
-    TermSelection sel;
-    sel.all(s);
-    QCOMPARE(sel.text(s), QString::fromUtf8("ab\naaaaaaaaaabb\nxxxxx yyy z\naaaaaaaaa日\n"));
+    QCOMPARE(dragged(s, {0, 0}, {7, 9}), QString::fromUtf8("ab\naaaaaaaaaabb\nxxxxx yyy z\naaaaaaaaa日\n"));
     QCOMPARE(dragged(s, {6, 1}, {6, 5}), QString::fromUtf8("日"));  // from its second half
     QCOMPARE(dragged(s, {5, 8}, {6, 0}), QString::fromUtf8("a日"));
     QCOMPARE(dragged(s, {0, 0}, {0, 9}), QString("ab"));
@@ -91,18 +89,27 @@ private slots:
     QCOMPARE(sel.text(s), QString("one two\nthree"));
     QCOMPARE(sel.last(), (TermPoint{1, 9}));
   }
-  void allIsTheScrollbackAndTheScreenButOnTheAlternateScreenItself() {
+  void everythingIsAllTheTextThereIsAsItGrows() {
     TermScreen s(3, 10);
     s.feed("1\r\n2\r\n3\r\n4\r\n5");  // 1 and 2 scroll off
     TermSelection sel;
-    sel.all(s);
-    QCOMPARE(sel.first(), (TermPoint{0, 0}));
-    QCOMPARE(sel.last(), (TermPoint{4, 9}));
+    sel.all();
+    QVERIFY(sel.everything());
+    QVERIFY(!sel.empty());
+    QVERIFY(sel.contains({0, 0}));
+    QVERIFY(sel.contains({1000, 9}));
     QCOMPARE(sel.text(s), QString("1\n2\n3\n4\n5"));
-    s.feed("\x1b[?1049h\x1b[Halt");
-    sel.all(s);
-    QCOMPARE(sel.first(), (TermPoint{2, 0}));
-    QCOMPARE(sel.text(s), QString("alt\n\n"));
+    s.feed("\r\n6\r\n");  // more, and an empty row under it: not copied
+    QCOMPARE(sel.text(s), QString("1\n2\n3\n4\n5\n6"));
+    s.feed("\x1b[?1049h\x1b[Halt");  // on the alternate screen, that screen alone
+    QCOMPARE(sel.text(s), QString("alt"));
+    sel.start(s, {0, 0}, Unit::Cell);  // a press ends it
+    QVERIFY(!sel.everything());
+    QVERIFY(sel.empty());
+    sel.all();
+    sel.clear();
+    QVERIFY(!sel.everything());
+    QVERIFY(sel.empty());
   }
   void linesAreCountedFromTheOldestSoASelectionStaysOnItsText() {
     TermScreen s(3, 10);
@@ -114,6 +121,22 @@ private slots:
     s.feed("\r\n4\r\n5");  // 1 and 2 scroll off
     QCOMPARE(s.scrollback(), 2);
     QCOMPARE(sel.text(s), QString("2\n3"));
+  }
+  void linesAreCountedFromTheFirstThereEverWasSoTheyHoldPastTheLimit() {
+    TermScreen s(3, 10);
+    QByteArray all;
+    for (int i = 1; i <= TermScreen::kScrollbackLimit + 5; ++i) all += QByteArray::number(i) + "\r\n";
+    s.feed(all);
+    QCOMPARE(s.linesDropped(), qint64(3));  // "1" to "3" have left
+    const qint64 oldest = TermSelection::topLine(s);
+    QCOMPARE(oldest, qint64(3));
+    QCOMPARE(TermSelection::rowOf(s, oldest), -TermScreen::kScrollbackLimit);
+    TermSelection sel;
+    sel.start(s, {oldest + 5, 0}, Unit::Line);
+    QCOMPARE(sel.text(s), QString("9"));
+    s.feed("more\r\nand more\r\n");  // two more leave
+    QCOMPARE(s.linesDropped(), qint64(5));
+    QCOMPARE(sel.text(s), QString("9"));
   }
 };
 

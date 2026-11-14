@@ -124,6 +124,7 @@ TerminalView::TerminalView(QWidget *parent) : QAbstractScrollArea(parent) {
   syncScrollBar();
   setFocusPolicy(Qt::StrongFocus);
   setAttribute(Qt::WA_InputMethodEnabled);
+  setAttribute(Qt::WA_NoMousePropagation);  // a wheel or click over the padding is not the window's
 
   repaint_.setSingleShot(true);
   repaint_.setInterval(kRepaintMs);
@@ -132,6 +133,7 @@ TerminalView::TerminalView(QWidget *parent) : QAbstractScrollArea(parent) {
   connect(&dragScroll_, &QTimer::timeout, this, &TerminalView::dragScroll);
   connect(screen_, &TermScreen::damaged, this, &TerminalView::screenDamaged);
   connect(screen_, &TermScreen::scrolled, this, &TerminalView::scrollbackChanged);
+  connect(screen_, &TermScreen::altScreenChanged, this, &TerminalView::altScreenChanged);
   connect(screen_, &TermScreen::reply, this, [this](const QByteArray &bytes) {
     if (pty_) pty_->write(bytes);
   });
@@ -196,9 +198,17 @@ QRect TerminalView::cursorRectangle() const {
 // --- looking back
 //
 // The view shows the screen's rows from -scrollPos_ on: row -1 is the newest line of the
-// scrollback. The scroll bar runs from the oldest line (0) to the bottom (scrollLimit()).
+// scrollback. The scroll bar runs from the oldest line (0) to the bottom (scrollLimit()). Lines are
+// counted as TermPoint counts them, from the first line there ever was.
 
-int TerminalView::topLine() const { return screen_->scrollback() - scrollPos_; }
+qint64 TerminalView::topLine() const {
+  return screen_->linesDropped() + screen_->scrollback() - scrollPos_;
+}
+
+int TerminalView::viewRow(qint64 line) const {
+  return static_cast<int>(std::clamp<qint64>(line - topLine(), -1, screen_->rows()));
+}
+
 int TerminalView::scrollLimit() const { return screen_->altScreen() ? 0 : screen_->scrollback(); }
 
 void TerminalView::scrollTo(int linesBack) {
@@ -226,32 +236,38 @@ void TerminalView::scrollContentsBy(int, int) {
 
 // lines went into the scrollback, or out of it (dropped past the limit, cleared, or taken back onto
 // the screen by a resize). A view at the bottom stays there; one looking back keeps its lines in
-// view, as far as there are lines to keep.
+// view, as far as there are lines to keep, and is repainted only when it could not (the lines it
+// shows from the screen were damaged where they changed). A selection keeps its text until its
+// first line has left.
 void TerminalView::scrollbackChanged() {
   const int lines = screen_->scrollback();
   const qint64 dropped = screen_->linesDropped();
-  if (dropped != dropped_) clearSelection();  // its lines, counted from the oldest, have moved
+  if (!selection_.empty() && !selection_.everything() && selection_.first().line < dropped) clearSelection();
   if (scrollPos_ > 0) {
-    const qint64 top = dropped_ + scrollback_ - scrollPos_;  // counted from the first line there ever was
-    scrollPos_ = static_cast<int>(std::clamp<qint64>(dropped + lines - top, 0, scrollLimit()));
-    damageAll();
+    const qint64 top = dropped_ + scrollback_ - scrollPos_;  // the line at the top of the view
+    const qint64 back = dropped + lines - top;                // how far back it is now
+    scrollPos_ = static_cast<int>(std::clamp<qint64>(back, 0, scrollLimit()));
+    if (scrollPos_ != back) damageAll();
   }
   scrollback_ = lines;
   dropped_ = dropped;
   syncScrollBar();
 }
 
-// rows of the screen changed: a selection over them goes, and they are painted where the view shows
-// them. On or off the alternate screen, the view is at the bottom
+// on or off the alternate screen: the view is at the bottom, with nothing selected
+void TerminalView::altScreenChanged() {
+  clearSelection();
+  scrollPos_ = 0;
+  syncScrollBar();
+  damageAll();
+}
+
+// rows of the screen changed: a selection over them goes (everything selected stays), and they are
+// painted where the view shows them
 void TerminalView::screenDamaged(int firstRow, int lastRow) {
-  if (screen_->altScreen() != altScreen_) {
-    altScreen_ = screen_->altScreen();
-    scrollPos_ = 0;
-    syncScrollBar();
-    damageAll();
-  }
-  const int sb = screen_->scrollback();
-  if (!selection_.empty() && selection_.first().line - sb <= lastRow && selection_.last().line - sb >= firstRow)
+  if (!selection_.empty() && !selection_.everything() &&
+      TermSelection::rowOf(*screen_, selection_.first().line) <= lastRow &&
+      TermSelection::rowOf(*screen_, selection_.last().line) >= firstRow)
     clearSelection();
   damage(firstRow + scrollPos_, lastRow + scrollPos_);
 }
@@ -323,7 +339,8 @@ void TerminalView::paintEvent(QPaintEvent *e) {
 // a row of the view as runs of cells that look the same, the cursor or the composition on it. The
 // cursor is drawn only while the view is at the bottom
 void TerminalView::paintRow(QPainter &p, int row) {
-  const int cols = screen_->cols(), line = topLine() + row;
+  const int cols = screen_->cols();
+  const qint64 line = topLine() + row;
   rowCells_.resize(static_cast<size_t>(cols));
   for (int col = 0; col < cols; ++col) rowCells_[static_cast<size_t>(col)] = screen_->cell(row - scrollPos_, col);
   const std::vector<TermCell> &cells = rowCells_;
@@ -443,7 +460,14 @@ void TerminalView::paintComposition(QPainter &p, int row) {
 }
 
 void TerminalView::focusInEvent(QFocusEvent *) { damageCursorRow(); }
-void TerminalView::focusOutEvent(QFocusEvent *) { damageCursorRow(); }
+
+// the release of a button held may never come (a dialog opened, another application came forward):
+// a drag ends here
+void TerminalView::focusOutEvent(QFocusEvent *) {
+  damageCursorRow();
+  dragScroll_.stop();
+  mouseOwner_ = MouseOwner::None;
+}
 
 // --- selecting
 
@@ -482,7 +506,7 @@ void TerminalView::extendSelection(TermPoint p) {
 
 void TerminalView::selectAll() {
   const TermSelection before = selection_;
-  selection_.all(*screen_);
+  selection_.all();
   selectionChanged(before);
 }
 
@@ -494,8 +518,10 @@ void TerminalView::clearSelection() {
 
 // the rows the selection covered and covers are painted again
 void TerminalView::selectionChanged(const TermSelection &before) {
-  for (const TermSelection *s : {&before, &std::as_const(selection_)})
-    if (!s->empty()) damage(s->first().line - topLine(), s->last().line - topLine());
+  for (const TermSelection *s : {&before, &std::as_const(selection_)}) {
+    if (s->everything()) damageAll();
+    else if (!s->empty()) damage(viewRow(s->first().line), viewRow(s->last().line));
+  }
 }
 
 // while a selecting drag is held past the top or the bottom, the view scrolls (the further out, the
@@ -524,7 +550,7 @@ TerminalView::MouseOwner TerminalView::takeMouse(Qt::KeyboardModifiers mods) {
 
 QPoint TerminalView::screenCellAt(QPoint pos) const {
   const TermPoint p = pointAt(pos);
-  return QPoint(p.col, std::max(0, p.line - screen_->scrollback()));
+  return QPoint(p.col, std::max(0, TermSelection::rowOf(*screen_, p.line)));
 }
 
 void TerminalView::reportMouse(QMouseEvent *e, bool pressed) {
@@ -534,11 +560,12 @@ void TerminalView::reportMouse(QMouseEvent *e, bool pressed) {
 
 void TerminalView::mousePressEvent(QMouseEvent *e) {
   e->accept();
-  if (takeMouse(e->modifiers()) == MouseOwner::Program) {
-    reportMouse(e, true);
+  const bool program = takeMouse(e->modifiers()) == MouseOwner::Program;
+  if (program || e->button() != Qt::LeftButton) {
+    clearSelection();  // a press ends a selection, whoever it is for (the view's left one starts another)
+    if (program) reportMouse(e, true);
     return;
   }
-  if (e->button() != Qt::LeftButton) return;
   dragPos_ = e->position().toPoint();
   const TermPoint p = pointAt(dragPos_);
   // a third press soon after a double click, on its cell: the row
@@ -587,26 +614,43 @@ void TerminalView::mouseReleaseEvent(QMouseEvent *e) {
   if (e->buttons() == Qt::NoButton) mouseOwner_ = MouseOwner::None;
 }
 
-// in lines: a trackpad's pixels, a line for each cell's height, and a wheel's notch three lines.
-// What is less than a step is kept for the next turn
+// The wheel looks back while the view is looking back. At the bottom it is a program's that asked
+// for the mouse, a step a notch at the cell under the pointer; on the alternate screen, with nothing
+// to look back at, the program's Up and Down; else it looks back.
+//
+// It turns in lines: a trackpad (a device whose turns come in phases) a line for each cell's height
+// of its pixels, a wheel three lines a notch of its angle (macOS gives a wheel pixels too, at its own
+// rate, which are not used). What is less than a step is kept for the next turn, if that goes the
+// same way and does the same.
 void TerminalView::wheelEvent(QWheelEvent *e) {
   e->accept();
-  const QPoint pixels = e->pixelDelta();
-  wheelLines_ += !pixels.isNull() ? qreal(pixels.y()) / cellH_
-                                  : qreal(e->angleDelta().y()) * kLinesPerNotch / kWheelNotch;
-  if (screen_->mouseWanted()) {  // the program's, a step a notch, at the cell under the pointer
-    const int steps = static_cast<int>(wheelLines_ / kLinesPerNotch);
-    wheelLines_ -= steps * kLinesPerNotch;
-    const QPoint cell = screenCellAt(e->position().toPoint());
-    screen_->wheel(cell.y(), cell.x(), steps);
-  } else if (screen_->altScreen()) {  // nothing to look back at: the program's Up and Down
-    const int keys = static_cast<int>(wheelLines_);
-    wheelLines_ -= keys;
-    for (int i = 0; i < std::abs(keys); ++i) screen_->key(keys > 0 ? Qt::Key_Up : Qt::Key_Down, Qt::NoModifier, {});
-  } else {
-    const int lines = static_cast<int>(wheelLines_);
-    wheelLines_ -= lines;
-    scrollTo(scrollPos_ + lines);
+  const WheelGoes goes = scrollPos_ > 0           ? WheelGoes::View
+                         : screen_->mouseWanted() ? WheelGoes::Program
+                         : screen_->altScreen()   ? WheelGoes::Keys
+                                                  : WheelGoes::View;
+  const bool trackpad = e->phase() != Qt::NoScrollPhase && !e->pixelDelta().isNull();
+  const qreal turned = trackpad ? qreal(e->pixelDelta().y()) / cellH_
+                                : qreal(e->angleDelta().y()) * kLinesPerNotch / kWheelNotch;
+  if (goes != wheelGoes_ || turned * wheelLines_ < 0) wheelLines_ = 0;
+  wheelGoes_ = goes;
+  wheelLines_ += turned;
+  const int lines = static_cast<int>(wheelLines_);  // toward zero
+  switch (goes) {
+    case WheelGoes::Program: {
+      const int steps = lines / kLinesPerNotch;
+      wheelLines_ -= steps * kLinesPerNotch;
+      const QPoint cell = screenCellAt(e->position().toPoint());
+      screen_->wheel(cell.y(), cell.x(), steps);
+      break;
+    }
+    case WheelGoes::Keys:
+      wheelLines_ -= lines;
+      for (int i = 0; i < std::abs(lines); ++i) screen_->key(lines > 0 ? Qt::Key_Up : Qt::Key_Down, Qt::NoModifier, {});
+      break;
+    case WheelGoes::View:
+      wheelLines_ -= lines;
+      scrollTo(scrollPos_ + lines);
+      break;
   }
 }
 

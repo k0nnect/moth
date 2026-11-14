@@ -161,6 +161,37 @@ private slots:
     QCOMPARE(t.s.text(-1), QString("eeeeeeeeee"));
     QVERIFY(t.s.wrapped(-1));
   }
+  void rowsPushedOnTheAlternateScreenAreDropped() {
+    Scr t(6, 10);
+    t.feed("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7");
+    const int before = t.s.scrollback();
+    QCOMPARE(before, 1);
+    // libvterm pushes the rows shown, the full-screen program's: they are not the history
+    t.feed("\x1b[?1049h\x1b[Hfull\r\nscreen\r\nprogram");
+    QSignalSpy scrolled(&t.s, &TermScreen::scrolled);
+    t.s.resize(2, 10);
+    QCOMPARE(t.s.scrollback(), before);
+    QCOMPARE(scrolled.count(), 0);
+    QCOMPARE(t.s.text(-1), QString("1"));
+  }
+  void goingOnAndOffTheAlternateScreenIsSaid() {
+    Scr t;
+    QSignalSpy changed(&t.s, &TermScreen::altScreenChanged);
+    t.feed("\x1b[?1049h");
+    QCOMPARE(changed.count(), 1);
+    t.feed("x\x1b[?1049h");  // already on
+    QCOMPARE(changed.count(), 1);
+    t.feed("\x1b[?1049l");
+    QCOMPARE(changed.count(), 2);
+    t.feed("\x1b[?1047h");  // 1047 too: the screen without the cursor saved
+    QCOMPARE(changed.count(), 3);
+    QVERIFY(t.s.altScreen());
+    t.feed("\x1b[?1047l");
+    QCOMPARE(changed.count(), 4);
+    t.feed("\x1b[?47h");  // libvterm 0.3.3 has no mode 47: nothing changes
+    QVERIFY(!t.s.altScreen());
+    QCOMPARE(changed.count(), 4);
+  }
   void alternateScreen() {
     Scr t;
     QByteArray all;
