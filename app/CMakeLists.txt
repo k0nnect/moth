@@ -11,11 +11,16 @@ add_compile_options(-Wall -Wextra)
 
 # qtbase only, linked dynamically; make passes -DCMAKE_PREFIX_PATH=$(brew --prefix qtbase)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Test)
+# libvterm (MIT, brew install libvterm) holds the terminal's screen state
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(VTERM REQUIRED IMPORTED_TARGET vterm)
 
 # the window's code without main(), which the program and every test link: one line per source file
 add_library(moth_window STATIC
   src/paths.cpp
   src/core_client.cpp
+  src/pty.cpp
+  src/term_screen.cpp
   src/board.cpp
   src/main_window.cpp
   src/game_bar.cpp
@@ -25,7 +30,7 @@ add_library(moth_window STATIC
   src/kept_panel.cpp
 )
 target_include_directories(moth_window PUBLIC src)
-target_link_libraries(moth_window PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network)
+target_link_libraries(moth_window PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network PkgConfig::VTERM)
 
 add_executable(moth-app src/main.cpp)
 target_link_libraries(moth-app PRIVATE moth_window)
@@ -50,6 +55,8 @@ set(MOTH_APP_TESTS
   test_search_bar
   test_results
   test_kept_panel
+  test_pty
+  test_term_screen
 )
 foreach(name IN LISTS MOTH_APP_TESTS)
   add_executable(${name} test/${name}.cpp)

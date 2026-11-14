@@ -4,7 +4,7 @@
 
 - OCaml 5.5.2 in a local opam switch (`_opam/`), with dune, yojson and alcotest.
 - C++20 with cmake (Makefiles generator, no ninja). Native build uses Apple clang. The Windows helper uses mingw-w64 from Homebrew (`x86_64-w64-mingw32-g++` and `i686-w64-mingw32-g++`).
-- The window uses Qt 6 from Homebrew's `qtbase` (`brew install qtbase`; 6.12 here), its Core, Gui, Widgets, Network and Test modules only, linked dynamically. `make` finds it with `brew --prefix qtbase`; set `QTBASE` to use another install.
+- The window uses Qt 6 from Homebrew's `qtbase` (`brew install qtbase`; 6.12 here), its Core, Gui, Widgets, Network and Test modules only, linked dynamically. The terminal's screen state comes from libvterm (MIT; `brew install libvterm`), which CMake finds through `pkg-config`. `make` finds it with `brew --prefix qtbase`; set `QTBASE` to use another install.
 - Nothing needs sudo. `opam init` runs with `--no-setup`, so no shell profile is touched.
 
 ## setup
