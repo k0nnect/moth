@@ -331,7 +331,8 @@ let other_build () =
 
 (* a service of the test's own on [home]/core.sock while [f] runs: each connection's one request
    goes to [answer], whose reply is sent back, and the connection is held until the client hangs
-   up. Gives [f]'s result and the requests, in the order they came. *)
+   up (a watch stays open while its client asks something else). Gives [f]'s result and the
+   requests, in the order they came. *)
 let with_fake_service ~home answer f =
   let path = Filename.concat home "core.sock" in
   let listener = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
@@ -354,15 +355,29 @@ let with_fake_service ~home answer f =
     | exception (End_of_file | Sys_error _) -> ());
     close_in_noerr ic
   in
+  let connections = ref [] in
   let th =
     Thread.create
       (fun () ->
         while not !over do
-          match Unix.select [ listener ] [] [] 0.05 with [], _, _ -> () | _ -> serve (fst (Unix.accept listener))
+          match Unix.select [ listener ] [] [] 0.05 with
+          | [], _, _ -> ()
+          | _ ->
+              let c, _ = Unix.accept listener in
+              connections := Thread.create serve c :: !connections
         done)
       ()
   in
-  let result = Fun.protect ~finally:(fun () -> over := true; Thread.join th; Unix.close listener; try Sys.remove path with Sys_error _ -> ()) f in
+  let result =
+    Fun.protect
+      ~finally:(fun () ->
+        over := true;
+        Thread.join th;
+        List.iter Thread.join !connections;
+        Unix.close listener;
+        try Sys.remove path with Sys_error _ -> ())
+      f
+  in
   (result, List.rev !seen)
 
 let id_of request = try Yojson.Safe.Util.member "id" request with Yojson.Safe.Util.Type_error _ -> `Null
@@ -420,6 +435,27 @@ let wait_ends_for_another_build () =
       check_str "nothing on stderr" "" err;
       Alcotest.(check (list string)) "one watch asked, nothing more" [ "watch" ] (List.map describe seen))
 
+(* the other way of finding out: a service that serves the watch but whose status gives no proto
+   (an older build) ends the waiter the same way *)
+let wait_ends_for_an_older_build () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      Unix.mkdir home 0o700;
+      Unix.mkdir (Filename.concat home "agent") 0o700;
+      let dir = Filename.concat (Filename.concat home "agent") (string_of_int (Unix.getpid ())) in
+      Unix.mkdir dir 0o700;
+      let answer request =
+        match cmd_of request with
+        | "watch" -> served request (`Assoc [ ("seq", `Int 7) ])
+        | "status" -> served request (`Assoc [ ("attached", `Bool false) ])
+        | _ -> refused request "not asked for in this test"
+      in
+      let (code, out, err, _), seen = with_fake_service ~home answer (fun () -> run ~limit:3. ~home ~tmphome:tmp [ "wait"; "--session"; dir ]) in
+      Alcotest.(check int) "exit 0 within 3 seconds" 0 code;
+      check_str "nothing on stdout" "" out;
+      check_str "nothing on stderr" "" err;
+      Alcotest.(check (list string)) "the watch, then its status read" [ "watch"; "status (unrecorded)" ] (List.map describe seen))
+
 (* the agent's own shell cannot start a second agent: refused before anything is written *)
 let not_from_the_agents_shell () =
   with_tmp (fun tmp ->
@@ -463,6 +499,7 @@ let () =
           Alcotest.test_case "service from another build" `Quick other_build;
           Alcotest.test_case "quiet is read after the seq" `Quick quiet_read_after_the_seq;
           Alcotest.test_case "a waiter refused as another build ends" `Quick wait_ends_for_another_build;
+          Alcotest.test_case "a waiter whose status is an older build's ends" `Quick wait_ends_for_an_older_build;
           Alcotest.test_case "not from the agent's own shell" `Quick not_from_the_agents_shell;
         ] );
     ]
