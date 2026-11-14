@@ -1,4 +1,6 @@
 #include <QCheckBox>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
@@ -35,10 +37,10 @@ public:
     save(name);
     qunsetenv(name);
   }
-  ~Env() {
-    for (const auto &[name, value] : saved_) {
-      if (value) qputenv(name, *value);
-      else qunsetenv(name);
+  ~Env() {  // newest first, so a name set twice ends up as it was before the first time
+    for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+      if (it->second) qputenv(it->first, *it->second);
+      else qunsetenv(it->first);
     }
   }
 
@@ -105,7 +107,15 @@ private slots:
   void pollsWhileShown();
   void pollingCanBeKeptOff();
   void theStaleSentenceStaysWhileSomeoneWorks();
+  void anEnvPutsBackWhatWasSetTwice();
   void theTerminalPathsAndEnvironment();
+  void theCommandAfterItCannotEatTheShellThatFollows();
+  void hidingAndShowingTheWindowDoesNotStartTheTerminalAgain();
+  void aTitleWithLineSeparatorsKeepsTheStripOneLine();
+  void whenTheShellEndedCommandCCopiesTheLastScreen();
+  void aRefusedOrFailedQuietLeavesTheBoxAndSaysWhy();
+  void theQuietBoxIsOutOfReachWhileStale();
+  void theTitleIsDrawnCutShort();
   void theWindowOpensWithTheColumnAndTheTerminal();
   void theTerminalRunsItsCommandThenAShellWithMothHome();
   void aMissingAgentLeavesAShellAndThePanelsWork();
@@ -227,15 +237,33 @@ void TestMainWindow::pollingCanBeKeptOff() {
   QCOMPARE(timesSeen(rig.fake, "status"), before);
 }
 
+void TestMainWindow::anEnvPutsBackWhatWasSetTwice() {
+  qunsetenv("MOTH_TEST_TWICE");
+  qputenv("MOTH_TEST_SET", "original");
+  {
+    Env env;
+    env.set("MOTH_TEST_TWICE", "one");
+    env.set("MOTH_TEST_TWICE", "two");
+    env.unset("MOTH_TEST_SET");
+    env.set("MOTH_TEST_SET", "x");
+    env.unset("MOTH_TEST_SET");
+    QVERIFY(!qEnvironmentVariableIsSet("MOTH_TEST_SET"));
+  }
+  QVERIFY(!qEnvironmentVariableIsSet("MOTH_TEST_TWICE"));
+  QCOMPARE(qgetenv("MOTH_TEST_SET"), QByteArray("original"));
+  qunsetenv("MOTH_TEST_SET");
+}
+
 void TestMainWindow::theTerminalPathsAndEnvironment() {
   {
     Env env;
     env.unset("MOTH_TERMINAL");
-    QCOMPARE(terminalCommand(), QString("moth agent"));
+    QCOMPARE(terminalCommand("/opt/my moth/moth"), QString("'/opt/my moth/moth' agent"));
+    QCOMPARE(terminalCommand("/opt/it's/moth"), QString("'/opt/it'\\''s/moth' agent"));
     env.set("MOTH_TERMINAL", "echo hi");
-    QCOMPARE(terminalCommand(), QString("echo hi"));
+    QCOMPARE(terminalCommand("/opt/moth"), QString("echo hi"));
     env.set("MOTH_TERMINAL", "");
-    QCOMPARE(terminalCommand(), QString());
+    QCOMPARE(terminalCommand("/opt/moth"), QString());
     env.unset("SHELL");
     QCOMPARE(userShell(), QString("/bin/zsh"));
     env.set("SHELL", "/bin/sh");
@@ -245,6 +273,12 @@ void TestMainWindow::theTerminalPathsAndEnvironment() {
   env.set("SHELL", "/bin/sh");
   env.set("MOTH_ACTOR", "agent");
   env.set("PATH", "/usr/bin:/bin");
+  for (const char *name : {"TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "ITERM_SESSION_ID", "CLAUDECODE",
+                           "CLAUDE_CODE_ENTRYPOINT"})
+    env.set(name, "from the launcher");
+  env.set("TERM_PROGRAM", "Apple_Terminal");
+  env.set("CLAUDE_CONFIG_DIR", "/keep/me");
+  env.set("ANTHROPIC_API_KEY", "keep");
   const QStringList vars = terminalEnv("/tmp/a home", "/opt/my moth/moth");
   QVERIFY(vars.contains("MOTH_HOME=/tmp/a home"));
   QVERIFY(vars.contains("MOTH_BIN=/opt/my moth/moth"));
@@ -253,6 +287,136 @@ void TestMainWindow::theTerminalPathsAndEnvironment() {
   QVERIFY(vars.contains("COLORTERM=truecolor"));
   QVERIFY(vars.contains("SHELL=/bin/sh"));
   for (const QString &v : vars) QVERIFY2(!v.startsWith("MOTH_ACTOR"), qPrintable(v));
+  // what belongs to the launching terminal or session is not passed on; the agent's sign-in is
+  for (const char *name : {"TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "ITERM_SESSION_ID", "CLAUDECODE",
+                           "CLAUDE_CODE_ENTRYPOINT"})
+    for (const QString &v : vars) QVERIFY2(!v.startsWith(QString(name) + "="), qPrintable(v));
+  QVERIFY(vars.contains("TERM_PROGRAM=moth"));
+  QVERIFY(vars.contains("CLAUDE_CONFIG_DIR=/keep/me"));
+  QVERIFY(vars.contains("ANTHROPIC_API_KEY=keep"));
+  // MOTH_BIN is passed on as an absolute path
+  QDir::setCurrent("/tmp");
+  QVERIFY(terminalEnv("/tmp/h", "rel/moth").contains("MOTH_BIN=" + QDir::currentPath() + "/rel/moth"));
+}
+
+// R20: whatever the command ends with, a shell follows
+void TestMainWindow::theCommandAfterItCannotEatTheShellThatFollows() {
+  for (const QString &command : {QString("echo one &"), QString("echo two;"), QString("echo three # a comment")}) {
+    Shell shell(command);
+    Rig rig;
+    QVERIFY(rig.ready());
+    MainWindow w(&rig.board);
+    w.setPolling(false);
+    showOffscreen(w);
+    TerminalView *t = w.terminal();
+    QVERIFY(t);
+    QVERIFY2(prompted(t), qPrintable(command + "\n" + screenText(*t)));
+    QVERIFY2(!screenText(*t).contains("syntax error"), qPrintable(screenText(*t)));
+    QVERIFY(t->running());
+  }
+}
+
+void TestMainWindow::hidingAndShowingTheWindowDoesNotStartTheTerminalAgain() {
+  Shell shell("");
+  Rig rig;
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  showOffscreen(w);
+  TerminalView *t = w.terminal();
+  QVERIFY(prompted(t));
+  const qint64 pid = t->pid();
+  w.hide();
+  w.show();
+  QTest::qWait(300);
+  QCOMPARE(w.terminal(), t);
+  QCOMPARE(t->pid(), pid);
+  QVERIFY(t->running());
+}
+
+void TestMainWindow::aTitleWithLineSeparatorsKeepsTheStripOneLine() {
+  Shell shell("");
+  Rig rig;
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  showOffscreen(w);
+  auto *title = w.findChild<QLabel *>("terminalTitle");
+  QVERIFY(prompted(w.terminal()));
+  w.terminal()->screen()->feed("\x1b]2;one\x07");
+  const int one = title->height(), rows = w.terminal()->screen()->rows();
+  w.terminal()->screen()->feed("\x1b]2;two\xe2\x80\xa8" "three\xe2\x80\xa9" "four\x07");
+  QCoreApplication::processEvents();
+  QCOMPARE(title->text(), QString("two three four"));
+  QCOMPARE(title->height(), one);
+  QCOMPARE(w.terminal()->screen()->rows(), rows);
+}
+
+void TestMainWindow::whenTheShellEndedCommandCCopiesTheLastScreen() {
+  Shell shell("");
+  Rig rig;
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  showOffscreen(w);
+  TerminalView *t = w.terminal();
+  QVERIFY(prompted(t));
+  type(t, "echo marker");
+  QVERIFY(shows(t, "marker"));
+  type(t, "exit");
+  QTRY_VERIFY(!t->running());
+  int row = -1;
+  for (int r = 0; r < t->screen()->rows() && row < 0; ++r)
+    if (t->screen()->text(r).startsWith("marker")) row = r;
+  QVERIFY(row >= 0);
+  const QString before = QGuiApplication::clipboard()->text();
+  QGuiApplication::clipboard()->setText("untouched");
+  const int cellH = t->viewport()->height() / t->screen()->rows();
+  QTest::mouseDClick(t->viewport(), Qt::LeftButton, {}, QPoint(3, row * cellH + cellH / 2));
+  QCOMPARE(t->selectedText(), QString("marker"));
+  QTest::keyClick(t, Qt::Key_C, Qt::ControlModifier);  // Command, as Qt reports it on macOS
+  QCOMPARE(QGuiApplication::clipboard()->text(), QString("marker"));
+  QVERIFY(!t->running());  // nothing else started
+  QGuiApplication::clipboard()->setText(before);
+}
+
+// a refused `quiet on` (the board is working) and a failed one leave the box as it was and say why
+void TestMainWindow::aRefusedOrFailedQuietLeavesTheBoxAndSaysWhy() {
+  Shell shell("");
+  Rig rig;
+  rig.fake.statusAsWritten();
+  rig.fake.on("status", [](const QStringList &, const Opts &) {
+    return Reply{true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}, {"proto", 2}, {"quiet", false}},
+                 "not attached", ""};
+  });
+  rig.fake.on("quiet", [](const QStringList &, const Opts &) { return Reply{false, QJsonValue(), "", "quiet is broken"}; });
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  showOffscreen(w);
+  auto *box = w.findChild<QCheckBox *>("quiet");
+  auto *line = w.findChild<QLabel *>("line");
+  QTRY_VERIFY(box->isEnabled());
+  QVERIFY(!box->isChecked());
+  // answered with an error
+  QTest::mouseClick(box, Qt::LeftButton, {}, box->rect().center());
+  QTRY_COMPARE(timesSeen(rig.fake, "quiet"), 1);
+  QTRY_COMPARE(line->text(), QString("quiet is broken"));
+  QVERIFY(!box->isChecked());
+  // refused: one of the user's own requests is unanswered, and the box sends nothing
+  rig.fake.on("find", [](const QStringList &, const Opts &) { return Reply{true, QJsonObject{{"main", 5}}, "5 matches", ""}; });
+  rig.fake.hold("find");
+  QVERIFY(rig.board.run("find", {"100"}));
+  QTRY_COMPARE(timesSeen(rig.fake, "find"), 1);
+  QTRY_VERIFY(!box->isEnabled());  // out of reach, so forced within it: a click that gets through is refused
+  box->setEnabled(true);
+  QTest::mouseClick(box, Qt::LeftButton, {}, box->rect().center());
+  QCOMPARE(timesSeen(rig.fake, "quiet"), 1);
+  // the board says it is busy; the window's line, while something works, shows what works
+  QCOMPARE(rig.board.line(), QString("moth is busy: find 100"));
+  QCOMPARE(line->text(), QString::fromUtf8("working: find 100 (user)…"));
+  QVERIFY(!box->isChecked());
+  rig.fake.release("find");
 }
 
 void TestMainWindow::theWindowOpensWithTheColumnAndTheTerminal() {
@@ -304,11 +468,15 @@ void TestMainWindow::theTerminalRunsItsCommandThenAShellWithMothHome() {
 void TestMainWindow::aMissingAgentLeavesAShellAndThePanelsWork() {
   const QString sentence =
       "claude code is not installed, or not on PATH. moth works without it: use the window, or type moth commands here.";
-  Shell shell("moth agent");
+  Shell shell("");
+  shell.env.unset("MOTH_TERMINAL");  // the default command: moth by its full path, then `agent`
+  shell.env.set("MOTH_CLAUDE", "/usr/bin/false");  // a second guard: no real agent whatever runs
   QTemporaryDir bin("/tmp/moth-bin-XXXXXX");
   QFile stub(bin.path() + "/moth");
   QVERIFY(stub.open(QIODevice::WriteOnly));
-  stub.write("#!/bin/sh\nif [ \"$1\" = agent ]; then echo '" + sentence.toUtf8() + "'; exit 1; fi\n");
+  const QString marker = bin.path() + "/ran";
+  stub.write("#!/bin/sh\nif [ \"$1\" = agent ]; then : > '" + marker.toUtf8() + "'; echo '" + sentence.toUtf8() +
+             "'; exit 1; fi\n");
   stub.close();
   stub.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
   shell.env.set("MOTH_BIN", (bin.path() + "/moth").toUtf8());
@@ -336,6 +504,7 @@ void TestMainWindow::aMissingAgentLeavesAShellAndThePanelsWork() {
   QVERIFY2(QTest::qWaitFor([&] { return flat(screenText(*t)).contains(flat(sentence)); }, 5000), qPrintable(screenText(*t)));
   QVERIFY(prompted(t));
   QVERIFY(t->running());
+  QVERIFY2(QFile::exists(marker), "the stand-in moth was not the one run");
 
   auto *number = w.findChild<QLineEdit *>("number");
   QVERIFY(number);
@@ -426,6 +595,58 @@ void TestMainWindow::theQuietBoxIsOutOfReachWhileBusy() {
   rig.fake.push({{"event", QJsonObject{{"seq", 1}, {"actor", "agent"}, {"cmd", "find"}, {"args", QJsonArray{"100"}},
                                        {"ok", true}, {"summary", "done"}}}});
   QTRY_VERIFY(box->isEnabled());
+}
+
+void TestMainWindow::theQuietBoxIsOutOfReachWhileStale() {
+  Shell shell("");
+  Rig rig;
+  rig.fake.statusAsWritten();
+  rig.fake.on("status", [](const QStringList &, const Opts &) {
+    return Reply{true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}, {"proto", 1}}, "not attached", ""};
+  });
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  showOffscreen(w);
+  auto *box = w.findChild<QCheckBox *>("quiet");
+  rig.board.tick();
+  QTRY_VERIFY(rig.board.stale());
+  QTRY_VERIFY(!box->isEnabled());
+  QTest::mouseClick(box, Qt::LeftButton, {}, box->rect().center());
+  QCOMPARE(timesSeen(rig.fake, "quiet"), 0);
+}
+
+// what is painted is the title cut short with an ellipsis, not the whole title run off the edge
+void TestMainWindow::theTitleIsDrawnCutShort() {
+  Shell shell("");
+  Rig rig;
+  QVERIFY(rig.ready());
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  showOffscreen(w);
+  auto *title = w.findChild<QLabel *>("terminalTitle");
+  QVERIFY(prompted(w.terminal()));
+  w.terminal()->screen()->feed("\x1b]2;" + QByteArray(2000, 'x') + "\x07");
+  QCoreApplication::processEvents();
+  QImage img(title->size(), QImage::Format_ARGB32);
+  img.fill(Qt::transparent);
+  title->render(&img);
+  // the right edge is blank where a whole title would still be drawn, and the ellipsis is inked
+  const QString shown = title->fontMetrics().elidedText(title->text(), Qt::ElideRight, title->contentsRect().width());
+  QVERIFY(shown.endsWith(QString::fromUtf8("…")));
+  QVERIFY(shown.size() < title->text().size());
+  QVERIFY(title->fontMetrics().horizontalAdvance(title->text()) > title->width() * 4);
+  // no ink in the last pixel column beyond what the elided text takes: the ellipsis ends inside the label
+  const QRgb ground = img.pixel(0, 0);
+  bool inkAtEdge = false;
+  for (int y = 0; y < img.height(); ++y)
+    if (img.pixel(img.width() - 1, y) != ground) inkAtEdge = true;
+  QVERIFY(!inkAtEdge);
+  bool inked = false;
+  for (int y = 0; y < img.height() && !inked; ++y)
+    for (int x = img.width() / 2; x < img.width(); ++x)
+      if (img.pixel(x, y) != ground) { inked = true; break; }
+  QVERIFY(inked);
 }
 
 void TestMainWindow::closingTheWindowHangsUpOnWhatRuns() {

@@ -18,8 +18,11 @@ QString mothBin() {
   return bin.isEmpty() ? QCoreApplication::applicationDirPath() + "/moth" : bin;
 }
 
-QString terminalCommand() {
-  return qEnvironmentVariableIsSet("MOTH_TERMINAL") ? qEnvironmentVariable("MOTH_TERMINAL") : "moth agent";
+QString terminalCommand(const QString &mothBin) {
+  if (qEnvironmentVariableIsSet("MOTH_TERMINAL")) return qEnvironmentVariable("MOTH_TERMINAL");
+  QString path = QFileInfo(mothBin).absoluteFilePath();
+  path.replace('\'', "'\\''");
+  return "'" + path + "' agent";
 }
 
 QString userShell() {
@@ -30,13 +33,19 @@ QString userShell() {
 QStringList terminalEnv(const QString &home, const QString &mothBin) {
   QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
   env.insert("MOTH_HOME", home);
-  env.insert("MOTH_BIN", mothBin);
+  const QFileInfo bin(mothBin);
+  env.insert("MOTH_BIN", bin.absoluteFilePath());
   const QString path = env.value("PATH");
-  const QString folder = QFileInfo(mothBin).absolutePath();
+  const QString folder = bin.absolutePath();
   env.insert("PATH", path.isEmpty() ? folder : folder + ':' + path);
   env.insert("SHELL", userShell());
   env.insert("TERM", "xterm-256color");
   env.insert("COLORTERM", "truecolor");
   env.remove("MOTH_ACTOR");
+  // what belongs to the terminal or the session that started the app is not this terminal's
+  for (const char *name : {"TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "ITERM_SESSION_ID", "CLAUDECODE",
+                           "CLAUDE_CODE_ENTRYPOINT"})
+    env.remove(name);
+  env.insert("TERM_PROGRAM", "moth");
   return env.toStringList();
 }

@@ -647,6 +647,7 @@ void TestResults::itIsThirdInTheWindowsColumn() {
   Rig rig;
   QVERIFY(rig.ready());
   MainWindow w(&rig.board);
+  w.setTerminal(false);
   w.setPolling(false);
   auto *panel = w.findChild<ResultsPanel *>("resultsPanel");
   QVERIFY(panel);

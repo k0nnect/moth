@@ -389,6 +389,7 @@ void TestGameBar::itIsFirstInTheWindowsColumn() {
   Rig rig;
   QVERIFY(rig.ready());
   MainWindow w(&rig.board);
+  w.setTerminal(false);
   w.setPolling(false);
   auto *bar = w.findChild<GameBar *>("gameBar");
   QVERIFY(bar);

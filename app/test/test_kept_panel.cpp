@@ -297,6 +297,7 @@ void TestKeptPanel::itIsLastInTheWindowsColumn() {
   Rig rig;
   QVERIFY(rig.ready());
   MainWindow w(&rig.board);
+  w.setTerminal(false);
   w.setPolling(false);
   auto *panel = w.findChild<KeptPanel *>("keptPanel");
   QVERIFY(panel);

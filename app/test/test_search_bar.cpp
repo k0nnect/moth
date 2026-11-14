@@ -312,6 +312,7 @@ void TestSearchBar::itIsSecondInTheWindowsColumn() {
   Rig rig;
   QVERIFY(rig.ready());
   MainWindow w(&rig.board);
+  w.setTerminal(false);
   w.setPolling(false);
   auto *bar = w.findChild<SearchBar *>("searchBar");
   QVERIFY(bar);

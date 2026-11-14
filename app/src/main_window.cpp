@@ -2,6 +2,7 @@
 
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
@@ -35,10 +36,19 @@ protected:
   void paintEvent(QPaintEvent *) override {
     QPainter p(this);
     p.setPen(palette().color(foregroundRole()));
-    p.drawText(contentsRect(), Qt::AlignLeft | Qt::AlignVCenter,
+    p.drawText(contentsRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine,
                fontMetrics().elidedText(text(), Qt::ElideRight, contentsRect().width()));
   }
 };
+
+// the modifier Qt reports for Command: Control, unless the application keeps Control and Meta as they are
+Qt::KeyboardModifier commandModifier() {
+#ifdef Q_OS_MACOS
+  return QCoreApplication::testAttribute(Qt::AA_MacDontSwapCtrlAndMeta) ? Qt::MetaModifier : Qt::ControlModifier;
+#else
+  return Qt::NoModifier;
+#endif
+}
 
 }  // namespace
 
@@ -80,11 +90,7 @@ QVBoxLayout *MainWindow::column() { return column_; }
 TerminalView *MainWindow::terminal() { return terminal_; }
 
 void MainWindow::setTerminal(bool on) {
-  wantTerminal_ = on;
-  if (on && !pane_) {
-    buildTerminal();
-    if (isVisible()) startTerminal();
-  } else if (!on && pane_) {
+  if (!on && pane_) {
     dropTerminal();
     resize(560, 860);
   }
@@ -139,9 +145,9 @@ void MainWindow::dropTerminal() {
 
 void MainWindow::startTerminal() {
   if (!terminal_ || terminal_->running()) return;
-  const QString shell = userShell(), command = terminalCommand();
+  const QString shell = userShell(), command = terminalCommand(mothBin());
   QStringList args{"-l", "-i"};
-  if (!command.isEmpty()) args << "-c" << command + "; exec \"$SHELL\" -l -i";
+  if (!command.isEmpty()) args << "-c" << command + "\nexec \"$SHELL\" -l -i";
   QString home = qEnvironmentVariable("HOME");
   if (home.isEmpty()) home = "/";
   started_ = true;
@@ -151,7 +157,10 @@ void MainWindow::startTerminal() {
 }
 
 void MainWindow::showTitle() {
-  const QString title = terminal_->screen()->title();
+  QString title = terminal_->screen()->title();
+  // a line or paragraph separator, or any control character, would make the strip two lines tall
+  for (QChar &c : title)
+    if (c == QChar::LineSeparator || c == QChar::ParagraphSeparator || c.category() == QChar::Other_Control) c = ' ';
   if (!ended_) title_->setText(title.isEmpty() ? "terminal" : title);
 }
 
@@ -166,10 +175,7 @@ void MainWindow::syncQuiet() {
 // a click asks the board; the box stays as it was until the board says otherwise
 void MainWindow::quietClicked(bool on) {
   syncQuiet();
-  if (!board_->run("quiet", {on ? "on" : "off"}, {}, [this](const Reply &r) {
-        if (!r.ok) syncQuiet();
-      }))
-    syncQuiet();
+  board_->run("quiet", {on ? "on" : "off"});
 }
 
 void MainWindow::setPolling(bool on) {
@@ -198,11 +204,13 @@ void MainWindow::closeEvent(QCloseEvent *e) {
   QMainWindow::closeEvent(e);
 }
 
-// Return in a terminal whose shell has ended starts it again; any other key does nothing
+// In a terminal whose shell has ended Return starts it again, Command+C and Command+A go to the
+// view as usual (the last screen can be copied), and any other key does nothing
 bool MainWindow::eventFilter(QObject *watched, QEvent *e) {
   if (watched == terminal_ && ended_ && e->type() == QEvent::KeyPress) {
-    const int key = static_cast<QKeyEvent *>(e)->key();
-    if (key == Qt::Key_Return || key == Qt::Key_Enter) startTerminal();
+    const auto *k = static_cast<QKeyEvent *>(e);
+    if (k->key() == Qt::Key_Return || k->key() == Qt::Key_Enter) startTerminal();
+    else if ((k->key() == Qt::Key_C || k->key() == Qt::Key_A) && k->modifiers() == commandModifier()) return false;
     return true;
   }
   return QMainWindow::eventFilter(watched, e);

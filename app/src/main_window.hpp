@@ -18,7 +18,7 @@ class TerminalView;
 // The terminal starts, once, when the window is first shown: in the user's home folder, the
 // user's shell running `moth agent` (MOTH_TERMINAL) and then a shell again, so that when the agent
 // ends or cannot start a shell with `moth` on its PATH is left. When that shell ends the view keeps
-// its last screen, the strip says so and Return in the view starts it again. Closing the window
+// its last screen, the strip says so and Return in the view starts it again (Command+C and Command+A still copy and select, any other key does nothing). Closing the window
 // destroys the terminal first, so its child and its process group are hung up on at once.
 class MainWindow : public QMainWindow {
 public:
@@ -26,8 +26,9 @@ public:
   ~MainWindow() override;
   QVBoxLayout *column();      // where the panels go, top to bottom
   TerminalView *terminal();   // null with the terminal off, and once the window is closed
-  // on (the default): the terminal is there and starts when the window is first shown. off, for
-  // tests of the panels alone: no terminal, nothing started, and the window is the column's width
+  // the terminal is there by default and starts when the window is first shown. setTerminal(false),
+  // for tests of the panels alone, removes it for good: nothing is started, and the window is the
+  // column's width. setTerminal(true) does nothing (a removed terminal is not brought back)
   void setTerminal(bool on);
   // on (the default): while the window is visible, Board::tick() runs on showing and then every
   // second. off: never; for tests that count requests
@@ -57,7 +58,6 @@ private:
   QLabel *title_ = nullptr;
   QCheckBox *quiet_ = nullptr;
   TerminalView *terminal_ = nullptr;
-  bool wantTerminal_ = true;
   bool started_ = false;      // the terminal has been started once
   bool ended_ = false;        // its shell ended: Return starts it again
   QTimer poll_;
