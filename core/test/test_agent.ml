@@ -162,7 +162,8 @@ let command_shape () =
 
 (* ---- the real moth agent, with a stand-in for claude ---- *)
 
-let run ?(env = []) ?cwd ~home ~tmphome args =
+(* with [limit], a program still running after that many seconds is killed (exit -1) *)
+let run ?(env = []) ?cwd ?limit ~home ~tmphome args =
   let err = Filename.concat tmphome "stderr.txt" and out = Filename.concat tmphome "stdout.txt" in
   let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
   let o = Unix.openfile out [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
@@ -180,7 +181,23 @@ let run ?(env = []) ?cwd ~home ~tmphome args =
         Fun.protect ~finally:(fun () -> Sys.chdir old) (fun () -> Unix.create_process_env exe (Array.of_list (exe :: args)) env null o e)
   in
   List.iter Unix.close [ null; o; e ];
-  let _, st = Unix.waitpid [] pid in
+  let st =
+    match limit with
+    | None -> snd (Unix.waitpid [] pid)
+    | Some l ->
+        let deadline = Unix.gettimeofday () +. l in
+        let rec go () =
+          match Unix.waitpid [ Unix.WNOHANG ] pid with
+          | 0, _ when Unix.gettimeofday () < deadline ->
+              Unix.sleepf 0.05;
+              go ()
+          | 0, _ ->
+              Unix.kill pid Sys.sigkill;
+              snd (Unix.waitpid [] pid)
+          | _, st -> st
+        in
+        go ()
+  in
   ((match st with Unix.WEXITED n -> n | _ -> -1), String.trim (read out), String.trim (read err), pid)
 
 let stop_service ~home ~tmphome =
@@ -382,6 +399,27 @@ let quiet_read_after_the_seq () =
       Alcotest.(check (list string)) "status, the watch, then status unrecorded" [ "status"; "watch"; "status (unrecorded)" ] (List.map describe seen);
       check_str "the cursor: the watch's seq, the second status's quiet" "7 quiet" (read (Filename.concat (Filename.concat (Filename.concat home "agent") (string_of_int pid)) "cursor")))
 
+(* a waiter whose watch the service refuses as from another build ends at once, saying nothing,
+   instead of asking again every second *)
+let wait_ends_for_another_build () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      Unix.mkdir home 0o700;
+      Unix.mkdir (Filename.concat home "agent") 0o700;
+      (* a session that is alive: the test's own pid *)
+      let dir = Filename.concat (Filename.concat home "agent") (string_of_int (Unix.getpid ())) in
+      Unix.mkdir dir 0o700;
+      let answer request =
+        match cmd_of request with
+        | "status" -> served request (`Assoc [ ("attached", `Bool false); ("proto", `Int (Daemon.protocol + 1)); ("quiet", `Bool false) ])
+        | _ -> refused request Daemon.other_build
+      in
+      let (code, out, err, _), seen = with_fake_service ~home answer (fun () -> run ~limit:3. ~home ~tmphome:tmp [ "wait"; "--session"; dir ]) in
+      Alcotest.(check int) "exit 0 within 3 seconds" 0 code;
+      check_str "nothing on stdout" "" out;
+      check_str "nothing on stderr" "" err;
+      Alcotest.(check (list string)) "one watch asked, nothing more" [ "watch" ] (List.map describe seen))
+
 (* the agent's own shell cannot start a second agent: refused before anything is written *)
 let not_from_the_agents_shell () =
   with_tmp (fun tmp ->
@@ -424,6 +462,7 @@ let () =
           Alcotest.test_case "program that cannot run" `Quick exec_fails;
           Alcotest.test_case "service from another build" `Quick other_build;
           Alcotest.test_case "quiet is read after the seq" `Quick quiet_read_after_the_seq;
+          Alcotest.test_case "a waiter refused as another build ends" `Quick wait_ends_for_another_build;
           Alcotest.test_case "not from the agent's own shell" `Quick not_from_the_agents_shell;
         ] );
     ]

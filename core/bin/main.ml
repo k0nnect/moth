@@ -103,9 +103,10 @@ let answer_limit () = match Option.bind (Sys.getenv_opt "MOTH_WAIT_TIMEOUT") flo
    person has done something (see Wait) prints the note to stderr and exits 2, which wakes the
    agent: 2 means that and nothing else. Every other end is exit 0 with nothing printed: the
    session is gone (its pid, the folder's name, is not alive, or the folder is), a newer waiter
-   took over [dir]/waiter, or the service is from another build. It never starts a service: with
-   none answering (or none answering in time) it asks again every second, and goes on telling
-   what it holds meanwhile. *)
+   took over [dir]/waiter, or the service is from another build (its status gives another proto,
+   or it refuses the watch with Daemon.other_build). It never starts a service: with none
+   answering (or none answering in time) it asks again every second, and goes on telling what it
+   holds meanwhile. *)
 let wait ~session =
   let home = Client.home () in
   let limit = answer_limit () in
@@ -189,7 +190,10 @@ let wait ~session =
     ignore (look ());
     (match (!w, cursor_file ()) with None, Some (c, quiet) -> w := Some (Wait.start ~cursor:c ~quiet) | _ -> ());
     let after = Option.map Wait.cursor !w in
-    ignore (Client.watch ~home ?after ~timeout:limit ~started ~idle:look feed);
+    (match Client.watch ~home ?after ~timeout:limit ~started ~idle:look feed with
+    (* a service from another build refuses the watch itself, whatever its status would say *)
+    | Error e when e = Daemon.other_build -> exit 0
+    | _ -> ());
     Option.iter Wait.dropped !w;
     ignore (look ());
     nap ();

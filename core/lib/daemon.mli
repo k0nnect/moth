@@ -52,3 +52,6 @@ val default_launch : home:string -> launch
 (** the client protocol number [status --json] gives as [proto] (a service that gives none is 1),
     and that every request and watch must carry as [proto] *)
 val protocol : int
+
+(** the error a request or watch gets when it does not carry this build's [proto] *)
+val other_build : string
