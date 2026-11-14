@@ -42,6 +42,15 @@ winsize sizeOf(int rows, int cols) {
 Pty::Pty(QObject *parent) : QObject(parent) {}
 
 Pty::~Pty() {
+  // The terminal's foreground group, read while the line is still ours. A job of an interactive
+  // shell (the agent) runs in a group of its own, which the shell's own end does not take with
+  // it; it is treated as the shell's group is. Not a real group (the call failed, or init's), the
+  // shell's own or ours: left alone.
+  pid_t job = -1;
+  if (master_ >= 0 && pid_ > 0) {
+    job = tcgetpgrp(master_);
+    if (job <= 1 || job == pid_ || job == getpgrp()) job = -1;
+  }
   // Let go of the line first. On macOS a session leader's exit waits for the tty's output to be
   // read, so with unread output the child cannot be reaped until the master is closed; closing it
   // also hangs up the line.
@@ -53,24 +62,33 @@ Pty::~Pty() {
   if (pid_ <= 0) return;
   int status = 0;
   // ECHILD: already reaped (the child's exit was seen), so there is nothing to signal or wait for
-  auto reaped = [&] {
-    const pid_t r = waitpid(pid_, &status, WNOHANG);
-    return r == pid_ || (r < 0 && errno == ECHILD);
+  bool shellGone = false;
+  auto gone = [&] {
+    if (!shellGone) {
+      const pid_t r = waitpid(pid_, &status, WNOHANG);
+      shellGone = r == pid_ || (r < 0 && errno == ECHILD);
+    }
+    // the job's group is gone when no process is left in it
+    return shellGone && (job < 0 || (kill(-job, 0) != 0 && errno == ESRCH));
   };
-  bool gone = reaped();
-  if (!gone) {
-    kill(-pid_, SIGHUP);
-    kill(-pid_, SIGCONT);  // a stopped child would not see the hangup
-    for (int waited = 0; waited < 500 && !gone; waited += 5) {
-      gone = reaped();
-      if (!gone) usleep(5000);
+  auto signalBoth = [&](int sig) {
+    if (!shellGone) kill(-pid_, sig);
+    if (job > 0) kill(-job, sig);
+  };
+  bool over = gone();
+  if (!over) {
+    signalBoth(SIGHUP);
+    signalBoth(SIGCONT);  // a stopped child would not see the hangup
+    for (int waited = 0; waited < 500 && !over; waited += 5) {
+      over = gone();
+      if (!over) usleep(5000);
     }
   }
-  if (!gone) {
-    kill(-pid_, SIGKILL);
-    for (int waited = 0; waited < 1000 && !gone; waited += 5) {  // never wait for ever
-      gone = reaped();
-      if (!gone) usleep(5000);
+  if (!over) {
+    signalBoth(SIGKILL);
+    for (int waited = 0; waited < 1000 && !over; waited += 5) {  // never wait for ever
+      over = gone();
+      if (!over) usleep(5000);
     }
   }
 }

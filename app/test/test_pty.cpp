@@ -135,6 +135,39 @@ private slots:
     }
     QVERIFY(!left);
   }
+  // an interactive shell runs a job in a group of its own, with the terminal; a job that ignores the
+  // hang-up (as an agent might) still goes with the Pty, though the shell itself dies of it at once
+  void aForegroundJobThatIgnoresHangupIsKilled() {
+    QTemporaryDir home("/tmp/moth-pty-XXXXXX");
+    QVERIFY(home.isValid());
+    auto r = std::make_unique<Run>();
+    QVERIFY(r->start("/bin/sh", {"-i"}, 24, 80, plainEnv + QStringList{"HOME=" + home.path()}));
+    const qint64 shell = r->pty.pid();
+    QVERIFY2(r->waitOut("$ "), r->out.constData());
+    r->pty.write("/bin/sh -c 'trap \"\" HUP; echo \"deaf <$$>\"; exec /bin/sleep 296'\n");
+    QVERIFY2(r->waitOut(">\r\n"), r->out.constData());
+    const QRegularExpressionMatch m = QRegularExpression("deaf <(\\d+)>").match(QString::fromLatin1(r->out));
+    QVERIFY2(m.hasMatch(), r->out.constData());
+    const qint64 job = m.captured(1).toLongLong();
+    QProcess ps;
+    ps.start("/bin/ps", {"-o", "pgid=,tpgid=", "-p", QString::number(job)});
+    QVERIFY(ps.waitForFinished());
+    const QStringList ids = QString::fromLatin1(ps.readAllStandardOutput()).split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+    QCOMPARE(ids.size(), 2);
+    QCOMPARE(ids[0], QString::number(job));  // a group of its own
+    QCOMPARE(ids[1], ids[0]);                // which has the terminal
+    QElapsedTimer t;
+    t.start();
+    r.reset();
+    QVERIFY2(t.elapsed() < 1600, qPrintable(QString::number(t.elapsed())));
+    QVERIFY(processGone(shell));
+    QElapsedTimer waited;
+    waited.start();
+    while (!processGone(job) && waited.elapsed() < 1000) QTest::qWait(10);
+    const bool left = !processGone(job);
+    if (left) kill(static_cast<pid_t>(job), SIGKILL);  // not left behind by a failing test
+    QVERIFY2(!left, "the job outlived the Pty");
+  }
   void sizeAndResize() {
     Run r;
     QVERIFY(r.start("/bin/sh", {"-c", "stty size; read x; stty size; read x"}, 30, 100));

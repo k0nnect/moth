@@ -16,7 +16,8 @@ class Pty : public QObject {
   Q_OBJECT
 public:
   explicit Pty(QObject *parent = nullptr);
-  // SIGHUP to the child's process group; SIGKILL to it if it is still there after 500 ms
+  // SIGHUP to the child's process group and to the terminal's foreground group (a job of the
+  // child's, such as the agent); SIGKILL to whichever is still there after 500 ms. 1.5 s at most
   ~Pty() override;
   // env is the whole environment of the child (each "NAME=value"). false, with nothing started,
   // when the program cannot be run (not found, not executable, or cwd is not a folder). A program
