@@ -213,6 +213,19 @@ private slots:
     QCOMPARE(t.s.text(0), top);
     QCOMPARE(t.s.text(22), bottom);
   }
+  void aTallerResizeOnTheAlternateScreenTakesNoHistoryBack() {
+    Scr t;
+    QByteArray all;
+    for (int i = 1; i <= 30; ++i) all += "old " + QByteArray::number(i) + "\r\n";
+    t.feed(all);
+    const int before = t.s.scrollback();
+    QVERIFY(before > 0);
+    t.feed("\x1b[?1049h");
+    t.s.resize(30, 80);
+    QCOMPARE(t.s.scrollback(), before);
+    t.feed("\x1b[?1049l");
+    QCOMPARE(t.s.scrollback(), before);
+  }
   void titleAndBell() {
     Scr t;
     QSignalSpy changed(&t.s, &TermScreen::titleChanged), bell(&t.s, &TermScreen::bell);

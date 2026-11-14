@@ -242,7 +242,6 @@ void TerminalView::scrollContentsBy(int, int) {
 void TerminalView::scrollbackChanged() {
   const int lines = screen_->scrollback();
   const qint64 dropped = screen_->linesDropped();
-  if (!selection_.empty() && !selection_.everything() && selection_.first().line < dropped) clearSelection();
   if (scrollPos_ > 0) {
     const qint64 top = dropped_ + scrollback_ - scrollPos_;  // the line at the top of the view
     const qint64 back = dropped + lines - top;                // how far back it is now
@@ -251,6 +250,8 @@ void TerminalView::scrollbackChanged() {
   }
   scrollback_ = lines;
   dropped_ = dropped;
+  // after the position: the rows the cleared selection covered are worked out from it
+  if (!selection_.empty() && !selection_.everything() && selection_.first().line < dropped) clearSelection();
   syncScrollBar();
 }
 

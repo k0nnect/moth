@@ -359,7 +359,8 @@ bool TermScreen::pushedLineWrapped() {
 
 int TermScreen::onPopLine(int cols, VTermScreenCell *cells, void *selfp) {
   auto *self = static_cast<TermScreen *>(selfp);
-  if (self->history_.empty()) return 0;
+  // the alternate screen has no history of its own, and what it takes back would be lost with it
+  if (self->altScreen_ || self->history_.empty()) return 0;
   const Line line = std::move(self->history_.back());
   self->history_.pop_back();
   const VTermScreenCell empty = self->blank();

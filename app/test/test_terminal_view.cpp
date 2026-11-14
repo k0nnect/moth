@@ -1046,6 +1046,26 @@ private slots:
     QCOMPARE(topRow(t.view), QString("line 93"));
     QCOMPARE(t.view.selectedText(), QString());
   }
+  void aSelectionDroppedAtTheLimitIsNotLeftDrawnInTheView() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    TermScreen *s = t.view.screen();
+    QScrollBar *bar = t.view.verticalScrollBar();
+    const int limit = TermScreen::kScrollbackLimit;
+    s->feed(numberedLines(1, limit + 100));  // line 78 is the oldest left
+    bar->setValue(10);
+    drag(t.view, at(t.view, 0, 0), at(t.view, 10, 6));  // lines 88 to 98
+    bar->setValue(15);                                  // the view starts at line 93, inside it
+    QCOMPARE(topRow(t.view), QString("line 93"));
+    QCOMPARE(Picture(t.view).colour(Picture(t.view).cells(0, 30).topLeft()), foreground);
+    s->feed(numberedLines(limit + 101, limit + 112));  // 88 leaves, the rest of it is still there
+    QCOMPARE(topRow(t.view), QString("line 93"));
+    QCOMPARE(t.view.selectedText(), QString());
+    QTest::qWait(50);  // the frame pacing
+    const Picture pic(t.view);
+    QCOMPARE(pic.colour(pic.cells(0, 30).topLeft()), background);
+    QCOMPARE(pic.colour(pic.cells(5, 30).topLeft()), background);
+  }
   void clearingTheScrollbackWhileLookingBackComesBackToTheBottom() {
     Term t;
     QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
