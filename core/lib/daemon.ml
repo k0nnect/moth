@@ -623,10 +623,28 @@ let check_usage ~cmd ~args ~opts =
 
 let relations = [ ("down", Session.Down); ("up", Session.Up); ("same", Session.Same); ("changed", Session.Changed) ]
 
+(* What the agent may not do through moth, though its one approval lets it run any moth command:
+   start a program the person has not started from moth (or start one with arguments of its own),
+   switch quiet, or write to a row by its number without the address that pins it. *)
+let agent_may st ~cmd ~args ~opts =
+  let row_write = match (cmd, args) with "set", [ r; _ ] | "keep", ([ r ] | [ r; _ ]) -> row_number r <> None | _ -> false in
+  match (cmd, args) with
+  | "launch", path :: game_args ->
+      let bottle = List.assoc "bottle" opts in
+      if not (List.exists (fun g -> g.bottle = bottle && g.path = path) (read_games st)) then
+        Error "the agent can only start a game you have started from moth before. start it yourself once: moth launch --bottle <bottle> <path>"
+      else if game_args <> [] then Error "the agent starts a game as you started it, with no arguments of its own"
+      else Ok ()
+  | "quiet", _ :: _ -> Error "quiet is the person's switch"
+  | _ when row_write && not (List.mem_assoc "at" opts) ->
+      Error "give the row's address too, so the write cannot land on another row: add --at <the address moth results showed for it>"
+  | _ -> Ok ()
+
 (* [record]: false when the request asked to leave no trace; such a results listing is not the
    one row numbers are taken from *)
-let handle st ~record ~cmd ~args ~opts =
+let handle st ~actor ~record ~cmd ~args ~opts =
   let* () = check_usage ~cmd ~args ~opts in
+  let* () = if actor = "agent" then agent_may st ~cmd ~args ~opts else Ok () in
   let bottle () = List.assoc "bottle" opts in
   let all = List.assoc_opt "all" opts = Some "true" in
   let at = Option.bind (List.assoc_opt "at" opts) address and kind = List.assoc_opt "kind" opts in
@@ -743,7 +761,7 @@ let answer st = function
   | Ok r when not (r.record || List.mem r.cmd reads) -> reply r.rid (Error "only commands that change nothing can go unrecorded")
   | Ok r ->
       if r.record then feed st (`Assoc [ ("busy", `Assoc [ ("actor", `String r.actor); ("cmd", `String r.cmd); ("args", `List (List.map (fun a -> `String a) r.args)) ]) ]);
-      let result = try handle st ~record:r.record ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
+      let result = try handle st ~actor:r.actor ~record:r.record ~cmd:r.cmd ~args:r.args ~opts:r.opts with e -> Error (internal_error st r.cmd e) in
       let lost_the_game = st.closed || st.lost || st.gone in
       settle st;
       if r.record || lost_the_game then record st ~actor:r.actor ~act:(lost_the_game || not (List.mem r.cmd reads)) ~cmd:r.cmd ~args:r.args ~opts:r.opts result;

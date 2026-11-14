@@ -1827,6 +1827,87 @@ let launch_args_pass_through () =
   check_str "json before the path is moth's" "launch [/g/a.exe] {bottle=u} true" (show (p [ "launch"; "--json"; "--bottle"; "u"; "/g/a.exe" ]));
   check_str "no path" "launch [] {bottle=u} false" (show (p [ "launch"; "--bottle"; "u" ]))
 
+(* ---- what the agent may not do through moth ---- *)
+
+let needs_at = "give the row's address too, so the write cannot land on another row: add --at <the address moth results showed for it>"
+
+(* the agent's set and keep by row number need --at; by name, by address and the person's own
+   are as before *)
+let the_agents_row_writes_carry_at () =
+  let fk, sh = fake () in
+  let f = fk.script in
+  with_daemon sh (fun d ->
+      hunt_for_three d f 3;
+      Fake_helper.queue_peek f "i32" (threes 3);
+      ignore (text (call d "results" []));
+      let agent ?(opts = []) cmd args = call ~actor:"agent" d cmd args ~opts in
+      let asked = List.length (Fake_helper.calls f) in
+      check_err "set 1" needs_at (agent "set" [ "1"; "9" ]);
+      check_err "set #1" needs_at (agent "set" [ "#1"; "9" ]);
+      check_err "keep 1" needs_at (agent "keep" [ "1" ]);
+      check_err "keep 1 hp" needs_at (agent "keep" [ "1"; "hp" ]);
+      check_int "nothing asked of the helper" asked (List.length (Fake_helper.calls f));
+      check_str "nothing kept" nothing_kept (text (call d "kept" []));
+      let refused = List.filter (fun ev -> Yojson.Safe.Util.member "actor" ev = `String "agent") (stored d) in
+      check_int "each recorded as the agent's" 4 (List.length refused);
+      check_bool "as failures" true (List.for_all (fun ev -> Yojson.Safe.Util.member "ok" ev = `Bool false) refused);
+      (* with --at: written and kept *)
+      Fake_helper.queue_peek f "i32" (threes 1);
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 9L);
+      check_str "set 1 --at" "set #1 (0x1000) to 9 (was 3)" (text (agent "set" [ "1"; "9" ] ~opts:[ ("at", "0x1000") ]));
+      Fake_helper.queue_peek f "i32" (threes ~base:0x1004 1);
+      Fake_helper.queue_read f (Vint 3L);
+      check_str "keep 2 --at" "kept #2 (0x1004) as hp (3, whole number)" (text (agent "keep" [ "2"; "hp" ] ~opts:[ ("at", "0x1004") ]));
+      (* by name and by address, as before *)
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 8L);
+      check_str "set by name" "set hp to 8 (was 3)" (text (agent "set" [ "hp"; "8" ]));
+      Fake_helper.queue_read f (Vint 3L);
+      check_str "keep by address" "kept 0x1008 as mp (3, whole number)" (text (agent "keep" [ "0x1008"; "3"; "mp" ]));
+      (* the person's row writes need no --at *)
+      Fake_helper.queue_write f ~prev:(Vint 3L);
+      Fake_helper.queue_read f (Vint 7L);
+      check_str "the person's set 3" "set #3 (0x1008) to 7 (was 3)" (text (call d "set" [ "3"; "7" ])))
+
+let refused_launch = "the agent can only start a game you have started from moth before. start it yourself once: moth launch --bottle <bottle> <path>"
+
+(* the agent starts only a game the person started from moth, in that bottle, with no arguments
+   of its own *)
+let the_agent_starts_only_a_known_game () =
+  let _, sh = fake () in
+  let launch, calls = fake_launch () in
+  let dir = path_of_file () in
+  Fun.protect ~finally:(fun () -> rm (Filename.dirname dir)) (fun () ->
+      let game = touch dir "game.exe" and other = touch dir "cmd.exe" in
+      with_daemon ~launch sh (fun d ->
+          let b = [ ("bottle", "uhmm") ] in
+          let agent opts args = call ~actor:"agent" d "launch" args ~opts in
+          check_err "nothing started from moth yet" refused_launch (agent b [ game ]);
+          ignore (text (call d "launch" [ game; "-windowed" ] ~opts:b));
+          check_err "another program" refused_launch (agent b [ other; "/c"; "anything" ]);
+          check_err "another bottle" refused_launch (agent [ ("bottle", "other") ] [ game ]);
+          check_err "arguments of its own" "the agent starts a game as you started it, with no arguments of its own" (agent b [ game; "-windowed" ]);
+          check_int "only the person's start ran" 1 (List.length !calls);
+          check_str "the game, as listed" "started game.exe in uhmm. when it is up: moth attach --bottle \"uhmm\" game.exe" (text (agent b [ game ]));
+          Alcotest.(check (list (triple string string (list string)))) "started with no arguments" [ ("uhmm", game, []); ("uhmm", game, [ "-windowed" ]) ] !calls;
+          let refused = List.filter (fun ev -> Yojson.Safe.Util.(member "actor" ev = `String "agent" && member "ok" ev = `Bool false)) (stored d) in
+          check_int "the refusals are recorded as the agent's" 4 (List.length refused)))
+
+(* quiet is the person's switch: the agent may ask which it is, not turn it *)
+let quiet_is_the_persons () =
+  let _, sh = fake () in
+  with_daemon sh (fun d ->
+      let agent args = call ~actor:"agent" d "quiet" args in
+      check_err "on" "quiet is the person's switch" (agent [ "on" ]);
+      check_bool "not kept" false (Sys.file_exists (Filename.concat d.home "quiet"));
+      check_str "it may ask" "quiet is off" (text (agent []));
+      ignore (text (call d "quiet" [ "on" ]));
+      check_err "off" "quiet is the person's switch" (agent [ "off" ]);
+      check_str "still on" "quiet is on" (text (agent []));
+      check_json "status says so" (`Bool true) Yojson.Safe.Util.(member "quiet" (json (call d "status" [])));
+      check_str "the person's off" "the agent is told what you do again" (text (call d "quiet" [ "off" ])))
+
 let home () =
   with_env "MOTH_HOME" "/x/y" (fun () -> check_str "env" "/x/y" (Client.home ()));
   with_env "MOTH_HOME" "rel" (fun () -> check_str "made absolute" (Filename.concat (Sys.getcwd ()) "rel") (Client.home ()));
@@ -2235,6 +2316,12 @@ let () =
           t "--at finds its row afresh" a_row_found_afresh;
           t "--kind refuses a row of another kind" a_row_of_another_kind;
           t "--kind and --all go with --at" kind_and_all_go_with_at;
+        ] );
+      ( "the agent's limits",
+        [
+          t "its row writes carry --at" the_agents_row_writes_carry_at;
+          t "it starts only a game the person started" the_agent_starts_only_a_known_game;
+          t "quiet is the person's" quiet_is_the_persons;
         ] );
       ( "wait",
         [

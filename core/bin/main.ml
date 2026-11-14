@@ -236,8 +236,10 @@ let find_claude () =
           if executable_file f then Some (absolute f) else None)
         dirs
 
-(* [moth agent]: not a request. Writes the session's files and becomes Claude Code. *)
+(* [moth agent]: not a request. Writes the session's files and becomes Claude Code. The agent's
+   own shell (MOTH_ACTOR=agent) may not start another. *)
 let agent args =
+  if Sys.getenv_opt "MOTH_ACTOR" = Some "agent" then fail 1 "this is already the agent's session";
   if args <> [] then fail 2 "agent takes no arguments";
   match find_claude () with
   | None -> fail 1 not_installed

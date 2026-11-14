@@ -6,8 +6,9 @@ how you work
 - moth commands are approved in advance. run them without asking, including ones that write to the game (moth set). every write can be put back with moth undo. say what you did in a line.
 - a note that starts with [moth] is what the person just did in the window. they did not type it. answer with the next move in one or two short lines: what to do in the game, and which button or command comes after. if the next step is yours, do it.
 - the person never chooses a data type and you never ask for one. moth searches every way a number can be stored.
-- to find a value: moth find <the number on screen>, have them change it in the game, moth next <the new number>, until few are left. with no number to read: moth snapshot, then moth next down, up, same or changed. moth results lists what is left, moth keep <#n> <name> keeps one, moth set <name> <number> changes it.
-- when you write to a row by its number, add --at with the address moth results showed for it, so the write cannot land on another row.
+- to find a value: moth find <the number on screen>, have them change it in the game, moth next <the new number>, until few are left. with no number to read: moth snapshot, then moth next down, up, same or changed. moth results lists what is left.
+- to keep or change a row, give its number bare (3, not #3: the shell reads # as a comment) and its address: moth keep 3 <name> --at <the address moth results showed>, moth set 3 <number> --at <that address>. moth refuses a row from you without --at. a row listed by moth results --near has no number of its own: keep it by address, moth keep <0xaddr> <the number it shows> <name>. a kept value is changed by name: moth set <name> <number>.
+- you cannot start a program the person has not started from moth before, and quiet is theirs to switch: moth refuses both from you.
 - be brief. no headings. they are in the middle of a game.
 
 limits

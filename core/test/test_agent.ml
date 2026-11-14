@@ -128,7 +128,20 @@ let instructions_say () =
   let has s = Alcotest.(check bool) s true (contains Agent.instructions s) in
   has "single-player and offline play only";
   has "never ask for one";
-  has "--at"
+  has "moth refuses a row from you without --at";
+  (* how a value is found, kept and changed, and what moth refuses from the agent: these lines, in
+     this order, one after the other *)
+  let lines = String.split_on_char '\n' Agent.instructions in
+  let expected =
+    [
+      "- to find a value: moth find <the number on screen>, have them change it in the game, moth next <the new number>, until few are left. with no number to read: moth snapshot, then moth next down, up, same or changed. moth results lists what is left.";
+      "- to keep or change a row, give its number bare (3, not #3: the shell reads # as a comment) and its address: moth keep 3 <name> --at <the address moth results showed>, moth set 3 <number> --at <that address>. moth refuses a row from you without --at. a row listed by moth results --near has no number of its own: keep it by address, moth keep <0xaddr> <the number it shows> <name>. a kept value is changed by name: moth set <name> <number>.";
+      "- you cannot start a program the person has not started from moth before, and quiet is theirs to switch: moth refuses both from you.";
+    ]
+  in
+  let rec from = function [] -> [] | l :: rest as all -> if l = List.hd expected then all else from rest in
+  Alcotest.(check (list string)) "the three lines" expected (List.filteri (fun i _ -> i < 3) (from lines));
+  Alcotest.(check bool) "no #n left" false (contains Agent.instructions "<#n>")
 
 let command_shape () =
   Alcotest.(check (array string))
@@ -266,6 +279,18 @@ let other_build () =
       check_bool "no session folder" false (Sys.file_exists (Filename.concat home "agent"));
       check_bool "stub not run" false (Sys.file_exists ran))
 
+(* the agent's own shell cannot start a second agent: refused before anything is written *)
+let not_from_the_agents_shell () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      let stub = Filename.concat tmp "stub" and ran = Filename.concat tmp "ran" in
+      write ~perm:0o755 stub (Printf.sprintf "#!/bin/sh\n: > %s\n" (Filename.quote ran));
+      let code, _, err, _ = run ~env:[ ("MOTH_CLAUDE", stub); ("MOTH_ACTOR", "agent"); ("PATH", "/usr/bin:/bin") ] ~home ~tmphome:tmp [ "agent" ] in
+      Alcotest.(check int) "exit" 1 code;
+      check_str "text" "this is already the agent's session" err;
+      check_bool "no home made, so no service and no session folder" false (Sys.file_exists home);
+      check_bool "stub not run" false (Sys.file_exists ran))
+
 let takes_no_arguments () =
   with_tmp (fun tmp ->
       let code, _, err, _ = run ~home:(Filename.concat tmp "h") ~tmphome:tmp [ "agent"; "now" ] in
@@ -293,5 +318,6 @@ let () =
           Alcotest.test_case "no arguments" `Quick takes_no_arguments;
           Alcotest.test_case "program that cannot run" `Quick exec_fails;
           Alcotest.test_case "service from another build" `Quick other_build;
+          Alcotest.test_case "not from the agent's own shell" `Quick not_from_the_agents_shell;
         ] );
     ]
