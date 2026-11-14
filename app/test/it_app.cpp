@@ -1,5 +1,5 @@
-// The real window against the real core and a real game, for the end-to-end scenarios 33 to 36
-// (core/integration/it_main.ml), which run it. Not a ctest test.
+// The real window against the real core and a real game, for the end-to-end scenarios 33 to 36,
+// 39, 40 and 41 (core/integration/it_main.ml), which run it. Not a ctest test.
 //
 //   it_app <edit|follow|gone> <bottle> <exe name> <number> <0xaddr> <new number>
 //   it_app term <bottle> <exe name> <number> <text>
@@ -20,7 +20,8 @@
 //           can't be used. Then it asks the search bar to find <number>, which the core must refuse
 //           as not attached. <new number> is not used.
 //   term:   the window with its terminal on (the harness sets MOTH_CLAUDE, SHELL and HOME so that no
-//           real agent or shell start-up file runs). It waits up to 60 seconds for <text> on the
+//           real agent or shell start-up file runs; it refuses to run without MOTH_CLAUDE, so run
+//           by hand it never starts the real agent). It waits up to 60 seconds for <text> on the
 //           terminal's screen and prints `terminal`; attaches, types <number> and Return in the
 //           search bar as the others do, and prints `clicked`. Then it takes commands, one per line,
 //           from its stdin, and ends (closing the window) at the first that ends it, or at the end
@@ -30,6 +31,7 @@
 //             bye    types `bye` and Return into the terminal, then does what `shell` does
 //             shell  waits for a shell prompt (a row ending in `$`), types `moth status` and Return,
 //                    waits for `attached to` on the screen, prints `shell`, and ends
+//             close  ends at once, with whatever runs in the terminal still running
 // It prints one line per step as it goes, then `ok`, exit 0. A step that does not come true in
 // time prints what it waited for and the window's line, exit 1. Whatever happens, it ends by
 // itself after three minutes.
@@ -381,7 +383,7 @@ public:
       } else if (c == "shell") {
         shell();
         return;
-      } else if (c.isEmpty()) return;
+      } else if (c == "close" || c.isEmpty()) return;
       else fail("it_app was told \"" + c + "\"");
     }
   }
@@ -442,6 +444,10 @@ int main(int argc, char **argv) {
   }
   if (qEnvironmentVariableIsEmpty("MOTH_HOME") || qEnvironmentVariableIsEmpty("MOTH_BIN")) {
     std::fprintf(stderr, "it_app needs MOTH_HOME and MOTH_BIN: it never uses the default home\n");
+    return 2;
+  }
+  if (term && qEnvironmentVariableIsEmpty("MOTH_CLAUDE")) {
+    std::fprintf(stderr, "it_app term needs MOTH_CLAUDE, the stand-in agent: it never starts the real one\n");
     return 2;
   }
   if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");

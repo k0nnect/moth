@@ -1198,10 +1198,22 @@ let waits () =
 (* the stand-in's own files, in this scenario's home *)
 let stub_file name = Filename.concat !home name
 
+(* the first note in stub-notes: from the first heading to the next, or to the end *)
+let first_note text =
+  let heading = "[moth] the person did this in moth:" in
+  let rec at i = if i + String.length heading > String.length text then None else if String.sub text i (String.length heading) = heading then Some i else at (i + 1) in
+  match at 0 with
+  | None -> ""
+  | Some a ->
+      let b = Option.value (at (a + String.length heading)) ~default:(String.length text) in
+      String.sub text a (b - a)
+
 (* 39: the window's terminal runs moth agent, which runs the stand-in; what the person does in the
    window reaches the stand-in as a note, quiet stops that (and the stand-in is shown alive and
    waiting while it does, and told again once quiet is off), and when the agent ends the terminal is
-   a shell that can run moth. Run in a home with a space in its name. *)
+   a shell that can run moth. The stand-in's first hook run waits 5 seconds (STUB_FIRST_DELAY), as
+   the first Stop hook waits for Claude Code's first turn: the window's attach and find come before
+   any waiter, and the first note must still tell the find. Run in a home with a space in its name. *)
 let agent_in_window () =
   with_spaced_home (fun () ->
       with_target ~attach:false (fun t ->
@@ -1209,13 +1221,17 @@ let agent_in_window () =
           ignore (moth [ "quiet"; "off" ]);
           let notes = stub_file "stub-notes" and args = stub_file "stub-args" and runs = stub_file "stub-runs" and envf = stub_file "stub-env" in
           List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ notes; args; runs; envf ];
-          let vars = [ ("MOTH_CLAUDE", stub_agent ()); ("SHELL", "/bin/sh"); ("HOME", fake_home ()) ] in
+          let vars = [ ("MOTH_CLAUDE", stub_agent ()); ("STUB_FIRST_DELAY", "5"); ("SHELL", "/bin/sh"); ("HOME", fake_home ()) ] in
           let settings_of a = List.find_opt (fun l -> String.starts_with ~prefix:(!home ^ "/agent/") l && String.ends_with ~suffix:"/settings.json" l) a in
           let after_notes = ref "" in
           let on_line = function
             | "clicked" ->
                 track_app ();
-                check (until ~timeout:10. (fun () -> contains (read_text notes) "find 3")) "stub-notes has no note with find 3 within 10s. it holds: %S" (read_text notes);
+                (* the find is done and no waiter has started yet *)
+                check (not (Sys.file_exists runs)) "the stand-in ran its hook before the window's find was done (stub-runs: %S), so the find was not made before the first waiter" (read_text runs);
+                check (until ~timeout:15. (fun () -> contains (read_text notes) "find 3")) "stub-notes has no note with find 3 within 15s. it holds: %S" (read_text notes);
+                let first = first_note (read_text notes) in
+                check (contains first "- find 3: ") "the first note does not tell the find made before the first waiter: %S" first;
                 (* the hook armed again after the note *)
                 check (until ~timeout:10. (fun () -> List.length (lines_of (read_text runs)) >= 2)) "the stand-in did not run the hook again after the note (stub-runs: %S)" (read_text runs);
                 let a = lines_of (read_text args) in
@@ -1271,6 +1287,42 @@ let no_agent () =
       in
       with_nothing_left "the window closed" (fun () -> app_ok ~stdin:true ~vars ~on_line [ "term"; bottle (); "moth-target.exe"; "3"; "claude code is not installed" ]))
 
+(* the stand-in's pid: its session folder's name, from the settings path in its arguments *)
+let session_of args = match List.find_opt (fun l -> String.starts_with ~prefix:(!home ^ "/agent/") l && String.ends_with ~suffix:"/settings.json" l) args with
+  | Some p -> int_of_string (Filename.basename (Filename.dirname p))
+  | None -> failf "no settings file under %s/agent/ among the stand-in's arguments: %s" !home (String.concat " | " args)
+
+(* 41: the window closes while the agent is up and a waiter is armed under it, and the agent
+   ignores the hang-up and never reads its terminal (STUB_DEAF): closing the window still ends it,
+   and its moth wait with it *)
+let window_goes_with_agent () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      ignore (moth [ "quiet"; "off" ]);
+      let notes = stub_file "stub-notes" and args = stub_file "stub-args" and runs = stub_file "stub-runs" and envf = stub_file "stub-env" in
+      List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ notes; args; runs; envf ];
+      let vars = [ ("MOTH_CLAUDE", stub_agent ()); ("STUB_DEAF", "1"); ("SHELL", "/bin/sh"); ("HOME", fake_home ()) ] in
+      let session = ref 0 and waiter = ref 0 in
+      let on_line = function
+        | "clicked" ->
+            track_app ();
+            check (until ~timeout:10. (fun () -> contains (read_text notes) "find 3")) "stub-notes has no note with find 3 within 10s. it holds: %S" (read_text notes);
+            check (until ~timeout:10. (fun () -> List.length (lines_of (read_text runs)) >= 2)) "the stand-in did not run the hook again after the note (stub-runs: %S)" (read_text runs);
+            session := session_of (lines_of (read_text args));
+            let waiter_file = Filename.concat (Filename.concat (Filename.concat !home "agent") (string_of_int !session)) "waiter" in
+            let armed () =
+              match int_of_string_opt (String.trim (read_text waiter_file)) with
+              | Some p when alive p && List.mem p (descendants !session) -> waiter := p; true
+              | _ -> false
+            in
+            check (until ~timeout:10. armed) "no live moth wait under the stand-in (pid %d) within 10s (waiter file: %S)" !session (read_text waiter_file);
+            track_app ();
+            !app_say "close"
+        | _ -> ()
+      in
+      with_nothing_left "the window closed with the agent up" (fun () -> app_ok ~stdin:true ~vars ~on_line [ "term"; bottle (); "moth-target.exe"; "3"; "stub agent up" ]);
+      check (!session > 0 && not (alive !session) && not (alive !waiter)) "the stand-in (pid %d) or its moth wait (pid %d) outlived the window" !session !waiter)
+
 let scenarios =
   [
     (1, "decimal found from a whole number", decimal_from_whole);
@@ -1313,6 +1365,7 @@ let scenarios =
     (38, "wait", waits);
     (39, "the agent in the window", agent_in_window);
     (40, "no agent", no_agent);
+    (41, "the window goes with the agent up", window_goes_with_agent);
   ]
 
 let () =
