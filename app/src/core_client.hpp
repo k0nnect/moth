@@ -29,10 +29,10 @@ public:
   CoreClient(QString home, QString mothBin, QObject *parent = nullptr);
   const QString &home() const;
   // one request on its own connection, actor "user", with proto; `done` runs once, on the caller's
-  // thread, and never before call() returns. When no service answers, a recorded request (the user's own
-  // action) runs `mothBin status` once to start one and is tried again when that ends (10 seconds
-  // at most). An unrecorded one (a poll) never starts it: it fails at once. Failing because no
-  // service answers, the error is "moth's background service is not answering. see
+  // thread, and never before call() returns. When no service answers, a recorded request (the
+  // user's own action) runs `mothBin status` once to start one and is tried again when that ends
+  // (10 seconds at most). An unrecorded one (a poll) never starts it: it fails at once. Failing
+  // because no service answers, the error is "moth's background service is not answering. see
   // <home>/core.log", or, when the last try to run `mothBin` could not start it at all, "could
   // not run <mothBin>. set MOTH_BIN to the moth program."
   void call(const QString &cmd, const QStringList &args, const Opts &opts, bool record,

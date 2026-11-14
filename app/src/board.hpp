@@ -32,9 +32,9 @@ public:
   bool connected() const;
   QString line() const;      // the newest thing to tell the user; the stale sentence while stale()
   bool quiet() const;        // the last status read said the agent is not told what the user does
-  // the last status read had a `proto` other than mothProtocol, or none: the service is from another build.
-  // A status read that fails, or the feed dropping, clears it: the user's next action then starts
-  // whatever build is installed
+  // the last status read had a `proto` other than mothProtocol, or none: the service is from
+  // another build. A status read that fails, or the feed dropping, clears it: the user's next
+  // action then starts whatever build is installed
   bool stale() const;
   void say(const QString &line);
   QString home() const;      // moth's home, as the client uses it

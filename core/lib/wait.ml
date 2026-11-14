@@ -21,6 +21,7 @@ let parse_cursor text =
   | [ n ] -> Option.map (fun n -> (n, false)) (int_of_string_opt n)
   | [ n; "quiet" ] -> Option.map (fun n -> (n, true)) (int_of_string_opt n)
   | _ -> None
+
 let cursor t = t.cursor
 let quiet t = t.quiet
 let dropped t = t.busy <- 0
