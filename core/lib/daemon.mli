@@ -4,7 +4,10 @@
     A [watch] connection stays open: up to 16 watchers are sent a line as each recorded request
     starts and its event once it ends, and one that can't take a line at once is let go. A read
     sent with [record: false] leaves no line and tells no watcher, unless it made the daemon let
-    go of the game or the helper (see docs/dev.md). *)
+    go of the game or the helper (see docs/dev.md). A request or watch that does not carry this
+    build's [proto] is refused unrun, except [stop] and [status]. From actor [agent] it refuses
+    [launch] of a program [games] does not list (or with arguments), [quiet on] and [quiet off],
+    and [set] and [keep] by row number without [--at]. *)
 
 (** starts a helper inside the named bottle *)
 type start_helper = bottle:string -> (Helper_api.helper, string) result
@@ -46,5 +49,6 @@ val clear_stale_socket : home:string -> bool
     output appended to [home]/launch.log *)
 val default_launch : home:string -> launch
 
-(** the client protocol number [status --json] gives as [proto]; a service that gives none is 1 *)
+(** the client protocol number [status --json] gives as [proto] (a service that gives none is 1),
+    and that every request and watch must carry as [proto] *)
 val protocol : int
