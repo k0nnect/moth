@@ -1401,7 +1401,7 @@ let another_build_is_refused () =
       check_json "says this build's proto" (`Int Daemon.protocol) Yojson.Safe.Util.(member "proto" (json (request ~proto:[ ("proto", `Int 1) ] d (fields ~record:false "status" [] []))));
       check_int "recorded as any status is" 1 (List.length (stored d));
       check_str "stop with no proto" "stopped" (text (request ~proto:[] d (fields "stop" [] [])));
-      check_strs "the last event is the stop" [ "status"; "stop" ] (List.map cmd_of (stored d)))
+      check_strs "recorded: the status and the stop" [ "status"; "stop" ] (List.map cmd_of (stored d)))
 
 let client_watch_hooks () =
   let fk, sh = fake () in
