@@ -24,6 +24,7 @@ let usage =
   log [-n <count>]                     recent commands, newest first
   watch [--after <seq>]                watch commands as they happen, from anyone
   quiet [on|off]                       stop or resume telling the agent what you do
+  agent                                start claude code on this moth session
   stop                                 stop moth's background service
   daemon                               run the background service in the foreground
 
@@ -213,6 +214,55 @@ let wait_command args =
       | None -> fail 1 "wait is run by the agent's hook: moth wait --session <dir>")
   | Error m -> fail 1 m
 
+let not_installed = "claude code is not installed, or not on PATH. moth works without it: use the window, or type moth commands here."
+
+let absolute p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p
+
+let executable_file p =
+  try
+    let st = Unix.stat p in
+    st.Unix.st_kind = Unix.S_REG && (try Unix.access p [ Unix.X_OK ]; true with Unix.Unix_error _ -> false)
+  with Unix.Unix_error _ -> false
+
+(* MOTH_CLAUDE when set, else claude in a PATH folder; an absolute path, since the agent starts in another folder *)
+let find_claude () =
+  match Sys.getenv_opt "MOTH_CLAUDE" with
+  | Some p when p <> "" -> if executable_file p then Some (absolute p) else None
+  | _ ->
+      let dirs = String.split_on_char ':' (Option.value (Sys.getenv_opt "PATH") ~default:"") in
+      List.find_map
+        (fun d ->
+          let f = Filename.concat (if d = "" then "." else d) "claude" in
+          if executable_file f then Some (absolute f) else None)
+        dirs
+
+(* [moth agent]: not a request. Writes the session's files and becomes Claude Code. *)
+let agent args =
+  if args <> [] then fail 2 "agent takes no arguments";
+  match find_claude () with
+  | None -> fail 1 not_installed
+  | Some claude -> (
+      let home = Client.home () in
+      (match Client.call ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
+      | Error m -> fail 1 m
+      | Ok (status, _) ->
+          let proto = match status with `Assoc f -> ( match List.assoc_opt "proto" f with Some (`Int n) -> n | _ -> 1) | _ -> 1 in
+          if proto <> Daemon.protocol then fail 1 "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop");
+      let moth = absolute Sys.executable_name in
+      let path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
+      match Agent.prepare ~home ~moth ~path ~pid:(Unix.getpid ()) with
+      | Error m -> fail 1 m
+      | Ok dir -> (
+          Unix.chdir (Filename.concat (Filename.dirname dir) "work");
+          Unix.putenv "MOTH_ACTOR" "agent";
+          Unix.putenv "MOTH_HOME" home;
+          Unix.putenv "PATH" (Filename.dirname moth ^ ":" ^ path);
+          let argv = Agent.command ~claude ~dir in
+          try Unix.execv claude argv
+          with Unix.Unix_error _ ->
+            Agent.remove_session dir;
+            fail 1 not_installed))
+
 let () =
   match List.tl (Array.to_list Sys.argv) with
   | [] | [ "help" ] | [ "--help" ] | [ "-h" ] -> print_string usage
@@ -220,6 +270,7 @@ let () =
       let home = Client.home () in
       try Daemon.run ~home ~start_helper:(Daemon.default_start_helper ~home) ~launch:(Daemon.default_launch ~home) with Failure m -> fail 1 m)
   | "wait" :: args -> wait_command args
+  | "agent" :: args -> agent args
   | argv -> (
       let actor = match Client.actor_of_env (Sys.getenv_opt "MOTH_ACTOR") with Ok a -> a | Error m -> fail 2 m in
       match Client.parse_args argv with
