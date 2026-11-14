@@ -2,6 +2,7 @@
 // (core/integration/it_main.ml), which run it. Not a ctest test.
 //
 //   it_app <edit|follow|gone> <bottle> <exe name> <number> <0xaddr> <new number>
+//   it_app term <bottle> <exe name> <number> <text>
 //
 // MOTH_HOME and MOTH_BIN come from the environment (it refuses to run without them, so it never
 // touches the default home), and the window is offscreen. It attaches from the game bar, types
@@ -18,6 +19,16 @@
 //           the kept table have no rows, the game bar says `no game attached`, and the search box
 //           can't be used. Then it asks the search bar to find <number>, which the core must refuse
 //           as not attached. <new number> is not used.
+//   term:   the window with its terminal on (the harness sets MOTH_CLAUDE, SHELL and HOME so that no
+//           real agent or shell start-up file runs). It waits up to 60 seconds for <text> on the
+//           terminal's screen and prints `terminal`; attaches, types <number> and Return in the
+//           search bar as the others do, and prints `clicked`. Then it takes commands, one per line,
+//           from its stdin, and ends (closing the window) at the first that ends it, or at the end
+//           of stdin:
+//             quiet  ticks the `quiet` box, waits for the board to say so, prints `quiet`
+//             bye    types `bye` and Return into the terminal, then does what `shell` does
+//             shell  waits for a shell prompt (a row ending in `$`), types `moth status` and Return,
+//                    waits for `attached to` on the screen, prints `shell`, and ends
 // It prints one line per step as it goes, then `ok`, exit 0. A step that does not come true in
 // time prints what it waited for and the window's line, exit 1. Whatever happens, it ends by
 // itself after three minutes.
@@ -32,6 +43,7 @@
 #include <QPushButton>
 #include <QTableView>
 #include <QTimer>
+#include <poll.h>
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
@@ -49,6 +61,8 @@
 #include "results_model.hpp"
 #include "results_panel.hpp"
 #include "search_bar.hpp"
+#include "term_screen.hpp"
+#include "terminal_view.hpp"
 
 namespace {
 
@@ -101,6 +115,12 @@ public:
       const bool writing = model_->writing();
       if (std::exchange(writing_, writing) == writing) ++readSinceTurn_;  // not a write starting or ending
     });
+  }
+
+  // the window's terminal, which the term mode needs
+  void useTerminal(MainWindow &window) {
+    terminal_ = need<TerminalView>(&window, "terminal");
+    quietBox_ = need<QCheckBox>(&window, "quiet");
   }
 
   [[noreturn]] void fail(const QString &why) {
@@ -262,6 +282,100 @@ public:
     print("find " + number + " was refused: " + line_->text());
   }
 
+
+  bool screenShows(const QString &text) const {
+    for (int r = 0; r < terminal_->screen()->rows(); ++r)
+      if (terminal_->screen()->text(r).contains(text, Qt::CaseInsensitive)) return true;
+    return false;
+  }
+
+  bool promptShown() const {
+    for (int r = 0; r < terminal_->screen()->rows(); ++r)
+      if (terminal_->screen()->text(r).endsWith('$')) return true;
+    return false;
+  }
+
+  QString screenText() const {
+    QStringList rows;
+    for (int r = 0; r < terminal_->screen()->rows(); ++r) rows << terminal_->screen()->text(r);
+    return rows.join(" | ");
+  }
+
+  // the terminal's screen shows `text` (the screen is put in the failure's words)
+  void terminalShows(const QString &text, int seconds) {
+    waitFor("the terminal to show \"" + text + "\". the screen: " + screenText(), seconds, [&] { return screenShows(text); });
+    print("the terminal shows " + text);
+  }
+
+  // keys sent to the terminal one at a time, as typing does; \n is Return
+  void type(const QString &text) {
+    for (const QChar c : text) {
+      int key = Qt::Key_unknown;
+      QString sent = QString(c);
+      if (c == '\n') {
+        key = Qt::Key_Return;
+        sent = "\r";
+      } else if (c == ' ') key = Qt::Key_Space;
+      else if (c >= 'a' && c <= 'z') key = Qt::Key_A + (c.unicode() - 'a');
+      QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier, sent);
+      QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier, sent);
+      QApplication::sendEvent(terminal_, &press);
+      QApplication::sendEvent(terminal_, &release);
+    }
+  }
+
+  // one line from stdin; "" at its end
+  QString command() {
+    QString line;
+    bool closed = false;
+    waitFor("a line on stdin", overallSeconds, [&] {
+      pollfd p{STDIN_FILENO, POLLIN, 0};
+      if (poll(&p, 1, 0) <= 0) return false;
+      char ch;
+      const ssize_t n = read(STDIN_FILENO, &ch, 1);
+      if (n <= 0) {
+        closed = true;
+        return true;
+      }
+      if (ch == '\n') return true;
+      line += QChar(ch);
+      return false;
+    });
+    return closed && line.isEmpty() ? QString() : line;
+  }
+
+  void tickQuiet() {
+    waitFor("the quiet box to be usable", 30, [this] { return quietBox_->isEnabled(); });
+    quietBox_->click();
+    waitFor("the board to say quiet is on", 30, [this] { return board_.quiet() && !board_.working(); });
+    if (!quietBox_->isChecked()) fail("the quiet box is not ticked");
+    print("quiet");
+  }
+
+  void shell() {
+    waitFor("a shell prompt on the terminal. the screen: " + screenText(), 30, [this] { return promptShown(); });
+    type("moth status\n");
+    terminalShows("attached to", 30);
+    print("shell");
+  }
+
+  // the term mode, after the search: what the harness tells it
+  void commands() {
+    for (;;) {
+      const QString c = command();
+      if (c == "quiet") tickQuiet();
+      else if (c == "bye") {
+        type("bye\n");
+        shell();
+        return;
+      } else if (c == "shell") {
+        shell();
+        return;
+      } else if (c.isEmpty()) return;
+      else fail("it_app was told \"" + c + "\"");
+    }
+  }
+
 private:
   template <typename W>
   W *need(QObject *in, const QString &name) {
@@ -296,7 +410,8 @@ private:
   ResultsPanel *panel_ = nullptr;
   ResultsModel *model_ = nullptr;
   QTableView *results_ = nullptr, *kept_ = nullptr;
-  QCheckBox *all_ = nullptr;
+  QCheckBox *all_ = nullptr, *quietBox_ = nullptr;
+  TerminalView *terminal_ = nullptr;
   int turns_ = 0, resets_ = 0;
   int readSinceTurn_ = 0;  // list changes since the latest event's turn, other than a write starting or ending
   bool writing_ = false;   // the model's writing() as last seen
@@ -307,9 +422,11 @@ private:
 int main(int argc, char **argv) {
   std::signal(SIGALRM, overran);
   alarm(overallSeconds);
-  const QString usage = "usage: it_app <edit|follow|gone> <bottle> <exe name> <number> <0xaddr> <new number>";
+  const QString usage =
+      "usage: it_app <edit|follow|gone> <bottle> <exe name> <number> <0xaddr> <new number>\n       it_app term <bottle> <exe name> <number> <text>";
   const QStringList modes{"edit", "follow", "gone"};
-  if (argc != 7 || !modes.contains(QString::fromUtf8(argv[1]))) {
+  const bool term = argc == 6 && QString::fromUtf8(argv[1]) == "term";
+  if (!term && (argc != 7 || !modes.contains(QString::fromUtf8(argv[1])))) {
     std::fprintf(stderr, "%s\n", usage.toUtf8().constData());
     return 2;
   }
@@ -320,17 +437,29 @@ int main(int argc, char **argv) {
   if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
 
   QApplication app(argc, argv);
-  const QString mode = argv[1], bottle = argv[2], exe = argv[3], number = argv[4], address = argv[5], value = argv[6];
-  if (addressOf(address) == 0) {
+  const QString mode = argv[1], bottle = argv[2], exe = argv[3], number = argv[4], address = argv[5], value = term ? QString() : argv[6];
+  if (!term && addressOf(address) == 0) {
     std::fprintf(stderr, "%s is not an address like 0x7ffe1234\n", argv[5]);
     return 2;
   }
   CoreClient core(mothHome(), mothBin());
   Board board(&core);
   MainWindow window(&board);
-  window.setTerminal(false);  // no shell, no agent: this drives the panels
+  if (!term) window.setTerminal(false);  // no shell, no agent: this drives the panels
   window.show();
   Drive drive(window, board);
+  if (term) {
+    drive.useTerminal(window);
+    drive.terminalShows(address, 60);  // the text to wait for is the fifth argument
+    print("terminal");
+    drive.attach(bottle, exe);
+    drive.search(number);
+    print("clicked");
+    drive.commands();
+    window.close();
+    print("ok");
+    return 0;
+  }
 
   drive.attach(bottle, exe);
   drive.search(number);

@@ -33,15 +33,21 @@ let home = ref ""
 let exe name = Filename.concat !bin name
 let bottle () = match Sys.getenv_opt "MOTH_TEST_BOTTLE" with Some b when b <> "" -> b | _ -> failwith "MOTH_TEST_BOTTLE is not set. run this through make."
 
+(* the environment with [vars] set, each replacing the value it had *)
+let env_with vars =
+  let unset e = not (List.exists (fun (k, _) -> String.starts_with ~prefix:(k ^ "=") e) vars) in
+  Array.of_list (List.filter unset (Array.to_list (Unix.environment ())) @ List.map (fun (k, v) -> k ^ "=" ^ v) vars)
+
 (* ---- running a program with a deadline ---- *)
 
 type ran = { code : int; out : string; err : string }
 
-let run ~timeout argv =
+let run ?env ~timeout argv =
   let out_r, out_w = Unix.pipe ~cloexec:true () in
   let err_r, err_w = Unix.pipe ~cloexec:true () in
   let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
-  let pid = Fun.protect ~finally:(fun () -> List.iter Unix.close [ null; out_w; err_w ]) (fun () -> Unix.create_process argv.(0) argv null out_w err_w) in
+  let spawn () = match env with None -> Unix.create_process argv.(0) argv null out_w err_w | Some e -> Unix.create_process_env argv.(0) argv e null out_w err_w in
+  let pid = Fun.protect ~finally:(fun () -> List.iter Unix.close [ null; out_w; err_w ]) spawn in
   let out = Buffer.create 4096 and err = Buffer.create 256 and chunk = Bytes.create 65536 in
   let deadline = now () +. timeout in
   let opened = ref [ out_r; err_r ] in
@@ -77,13 +83,13 @@ let run ~timeout argv =
 let verbose = ref false
 
 (* --json first: after launch's path everything is the game's own *)
-let moth_raw ?(timeout = 900.) args =
-  let r = run ~timeout (Array.of_list (exe "moth" :: "--json" :: args)) in
+let moth_raw ?env ?(timeout = 900.) args =
+  let r = run ?env ~timeout (Array.of_list (exe "moth" :: "--json" :: args)) in
   if !verbose then Printf.eprintf "moth %s -> exit %d\n%s%s%!" (String.concat " " args) r.code r.out r.err;
   r
 
-let moth ?timeout args =
-  let r = moth_raw ?timeout args in
+let moth ?env ?timeout args =
+  let r = moth_raw ?env ?timeout args in
   if r.code <> 0 then failf "moth %s failed (exit %d): %s" (String.concat " " args) r.code (String.trim r.err)
   else try Yojson.Safe.from_string r.out with Yojson.Json_error m -> failf "moth %s printed something that isn't json (%s): %s" (String.concat " " args) m r.out
 
@@ -805,25 +811,33 @@ let launched () =
 
 let it_app () = Filename.concat (Filename.dirname !bin) "build/app/it_app"
 
-(* the environment with [vars] set, each replacing the value it had *)
-let env_with vars =
-  let unset e = not (List.exists (fun (k, _) -> String.starts_with ~prefix:(k ^ "=") e) vars) in
-  Array.of_list (List.filter unset (Array.to_list (Unix.environment ())) @ List.map (fun (k, v) -> k ^ "=" ^ v) vars)
-
 (* Runs it_app with [args] against this home's daemon, and hands [on_line] each line it prints as
    it prints it. Its stderr (Qt's own notes) goes to it_app.log in the home. It must end with ok
    and exit 0. It is killed when it runs past [timeout] (its own limit is 180s) or when [on_line]
    fails. *)
-let app_ok ?(on_line = fun _ -> ()) ?(timeout = 240.) args =
+let app_pid = ref 0
+
+(* with [~stdin:true], what [on_line] can say to the running it_app, a line at a time *)
+let app_say : (string -> unit) ref = ref (fun _ -> failwith "it_app was started without ~stdin")
+
+let app_ok ?(on_line = fun _ -> ()) ?(timeout = 240.) ?(vars = []) ?(stdin = false) args =
   let prog = it_app () in
   if not (Sys.file_exists prog) then failf "%s not found. run make app." prog;
-  let env = env_with [ ("MOTH_BIN", exe "moth"); ("QT_QPA_PLATFORM", "offscreen") ] in
+  let env = env_with ([ ("MOTH_BIN", exe "moth"); ("QT_QPA_PLATFORM", "offscreen") ] @ vars) in
   let out_r, out_w = Unix.pipe ~cloexec:true () in
-  let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
+  let in_r, in_w = if stdin then Unix.pipe ~cloexec:true () else (Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0, Unix.stdout) in
+  let null = in_r in
   let err = Unix.openfile (Filename.concat !home "it_app.log") [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ] 0o644 in
   let pid =
     Fun.protect ~finally:(fun () -> List.iter Unix.close [ null; out_w; err ]) (fun () -> Unix.create_process_env prog (Array.of_list (prog :: args)) env null out_w err)
   in
+  app_pid := pid;
+  let in_open = ref stdin in
+  let close_in () = if !in_open then (in_open := false; try Unix.close in_w with Unix.Unix_error _ -> ()) in
+  app_say :=
+    (fun line ->
+      let text = line ^ "\n" in
+      if not !in_open || Unix.write_substring in_w text 0 (String.length text) <> String.length text then failf "could not tell it_app %s" line);
   let lines = ref [] and partial = Buffer.create 256 and chunk = Bytes.create 4096 in
   let rec take () =
     let s = Buffer.contents partial in
@@ -858,7 +872,7 @@ let app_ok ?(on_line = fun _ -> ()) ?(timeout = 240.) args =
     (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
     ignore (reap ())
   in
-  let finished = Fun.protect ~finally:(fun () -> Unix.close out_r) (fun () -> try pump () with e -> stop (); raise e) in
+  let finished = Fun.protect ~finally:(fun () -> Unix.close out_r; close_in ()) (fun () -> try pump () with e -> stop (); raise e) in
   let printed () = String.concat " | " (List.rev !lines) in
   if not finished then (
     stop ();
@@ -939,6 +953,208 @@ let game_goes () =
       let writes = List.filter (fun ev -> List.mem (member "cmd" ev) [ `String "set"; `String "keep"; `String "undo" ]) since in
       check (writes = []) "something wrote: %s" (show (`List writes)))
 
+(* ---- an agent's hand, and the agent in the window (37 to 40) ---- *)
+
+let read_text path = try In_channel.with_open_bin path In_channel.input_all with Sys_error _ -> ""
+let lines_of text = List.filter (fun l -> l <> "") (String.split_on_char '\n' text)
+
+(* the stand-in for claude code, built next to this program *)
+let stub_agent () =
+  let dir = Filename.dirname Sys.executable_name in
+  let dir = if Filename.is_relative dir then Filename.concat (Sys.getcwd ()) dir else dir in
+  let p = Filename.concat dir "stub_agent.exe" in
+  if not (Sys.file_exists p) then failf "%s not found. run make build." p;
+  p
+
+let mkdir_p dir = List.iter (fun d -> try Unix.mkdir d 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) (let rec up d = if d = "/" || d = "." then [] else up (Filename.dirname d) @ [ d ] in up dir)
+
+(* waits up to [timeout] seconds for [f] to be true *)
+let until ~timeout f =
+  let deadline = now () +. timeout in
+  let rec go () = f () || (now () < deadline && (Unix.sleepf 0.1; go ())) in
+  go ()
+
+(* every process below [root], by ps *)
+let descendants root =
+  let r = run ~timeout:20. [| "/bin/ps"; "-axo"; "pid=,ppid=" |] in
+  let pairs =
+    List.filter_map
+      (fun l -> match List.filter (( <> ) "") (String.split_on_char ' ' (String.trim l)) with [ a; b ] -> (match (int_of_string_opt a, int_of_string_opt b) with Some a, Some b -> Some (a, b) | _ -> None) | _ -> None)
+      (String.split_on_char '\n' r.out)
+  in
+  let rec below acc = function
+    | [] -> acc
+    | p :: rest ->
+        let kids = List.filter_map (fun (c, par) -> if par = p && not (List.mem c acc) then Some c else None) pairs in
+        below (acc @ kids) (rest @ kids)
+  in
+  below [] [ root ]
+
+(* the processes a window started that the harness did not: tracked while it runs, and checked gone after *)
+let tracked = ref []
+let track_app () =
+  tracked := List.sort_uniq compare (descendants !app_pid @ !tracked);
+  if !verbose then Printf.eprintf "processes below it_app: %s\n%!" (String.concat " " (List.map string_of_int !tracked))
+
+let check_all_gone what =
+  let left = List.filter (fun p -> not (wait_gone p ~timeout:10.)) !tracked in
+  tracked := [];
+  check (left = []) "after %s these processes are still running: %s" what (String.concat ", " (List.map string_of_int left));
+  (* and by what they were started with, in case one was missed *)
+  let r = run ~timeout:20. [| "/bin/ps"; "-axo"; "pid=,args=" |] in
+  let mine = List.filter (fun l -> contains l !home && (contains l "stub_agent" || contains l "moth wait" || contains l "moth-app")) (String.split_on_char '\n' r.out) in
+  check (mine = []) "after %s this is still running: %s" what (String.concat " / " mine)
+
+(* a temporary HOME for the window's shell, with a space in its name *)
+let fake_home () =
+  let h = Filename.concat !home "fake home" in
+  mkdir_p h;
+  h
+
+(* 37: what the agent runs is recorded as the agent's; an actor that is neither is refused *)
+let agents_hand () =
+  with_target (fun t ->
+      Target_ctl.set t "points" "3";
+      let agent_env = env_with [ ("MOTH_ACTOR", "agent") ] in
+      ignore (moth ~env:agent_env [ "find"; "3" ]);
+      let events = to_list (moth [ "log"; "-n"; "5" ]) in
+      (match List.find_opt (fun ev -> member "cmd" ev = `String "find") events with
+      | Some ev -> check (member "actor" ev = `String "agent") "the find was recorded as %s, expected actor agent" (show ev)
+      | None -> failf "no find in the log: %s" (show (`List events)));
+      ignore (moth [ "next"; "3" ]);
+      (match List.find_opt (fun ev -> member "cmd" ev = `String "next") (to_list (moth [ "log"; "-n"; "5" ])) with
+      | Some ev -> check (member "actor" ev = `String "user") "a next with no MOTH_ACTOR was recorded as %s, expected actor user" (show ev)
+      | None -> failf "no next in the log");
+      let r = moth_raw ~env:(env_with [ ("MOTH_ACTOR", "robot") ]) [ "status" ] in
+      check (r.code = 2 && contains r.err "MOTH_ACTOR must be user or agent") "MOTH_ACTOR=robot moth status gave exit %d, %s" r.code (String.trim r.err))
+
+(* a moth wait of our own, its stderr in a file *)
+type waiter = { wpid : int; werr : string; mutable ended : int option }
+
+let start_waiter dir =
+  let werr = Filename.concat !home (sprintf "waiter-%d.err" (int_of_float (now () *. 1000.))) in
+  let err = Unix.openfile werr [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC; Unix.O_CLOEXEC ] 0o600 in
+  let null = Unix.openfile "/dev/null" [ Unix.O_RDWR; Unix.O_CLOEXEC ] 0 in
+  let argv = [| exe "moth"; "wait"; "--session"; dir |] in
+  let wpid = Fun.protect ~finally:(fun () -> Unix.close err; Unix.close null) (fun () -> Unix.create_process argv.(0) argv null null err) in
+  { wpid; werr; ended = None }
+
+let waiter_code w =
+  (match w.ended with
+  | None -> (
+      match Unix.waitpid [ Unix.WNOHANG ] w.wpid with
+      | 0, _ -> ()
+      | _, st -> w.ended <- Some (match st with Unix.WEXITED c -> c | WSIGNALED s | WSTOPPED s -> 128 + abs s)
+      | exception Unix.Unix_error _ -> w.ended <- Some 0)
+  | Some _ -> ());
+  w.ended
+
+let stop_waiter w =
+  if waiter_code w = None then (
+    (try Unix.kill w.wpid Sys.sigkill with Unix.Unix_error _ -> ());
+    ignore (try Unix.waitpid [] w.wpid with Unix.Unix_error _ -> (0, Unix.WEXITED 0)));
+  check (not (alive w.wpid)) "moth wait (pid %d) is still running" w.wpid
+
+(* 38: moth wait tells what the person did, in order, and keeps quiet about the agent's own steps
+   and, while quiet is on, the person's *)
+let waits () =
+  with_target (fun t ->
+      Target_ctl.set t "points" "3";
+      ignore (moth [ "quiet"; "off" ]);
+      let dir = Filename.concat (Filename.concat !home "sessions") (string_of_int (Unix.getpid ())) in
+      mkdir_p dir;
+      let waiters = ref [] in
+      let start () = let w = start_waiter dir in waiters := w :: !waiters; w in
+      Fun.protect
+        ~finally:(fun () -> List.iter stop_waiter !waiters)
+        (fun () ->
+          let w1 = start () in
+          check (until ~timeout:15. (fun () -> Sys.file_exists (Filename.concat dir "cursor"))) "moth wait wrote no cursor in 15s";
+          ignore (find "3");
+          Unix.sleepf 0.5;
+          Target_ctl.set t "points" "4";
+          ignore (next "4");
+          check (until ~timeout:6. (fun () -> waiter_code w1 <> None)) "moth wait did not end within 6s of the person's find and next";
+          let err1 = read_text w1.werr in
+          check (waiter_code w1 = Some 2) "moth wait ended with %s, expected 2. stderr: %s" (match waiter_code w1 with Some c -> string_of_int c | None -> "?") err1;
+          (match lines_of err1 with
+          | [ head; a; b ] ->
+              check (head = "[moth] the person did this in moth:") "the note starts %S" head;
+              check (String.starts_with ~prefix:"- find 3: " a && String.starts_with ~prefix:"- next 4: " b) "the note's steps are %S and %S, expected find 3 then next 4" a b
+          | l -> failf "the note is %d lines, expected a heading and two steps: %s" (List.length l) err1);
+          (* the agent's own step, then quiet, then the person's *)
+          let w2 = start () in
+          Unix.sleepf 1.5;
+          Target_ctl.set t "points" "5";
+          ignore (moth ~env:(env_with [ ("MOTH_ACTOR", "agent") ]) [ "next"; "5" ]);
+          Unix.sleepf 3.;
+          check (waiter_code w2 = None) "moth wait ended (%s) over the agent's own step" (read_text w2.werr);
+          ignore (moth [ "quiet"; "on" ]);
+          ignore (next "5");
+          Unix.sleepf 3.;
+          check (waiter_code w2 = None) "moth wait ended (%s) over a step of the person's while quiet was on" (read_text w2.werr);
+          ignore (moth [ "quiet"; "off" ]);
+          Target_ctl.set t "points" "3";
+          ignore (find "3");
+          check (until ~timeout:6. (fun () -> waiter_code w2 <> None)) "moth wait did not end within 6s of the person's find after quiet off";
+          let err2 = read_text w2.werr in
+          check (waiter_code w2 = Some 2) "the second moth wait ended with %s, expected 2. stderr: %s"
+            (match waiter_code w2 with Some c -> string_of_int c | None -> "?") err2;
+          match lines_of err2 with
+          | [ head; a ] -> check (head = "[moth] the person did this in moth:" && String.starts_with ~prefix:"- find 3: " a) "the second note is %S, expected the find alone" err2
+          | _ -> failf "the second note is not a heading and one step: %s" err2))
+
+(* 39: the window's terminal runs moth agent, which runs the stand-in; what the person does in the
+   window reaches the stand-in as a note, quiet stops that, and when the agent ends the terminal is
+   a shell that can run moth *)
+let agent_in_window () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      (* the service is started here, with this program's HOME: the window runs with another, and CrossOver is found under HOME *)
+      ignore (moth [ "quiet"; "off" ]);
+      let notes = Filename.concat !home "stub-notes" and args = Filename.concat !home "stub-args" in
+      List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ notes; args ];
+      let vars = [ ("MOTH_CLAUDE", stub_agent ()); ("SHELL", "/bin/sh"); ("HOME", fake_home ()) ] in
+      let on_line = function
+        | "clicked" ->
+            track_app ();
+            check (until ~timeout:10. (fun () -> contains (read_text notes) "find 3")) "stub-notes has no note with find 3 within 10s. it holds: %S" (read_text notes);
+            let a = lines_of (read_text args) in
+            check (List.mem "--settings" a) "the stand-in's arguments have no --settings: %s" (String.concat " | " a);
+            check (List.exists (fun l -> String.starts_with ~prefix:(!home ^ "/agent/") l && String.ends_with ~suffix:"/settings.json" l) a)
+              "no settings file under %s/agent/ among the arguments: %s" !home (String.concat " | " a);
+            !app_say "quiet"
+        | "quiet" ->
+            track_app ();
+            check (member "quiet" (moth [ "status" ]) = `Bool true) "status after the box was ticked does not say quiet";
+            let before = read_text notes in
+            Target_ctl.set t "points" "4";
+            ignore (next "4");
+            Unix.sleepf 4.;
+            check (read_text notes = before) "a step of the person's while quiet was on reached the agent: %S" (read_text notes);
+            !app_say "bye"
+        | _ -> ()
+      in
+      Fun.protect
+        ~finally:(fun () -> try ignore (moth [ "quiet"; "off" ]) with Failure _ -> ())
+        (fun () -> app_ok ~stdin:true ~vars ~on_line [ "term"; bottle (); "moth-target.exe"; "3"; "stub agent up" ]);
+      check_all_gone "the window closed")
+
+(* 40: no claude code: the terminal says so, is a shell, and the panels still work *)
+let no_agent () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      ignore (moth [ "status" ]);
+      let vars = [ ("MOTH_CLAUDE", "/nonexistent"); ("SHELL", "/bin/sh"); ("HOME", fake_home ()) ] in
+      let on_line = function
+        | "clicked" ->
+            track_app ();
+            !app_say "shell"
+        | _ -> ()
+      in
+      app_ok ~stdin:true ~vars ~on_line [ "term"; bottle (); "moth-target.exe"; "3"; "claude code is not installed" ];
+      check_all_gone "the window closed")
+
 let scenarios =
   [
     (1, "decimal found from a whole number", decimal_from_whole);
@@ -977,6 +1193,10 @@ let scenarios =
     (34, "the list follows", list_follows);
     (35, "two hands on rows", two_hands);
     (36, "the game goes away", game_goes);
+    (37, "an agent's hand", agents_hand);
+    (38, "wait", waits);
+    (39, "the agent in the window", agent_in_window);
+    (40, "no agent", no_agent);
   ]
 
 let rec rm p =
@@ -1005,6 +1225,7 @@ let () =
   in
   let picked = opts [] (List.tl (Array.to_list Sys.argv)) in
   let picked = if picked = [] then List.map (fun (k, _, _) -> k) scenarios else picked in
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   Sys.catch_break true;
   Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ -> raise Sys.Break));
   (* under /tmp rather than $TMPDIR: macOS caps unix socket paths at 104 bytes *)
