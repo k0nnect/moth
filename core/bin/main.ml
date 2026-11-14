@@ -245,18 +245,21 @@ let agent args =
   | None -> fail 1 not_installed
   | Some claude -> (
       let home = Client.home () in
-      let quiet =
-        match Client.call ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
+      (* the fields of status --json *)
+      let status ~record =
+        match Client.call ~record ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
         | Error m -> fail 1 m
-        | Ok (status, _) ->
-            let field k = match status with `Assoc f -> List.assoc_opt k f | _ -> None in
-            let proto = match field "proto" with Some (`Int n) -> n | _ -> 1 in
-            if proto <> Daemon.protocol then fail 1 "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop";
-            field "quiet" = Some (`Bool true)
+        | Ok (`Assoc fields, _) -> fields
+        | Ok _ -> []
       in
+      let proto = match List.assoc_opt "proto" (status ~record:true) with Some (`Int n) -> n | _ -> 1 in
+      if proto <> Daemon.protocol then fail 1 "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop";
       (* the session's cursor starts here, so the first waiter tells everything the person does
-         from now on, however long the agent takes to load and end its first turn *)
+         from now on, however long the agent takes to load and start its first turn. Its quiet
+         state is read after the seq: a quiet change after the seq is replayed by the waiter, and
+         one before it is in this status *)
       let seq = match newest_seq ~home with Ok s -> s | Error m -> fail 1 m in
+      let quiet = List.assoc_opt "quiet" (status ~record:false) = Some (`Bool true) in
       let moth = absolute Sys.executable_name in
       let path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
       match Agent.prepare ~home ~moth ~path ~pid:(Unix.getpid ()) ~cursor:(seq, quiet) with

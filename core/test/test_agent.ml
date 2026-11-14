@@ -312,6 +312,76 @@ let other_build () =
       check_bool "no session folder" false (Sys.file_exists (Filename.concat home "agent"));
       check_bool "stub not run" false (Sys.file_exists ran))
 
+(* a service of the test's own on [home]/core.sock while [f] runs: each connection's one request
+   goes to [answer], whose reply is sent back, and the connection is held until the client hangs
+   up. Gives [f]'s result and the requests, in the order they came. *)
+let with_fake_service ~home answer f =
+  let path = Filename.concat home "core.sock" in
+  let listener = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.bind listener (Unix.ADDR_UNIX path);
+  Unix.listen listener 8;
+  let seen = ref [] and over = ref false in
+  let serve c =
+    let ic = Unix.in_channel_of_descr c in
+    (match input_line ic with
+    | line ->
+        let request = try Yojson.Safe.from_string line with Yojson.Json_error _ -> `Null in
+        seen := request :: !seen;
+        let reply = Yojson.Safe.to_string (answer request) ^ "\n" in
+        ignore (Unix.write_substring c reply 0 (String.length reply));
+        (try
+           while true do
+             ignore (input_line ic)
+           done
+         with End_of_file | Sys_error _ -> ())
+    | exception (End_of_file | Sys_error _) -> ());
+    close_in_noerr ic
+  in
+  let th =
+    Thread.create
+      (fun () ->
+        while not !over do
+          match Unix.select [ listener ] [] [] 0.05 with [], _, _ -> () | _ -> serve (fst (Unix.accept listener))
+        done)
+      ()
+  in
+  let result = Fun.protect ~finally:(fun () -> over := true; Thread.join th; Unix.close listener; try Sys.remove path with Sys_error _ -> ()) f in
+  (result, List.rev !seen)
+
+let id_of request = try Yojson.Safe.Util.member "id" request with Yojson.Safe.Util.Type_error _ -> `Null
+let served request result = `Assoc [ ("id", id_of request); ("ok", `Bool true); ("result", result); ("text", `String "") ]
+let refused request e = `Assoc [ ("id", id_of request); ("ok", `Bool false); ("error", `String e) ]
+
+(* a request as [cmd], and [(unrecorded)] after it when it asked to leave no trace *)
+let describe request =
+  let open Yojson.Safe.Util in
+  let cmd = try to_string (member "cmd" request) with Type_error _ -> "?" in
+  if (try member "record" request with Type_error _ -> `Null) = `Bool false then cmd ^ " (unrecorded)" else cmd
+
+let cmd_of request = try Yojson.Safe.Util.(to_string (member "cmd" request)) with Yojson.Safe.Util.Type_error _ -> ""
+
+(* the cursor's seq comes from the watch, and its quiet state from a status read after it, so a
+   quiet on between the first status and the watch is not missed *)
+let quiet_read_after_the_seq () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      Unix.mkdir home 0o700;
+      let stub = Filename.concat tmp "stub" in
+      write ~perm:0o755 stub "#!/bin/sh\n";
+      let statuses = ref 0 in
+      let answer request =
+        match cmd_of request with
+        | "status" ->
+            incr statuses;
+            served request (`Assoc [ ("attached", `Bool false); ("proto", `Int Daemon.protocol); ("quiet", `Bool (!statuses > 1)) ])
+        | "watch" -> served request (`Assoc [ ("seq", `Int 7) ])
+        | _ -> refused request "not asked for in this test"
+      in
+      let (code, _, err, pid), seen = with_fake_service ~home answer (fun () -> run ~env:[ ("MOTH_CLAUDE", stub); ("PATH", "/usr/bin:/bin") ] ~home ~tmphome:tmp [ "agent" ]) in
+      Alcotest.(check int) ("exit 0 (" ^ err ^ ")") 0 code;
+      Alcotest.(check (list string)) "status, the watch, then status unrecorded" [ "status"; "watch"; "status (unrecorded)" ] (List.map describe seen);
+      check_str "the cursor: the watch's seq, the second status's quiet" "7 quiet" (read (Filename.concat (Filename.concat (Filename.concat home "agent") (string_of_int pid)) "cursor")))
+
 (* the agent's own shell cannot start a second agent: refused before anything is written *)
 let not_from_the_agents_shell () =
   with_tmp (fun tmp ->
@@ -353,6 +423,7 @@ let () =
           Alcotest.test_case "no arguments" `Quick takes_no_arguments;
           Alcotest.test_case "program that cannot run" `Quick exec_fails;
           Alcotest.test_case "service from another build" `Quick other_build;
+          Alcotest.test_case "quiet is read after the seq" `Quick quiet_read_after_the_seq;
           Alcotest.test_case "not from the agent's own shell" `Quick not_from_the_agents_shell;
         ] );
     ]
