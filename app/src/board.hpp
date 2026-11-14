@@ -30,7 +30,9 @@ public:
   bool working() const;      // a recorded request is running, ours or anyone's
   QString what() const;      // "find 100 (agent)" while working
   bool connected() const;
-  QString line() const;      // the newest thing to tell the user
+  QString line() const;      // the newest thing to tell the user; the stale sentence while stale()
+  bool quiet() const;        // the last status read said the agent is not told what the user does
+  bool stale() const;        // the last status read had a `proto` other than 2, or none: the service is from another build
   void say(const QString &line);
   QString home() const;      // moth's home, as the client uses it
   // why a request would not be sent now: "moth is busy: <words>" while one of the user's own
@@ -78,7 +80,7 @@ private:
   std::optional<Hunt> hunt_;
   QString counts_, what_, line_;
   QString running_;            // the words of the user's own request still unanswered, or ""
-  bool working_ = false, connected_ = false;
+  bool working_ = false, connected_ = false, quiet_ = false, stale_ = false;
   bool lost_ = false;          // the feed went down and has not come back
   bool stopped_ = false;       // the last event was a stop: the feed is about to drop
   bool starting_ = true;       // the start of the service at the board's start is under way

@@ -93,6 +93,8 @@ void FakeCore::refuseWatch(const QString &error) { refuseWatch_ = error; }
 
 void FakeCore::closeGame(const QString &name) { closing_ = name; }
 
+void FakeCore::statusAsWritten(bool on) { asWritten_ = on; }
+
 void FakeCore::accept() {
   while (QLocalSocket *s = server_.nextPendingConnection()) {
     connections_.append(s);
@@ -165,6 +167,13 @@ void FakeCore::answer(QLocalSocket *socket, const QJsonValue &id, const Seen &re
     r.error = "unknown command: " + req.cmd + ". run: moth help";
   }
 
+  if (req.cmd == "status" && r.ok && r.result.isObject() && !asWritten_) {
+    QJsonObject o = r.result.toObject();
+    if (!o.contains("proto")) o.insert("proto", 2);
+    if (!o.contains("quiet")) o.insert("quiet", false);
+    r.result = o;
+  }
+
   if ((req.record && feedRequests_) || closes) {
     QJsonObject ev{{"seq", ++seq_},
                    {"ts", QDateTime::currentMSecsSinceEpoch() / 1000.0},
@@ -172,7 +181,8 @@ void FakeCore::answer(QLocalSocket *socket, const QJsonValue &id, const Seen &re
                    {"cmd", req.cmd},
                    {"args", QJsonArray::fromStringList(req.args)},
                    {"ok", r.ok},
-                   {"summary", firstLine(r.ok ? r.text : r.error)}};
+                   {"summary", firstLine(r.ok ? r.text : r.error)},
+                   {"act", !reads.contains(req.cmd) || closes}};
     if (!req.opts.isEmpty()) ev.insert("opts", optsObject(req.opts));
     push({{"event", ev}});
   }

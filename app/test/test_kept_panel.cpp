@@ -94,6 +94,7 @@ private slots:
   void itIsLastInTheWindowsColumn();
   void anEditCommittedWhileBusyIsSaid();
   void aFailedReadIsShownInThePanel();
+  void undoNeedsAGame();
 };
 
 void TestKeptPanel::twoKeptValuesAppear() {
@@ -262,6 +263,18 @@ void TestKeptPanel::noGameMeansAnEmptyTableAndNoRequest() {
   QTest::qWait(150);
   QCOMPARE(timesSeen(h.rig.fake, "kept"), before);
   QCOMPARE(h.view->model()->rowCount(), 0);
+}
+
+void TestKeptPanel::undoNeedsAGame() {
+  KeptRig h;
+  QVERIFY(h.start());
+  QTRY_VERIFY(h.undo->isEnabled());
+  h.rig.fake.on("status", [](const QStringList &, const Opts &) {
+    return ok(QJsonObject{{"attached", QJsonValue()}, {"hunt", QJsonValue()}}, "not attached");
+  });
+  h.rig.board.tick();
+  QTRY_VERIFY(!h.rig.board.attached().has_value());
+  QTRY_VERIFY(!h.undo->isEnabled());
 }
 
 void TestKeptPanel::buttonsAreDisabledWhileWorking() {

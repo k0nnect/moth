@@ -198,7 +198,7 @@ KeptPanel::KeptPanel(Board *board, QWidget *parent) : QWidget(parent), board_(bo
 void KeptPanel::showState() {
   const bool idle = !board_->working();
   forget_->setEnabled(idle && view_->selectionModel()->hasSelection());
-  undo_->setEnabled(idle);
+  undo_->setEnabled(idle && board_->attached());
   // the label says nothing is kept, or why the last read failed
   const bool failed = !error_.isEmpty() && board_->attached();
   const bool none = loaded_ && board_->attached() && model_->empty();

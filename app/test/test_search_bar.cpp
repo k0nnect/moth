@@ -58,6 +58,7 @@ private slots:
   void returnStartsAHuntThenNarrows();
   void nothingTypedSendsNothing();
   void whatEachButtonNeeds();
+  void theBoxIsEmptiedOnlyWhenItsOwnStepWorked();
   void aHeldFindDisablesEverything();
   void someoneElsesStepDisablesEverything();
   void anErrorIsTheLineWordForWord();
@@ -86,9 +87,8 @@ void TestSearchBar::returnStartsAHuntThenNarrows() {
   QCOMPARE(seenOf(rig.fake, "find")[0].args, QStringList{"100"});  // as typed, trimmed
   QVERIFY(seenOf(rig.fake, "find")[0].record);
   QTRY_VERIFY(rig.board.hunt().has_value());
-  // the step worked: the box's text is selected, so the next number replaces it
-  QTRY_VERIFY(number->hasSelectedText());
-  QCOMPARE(number->selectedText(), number->text());
+  // the step worked: the box is emptied and keeps the focus
+  QTRY_VERIFY(number->text().isEmpty());
 
   rig.fake.on("next", [](const QStringList &, const Opts &) { return ok(QJsonObject{{"main", 3}}, "3 matches"); });
   QTest::keyClicks(number, "90");
@@ -118,6 +118,40 @@ void TestSearchBar::nothingTypedSendsNothing() {
   QTest::qWait(100);
   QCOMPARE(timesSeen(rig.fake, "find"), 0);
   QCOMPARE(timesSeen(rig.fake, "next"), 0);
+}
+
+void TestSearchBar::theBoxIsEmptiedOnlyWhenItsOwnStepWorked() {
+  Rig rig;
+  statusIs(rig.fake, huntWith(true));
+  QVERIFY(rig.ready());
+  QVERIFY(reads(rig, true, true));
+  SearchBar bar(&rig.board);
+  bar.show();
+  auto *number = bar.findChild<QLineEdit *>("number");
+  rig.fake.on("next", [](const QStringList &args, const Opts &) {
+    return args == QStringList{"42"} ? Reply{false, QJsonValue(), "", "no"} : ok(QJsonObject{{"main", 3}}, "3 matches");
+  });
+  // a refused step keeps what was typed
+  number->setFocus();
+  QTest::keyClicks(number, "42");
+  QTest::keyClick(number, Qt::Key_Return);
+  QTRY_COMPARE(seenOf(rig.fake, "next").size(), 1);
+  QTRY_VERIFY(number->isEnabled());
+  QCOMPARE(number->text(), QString("42"));
+  // a relation button leaves the box alone
+  button(bar, "down")->click();
+  QTRY_COMPARE(seenOf(rig.fake, "next").size(), 2);
+  QTRY_VERIFY(number->isEnabled());
+  QCOMPARE(number->text(), QString("42"));
+  // a step that works empties it; a second Return sends nothing
+  rig.fake.on("next", [](const QStringList &, const Opts &) { return ok(QJsonObject{{"main", 3}}, "3 matches"); });
+  QTest::keyClick(number, Qt::Key_Return);
+  QTRY_COMPARE(seenOf(rig.fake, "next").size(), 3);
+  QTRY_VERIFY(number->text().isEmpty());
+  QTRY_VERIFY(number->isEnabled());
+  QTest::keyClick(number, Qt::Key_Return);
+  QTest::qWait(100);
+  QCOMPARE(seenOf(rig.fake, "next").size(), 3);
 }
 
 void TestSearchBar::whatEachButtonNeeds() {

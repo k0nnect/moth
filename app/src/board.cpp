@@ -7,6 +7,7 @@
 namespace {
 
 const QString lostLine = QString::fromUtf8("lost moth's background service. trying again…");
+const QString staleLine = "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop";
 const QString stoppedLine = "moth's background service was stopped. it starts again with your next action.";
 
 std::optional<Attached> attachedOf(const QJsonValue &v) {
@@ -58,7 +59,9 @@ QString Board::counts() const { return counts_; }
 bool Board::working() const { return working_; }
 QString Board::what() const { return what_; }
 bool Board::connected() const { return connected_; }
-QString Board::line() const { return line_; }
+QString Board::line() const { return stale_ ? staleLine : line_; }
+bool Board::quiet() const { return quiet_; }
+bool Board::stale() const { return stale_; }
 
 void Board::say(const QString &line) {
   owesLine_ = false;
@@ -70,6 +73,7 @@ void Board::say(const QString &line) {
 QString Board::home() const { return core_->home(); }
 
 QString Board::busyText() const {
+  if (stale_) return staleLine;
   if (!running_.isEmpty()) return "moth is busy: " + running_;
   if (working_) return "moth is busy: " + what_;
   if (starting_) return QString::fromUtf8("moth is starting…");
@@ -78,7 +82,7 @@ QString Board::busyText() const {
 
 bool Board::run(const QString &cmd, const QStringList &args, const Opts &opts, std::function<void(const Reply &)> then) {
   // one of the user's own at a time, even before the feed says the first has started
-  if (!running_.isEmpty() || working_) {
+  if (stale_ || !running_.isEmpty() || working_) {
     say(busyText());
     return false;
   }
@@ -130,9 +134,12 @@ void Board::ended(const QJsonObject &ev) {
   what_.clear();
   // the stop's own event comes just before the feed drops: the drop is then said as a stop
   stopped_ = ev.value("cmd").toString() == "stop" && ev.value("ok").toBool();
-  // the user's own action already shows its whole answer, whose first line this is
-  if (said != line_.section('\n', 0, 0)) line_ = said;
-  owesLine_ = false;
+  // a read (`act` false) leaves the line alone; no `act` counts as true. The user's own action
+  // already shows its whole answer, whose first line this is
+  if (ev.value("act").toBool(true)) {
+    if (said != line_.section('\n', 0, 0)) line_ = said;
+    owesLine_ = false;
+  }
   emit changed();
   ++turnsOwed_;
   refresh();
@@ -153,6 +160,7 @@ void Board::feedWent(bool up) {
   // the service, so the feed can't come back before it is over
   working_ = false;
   what_.clear();
+  stale_ = false;  // with the service gone, what it was is not known until it answers again
   line_ = stopped_ ? stoppedLine : lostLine;
   lost_ = needStatus_ = owesLine_ = true;
   emit changed();
@@ -185,11 +193,15 @@ void Board::showStatus(const Reply &r) {
   const auto attached = attachedOf(o.value("attached"));
   const auto hunt = huntOf(o.value("hunt"));
   const QString counts = hunt ? r.text.section('\n', 1) : QString();
+  const bool stale = o.value("proto").toInt(-1) != 2, quiet = o.value("quiet").toBool();
+  if (stale_ && !stale) owesLine_ = true;  // the stale sentence goes: the line is the status again
   QString line = line_;
   if (o.contains("closed")) line = r.text;  // the game went: say so, whatever was said before
   else if (owesLine_) line = r.text.section('\n', 0, 0);
   needStatus_ = owesLine_ = false;
-  if (attached == attached_ && hunt == hunt_ && counts == counts_ && line == line_) return;
+  if (attached == attached_ && hunt == hunt_ && counts == counts_ && line == line_ && stale == stale_ && quiet == quiet_) return;
+  stale_ = stale;
+  quiet_ = quiet;
   attached_ = attached;
   hunt_ = hunt;
   counts_ = counts;

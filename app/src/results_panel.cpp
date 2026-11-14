@@ -7,6 +7,7 @@
 #include <QLabel>
 #include <QPointer>
 #include <QPushButton>
+#include <QStyle>
 #include <QTableView>
 #include <QVBoxLayout>
 
@@ -60,6 +61,10 @@ ResultsPanel::ResultsPanel(Board *board, QWidget *parent) : QWidget(parent), boa
   view_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |
                          QAbstractItemView::AnyKeyPressed);
   view_->verticalHeader()->hide();
+  // `kind` shows its widest word whole, `#` six digits; `address` takes the rest
+  const int pad = 2 * view_->style()->pixelMetric(QStyle::PM_FocusFrameHMargin) + 16;
+  view_->setColumnWidth(ResultsModel::Number, view_->fontMetrics().horizontalAdvance("999999") + pad);
+  view_->setColumnWidth(ResultsModel::Kind, view_->fontMetrics().horizontalAdvance("whole number (8-byte)") + pad);
   view_->horizontalHeader()->setStretchLastSection(true);
   column->addWidget(view_, 1);
 
@@ -97,7 +102,7 @@ QString ResultsPanel::shownText() const {
   if (!model_->error().isEmpty()) return model_->error();
   if (!model_->listed()) return {};
   const qint64 total = model_->total(), rows = model_->rowCount();
-  if (rows >= total) return commas(total) + (total == 1 ? " match" : " matches");
+  if (rows >= total) return {};  // the count is in the search bar
   if (rows >= ResultsModel::cap)
     return "showing the first " + commas(ResultsModel::cap) + " of " + commas(total) + ". narrow the hunt to see fewer.";
   return "showing " + commas(rows) + " of " + commas(total);

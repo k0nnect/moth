@@ -23,7 +23,7 @@ public:
 
 private:
   void entered();
-  void step(const QString &cmd, const QStringList &args);
+  void step(const QString &cmd, const QStringList &args, bool fromBox);
   QString typed();                     // trimmed; nothing typed: says so and is ""
   void showState();
 

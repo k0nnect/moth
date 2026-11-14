@@ -84,23 +84,25 @@ void SearchBar::entered() {
 
 void SearchBar::find() {
   const QString n = typed();
-  if (!n.isEmpty()) step("find", {n});
+  if (!n.isEmpty()) step("find", {n}, true);
 }
 
 void SearchBar::narrow() {
   const QString n = typed();
-  if (!n.isEmpty()) step("next", {n});
+  if (!n.isEmpty()) step("next", {n}, true);
 }
 
-void SearchBar::snapshot() { step("snapshot", {}); }
+void SearchBar::snapshot() { step("snapshot", {}, true); }
 
-void SearchBar::compare(const QString &how) { step("next", {how}); }
+void SearchBar::compare(const QString &how) { step("next", {how}, false); }
 
 // a second press before the first step is answered sends nothing: Board::run refuses it and the
-// line says what is running
-void SearchBar::step(const QString &cmd, const QStringList &args) {
-  board_->run(cmd, args, {}, [self = QPointer<SearchBar>(this)](const Reply &r) {
+// line says what is running. A step the box started (`fromBox`) empties it once it worked; the
+// four relation buttons leave it alone
+void SearchBar::step(const QString &cmd, const QStringList &args, bool fromBox) {
+  board_->run(cmd, args, {}, [self = QPointer<SearchBar>(this), fromBox](const Reply &r) {
     if (!self) return;
+    if (fromBox && r.ok) self->number_->clear();
     self->selectNext_ = r.ok;
     self->showState();
   });

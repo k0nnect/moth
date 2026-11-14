@@ -139,6 +139,7 @@ private slots:
   void aSnapshotListsNothingYet();
   void showRarerFormsAddsAll();
   void theLabelSaysHowMuchIsShown();
+  void theKindColumnFitsItsWidestWord();
   void itStopsAtTwentyThousand();
   void aTickRefreshesTheRowsInView();
   void readsThatOverlapEndWithTheList();
@@ -367,16 +368,25 @@ void TestResults::showRarerFormsAddsAll() {
   QCOMPARE(opt(seenOf(h.rig.fake, "results").last().opts, "all"), QString("true"));
 }
 
+void TestResults::theKindColumnFitsItsWidestWord() {
+  ListRig h;
+  h.list.total = 48;
+  QVERIFY(h.start());
+  QVERIFY(h.view->columnWidth(ResultsModel::Kind) >= h.view->fontMetrics().horizontalAdvance("whole number (8-byte)"));
+  QVERIFY(h.view->columnWidth(ResultsModel::Number) >= h.view->fontMetrics().horizontalAdvance("999999"));
+  QCOMPARE(h.shown->text(), QString());  // 48 of 48: nothing to say
+}
+
 void TestResults::theLabelSaysHowMuchIsShown() {
   ListRig h;
   h.list.total = 3;
   QVERIFY(h.start());
-  QCOMPARE(h.shown->text(), QString("3 matches"));
+  QCOMPARE(h.shown->text(), QString());  // all loaded: the count is in the search bar
   QCOMPARE(h.model->rowCount(), 3);
   QVERIFY(!h.model->canFetchMore({}));
   h.list.total = 1;
   h.model->reload();
-  QTRY_COMPARE(h.shown->text(), QString("1 match"));
+  QTRY_COMPARE(h.shown->text(), QString());
   h.list.total = 1234567;
   h.model->reload();
   QTRY_COMPARE(h.shown->text(), QString("showing 200 of 1,234,567"));

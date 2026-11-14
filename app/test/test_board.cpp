@@ -28,6 +28,9 @@ private slots:
   void busyTextSaysWhatStandsInTheWay();
   void theGameClosingAsTheCoreRecordsIt();
   void aStopFromElsewhereIsSaidAsAStop();
+  void aReadsEventLeavesTheLineAlone();
+  void aServiceFromAnotherBuildIsSaid();
+  void quietComesFromStatus();
 };
 
 namespace {
@@ -510,6 +513,84 @@ void TestBoard::aStopFromElsewhereIsSaidAsAStop() {
   QTRY_VERIFY_WITH_TIMEOUT(rig.board.connected(), 2000);
   rig.fake.dropWatchers();
   QTRY_COMPARE(rig.board.line(), lost);
+}
+
+namespace {
+const QString staleSentence = "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop";
+
+void statusWith(FakeCore &fake, const QJsonObject &extra) {
+  fake.on("status", [extra](const QStringList &, const Opts &) {
+    QJsonObject o{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}};
+    for (auto it = extra.begin(); it != extra.end(); ++it) o.insert(it.key(), it.value());
+    return Reply{true, o, "not attached", ""};
+  });
+}
+
+QJsonObject withAct(QJsonObject line, bool act) {
+  QJsonObject ev = line.value("event").toObject();
+  ev.insert("act", act);
+  return {{"event", ev}};
+}
+}  // namespace
+
+// an event with act false never replaces the line; one with act true does
+void TestBoard::aReadsEventLeavesTheLineAlone() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  const QString before = rig.board.line();
+  rig.fake.push(withAct(eventLine(5, "agent", "log", {}, "a very long summary of what the log said, and more"), false));
+  QTest::qWait(300);
+  QCOMPARE(rig.board.line(), before);
+  rig.fake.push(withAct(eventLine(6, "agent", "set", {"3", "9"}, "set #3 (0x7ffe1234) to 9 (was 5)"), true));
+  QTRY_COMPARE(rig.board.line(), QString("agent: set #3 (0x7ffe1234) to 9 (was 5)"));
+}
+
+void TestBoard::aServiceFromAnotherBuildIsSaid() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  QVERIFY(!rig.board.stale());
+  rig.fake.statusAsWritten();
+  statusWith(rig.fake, {{"proto", 1}});
+  rig.board.tick();
+  QTRY_VERIFY(rig.board.stale());
+  QCOMPARE(rig.board.line(), staleSentence);
+  QCOMPARE(rig.board.busyText(), staleSentence);
+  const int before = rig.fake.seen().size();
+  QVERIFY(!rig.board.run("find", {"3"}));
+  QCOMPARE(rig.board.line(), staleSentence);
+  QCOMPARE(timesSeen(rig.fake, "find"), 0);
+  // events do not replace it
+  rig.fake.push(withAct(eventLine(7, "agent", "set", {"3", "9"}, "set #3 to 9"), true));
+  QTest::qWait(300);
+  QCOMPARE(rig.board.line(), staleSentence);
+  Q_UNUSED(before);
+  // no proto at all is stale too, and polls go on
+  statusWith(rig.fake, {});
+  const int polls = timesSeen(rig.fake, "status");
+  rig.board.tick();
+  QTRY_VERIFY(timesSeen(rig.fake, "status") > polls);
+  QVERIFY(rig.board.stale());
+  // restarted: it clears by itself
+  statusWith(rig.fake, {{"proto", 2}});
+  rig.board.tick();
+  QTRY_VERIFY(!rig.board.stale());
+  QVERIFY(rig.board.line() != staleSentence);
+  rig.fake.on("find", [](const QStringList &, const Opts &) { return Reply{true, QJsonObject(), "ok", ""}; });
+  QVERIFY(rig.board.run("find", {"3"}));
+}
+
+void TestBoard::quietComesFromStatus() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  QVERIFY(!rig.board.quiet());
+  QSignalSpy changed(&rig.board, &Board::changed);
+  statusWith(rig.fake, {{"proto", 2}, {"quiet", true}});
+  rig.board.tick();
+  QTRY_VERIFY(rig.board.quiet());
+  QTRY_COMPARE(changed.count(), 1);
+  rig.board.tick();
+  QTest::qWait(300);
+  QCOMPARE(changed.count(), 1);
 }
 
 QTEST_GUILESS_MAIN(TestBoard)

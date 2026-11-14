@@ -51,6 +51,9 @@ public:
   // busy line before it. From then on `status` answers `not attached` (what `on` registered for
   // it is dropped)
   void closeGame(const QString &name);
+  // from now on every ok `status` answer is sent as the test wrote it. Otherwise one that lacks
+  // `proto` gets "proto": 2 and one that lacks `quiet` gets "quiet": false, as the daemon's all have
+  void statusAsWritten(bool on = true);
 
 private:
   struct Held { QPointer<QLocalSocket> socket; QJsonValue id; Seen request; };
@@ -69,7 +72,7 @@ private:
   QList<QPointer<QLocalSocket>> watchers_;
   QList<Seen> seen_;
   QList<Opts> watches_;
-  bool feedRequests_ = true;
+  bool feedRequests_ = true, asWritten_ = false;
   QString refuseWatch_;
   QString closing_;          // the game the next unrecorded status finds closed, or ""
   qint64 seq_ = 0;
