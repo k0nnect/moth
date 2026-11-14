@@ -21,6 +21,7 @@ add_library(moth_window STATIC
   src/core_client.cpp
   src/pty.cpp
   src/term_screen.cpp
+  src/terminal_view.cpp
   src/board.cpp
   src/main_window.cpp
   src/game_bar.cpp
@@ -57,6 +58,7 @@ set(MOTH_APP_TESTS
   test_kept_panel
   test_pty
   test_term_screen
+  test_terminal_view
 )
 foreach(name IN LISTS MOTH_APP_TESTS)
   add_executable(${name} test/${name}.cpp)
