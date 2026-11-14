@@ -328,6 +328,7 @@ int main(int argc, char **argv) {
   CoreClient core(mothHome(), mothBin());
   Board board(&core);
   MainWindow window(&board);
+  window.setTerminal(false);  // no shell, no agent: this drives the panels
   window.show();
   Drive drive(window, board);
 

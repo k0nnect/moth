@@ -81,7 +81,9 @@ private:
 // What most app tests start from: a fake core in a fresh home, a client on it and a board on that.
 // Starting the service runs /usr/bin/true, so a stopped fake stays stopped.
 struct Rig {
-  QTemporaryDir home{"/tmp/moth-app-XXXXXX"};  // short: a socket path is limited to about 104 bytes
+  // short: a socket path is limited to about 104 bytes
+  explicit Rig(const QString &homeTemplate = "/tmp/moth-app-XXXXXX") : home(homeTemplate) {}
+  QTemporaryDir home;
   FakeCore fake{home.path()};
   CoreClient core{home.path(), "/usr/bin/true"};
   Board board{&core};
