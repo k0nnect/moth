@@ -225,7 +225,12 @@ void TermScreen::key(int qtKey, Qt::KeyboardModifiers mods, const QString &text)
   bool sent = false;
   for (const char32_t c : text.toUcs4()) {
     if (c < 0x20 || c == 0x7f) continue;  // Qt's text for a control key: the key code says it better
-    vterm_keyboard_unichar(vt_, c, cm);
+    if (c >= 0x80 && cm == VTERM_MOD_ALT) {
+      // libvterm writes Alt with a character past ASCII as ESC and one byte of the character
+      emit reply("\x1b" + QString::fromUcs4(&c, 1).toUtf8());
+    } else {
+      vterm_keyboard_unichar(vt_, c, cm);
+    }
     sent = true;
   }
   if (!sent && qtKey >= Qt::Key_Space && qtKey <= Qt::Key_AsciiTilde) {

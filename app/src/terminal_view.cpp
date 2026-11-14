@@ -9,6 +9,7 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QScrollBar>
+#include <QtMath>
 #include <algorithm>
 #include <utility>
 
@@ -33,6 +34,7 @@ const QByteArray kFreshTerminal =
 // Command as Control (unless the application asks it not to swap them); Option is Alt either way.
 struct KeyMods {
   bool command = false;          // a key with Command is never the program's
+  bool commandAlone = false;     // Command and no other modifier
   Qt::KeyboardModifiers terminal;  // Control, Alt (Option) and Shift as TermScreen::key reads them
 };
 
@@ -41,7 +43,9 @@ KeyMods translate(Qt::KeyboardModifiers qt) {
   m.terminal = qt & (Qt::ShiftModifier | Qt::AltModifier | Qt::KeypadModifier);
 #ifdef Q_OS_MACOS
   const bool swapped = !QCoreApplication::testAttribute(Qt::AA_MacDontSwapCtrlAndMeta);
-  m.command = qt & (swapped ? Qt::ControlModifier : Qt::MetaModifier);
+  const Qt::KeyboardModifiers command(swapped ? Qt::ControlModifier : Qt::MetaModifier);
+  m.command = qt & command;
+  m.commandAlone = (qt & ~Qt::KeypadModifier) == command;
   if (qt & (swapped ? Qt::MetaModifier : Qt::ControlModifier)) m.terminal |= Qt::ControlModifier;
 #else
   m.terminal |= qt & Qt::ControlModifier;
@@ -49,8 +53,23 @@ KeyMods translate(Qt::KeyboardModifiers qt) {
   return m;
 }
 
-// Command combinations the view keeps for itself (copy, paste, select all); they send nothing
-bool viewCommand(int key) { return key == Qt::Key_C || key == Qt::Key_V || key == Qt::Key_A; }
+// Cmd+C, Cmd+V and Cmd+A, which the view keeps for itself (copy, paste, select all); they send
+// nothing. Any other chord with Command is the application's.
+bool viewCommand(int key, const KeyMods &mods) {
+  return mods.commandAlone && (key == Qt::Key_C || key == Qt::Key_V || key == Qt::Key_A);
+}
+
+// a key that only changes the others: pressing it alone sends nothing
+bool modifierKey(int key) {
+  return key == Qt::Key_Shift || key == Qt::Key_Control || key == Qt::Key_Meta || key == Qt::Key_Alt ||
+         key == Qt::Key_AltGr || key == Qt::Key_CapsLock;
+}
+
+// text a key press sends as it is: no control characters
+bool plainText(const QString &text) {
+  return !text.isEmpty() &&
+         std::none_of(text.begin(), text.end(), [](QChar c) { return c.unicode() < 0x20 || c.unicode() == 0x7f; });
+}
 
 // the character a key makes with Shift alone. Qt's code for a key that makes a character is that
 // character (a letter's in upper case); codes from Key_Escape on are keys that make none
@@ -74,6 +93,7 @@ TerminalView::TerminalView(QWidget *parent) : QAbstractScrollArea(parent) {
     fonts_[i].setBold(i & 1);
     fonts_[i].setItalic(i & 2);
     rawFonts_[i] = QRawFont::fromFont(fonts_[i]);
+    metrics_.emplace_back(fonts_[i]);
   }
   const QFontMetrics fm(fonts_[0]);
   cellW_ = std::max(1, fm.averageCharWidth());
@@ -113,6 +133,7 @@ TermScreen *TerminalView::screen() const { return screen_; }
 bool TerminalView::running() const { return pty_ && pty_->running(); }
 qint64 TerminalView::pid() const { return pty_ ? pty_->pid() : 0; }
 int TerminalView::paints() const { return paints_; }
+int TerminalView::rowsPainted() const { return rowsPainted_; }
 
 bool TerminalView::run(const QString &program, const QStringList &args, const QStringList &env,
                        const QString &cwd) {
@@ -123,6 +144,7 @@ bool TerminalView::run(const QString &program, const QStringList &args, const QS
     return false;
   }
   pty_ = pty;
+  typed_.clear();
   screen_->feed(kFreshTerminal);  // no output can have arrived yet: it comes through the event loop
   connect(pty, &Pty::output, screen_, &TermScreen::feed);
   connect(pty, &Pty::exited, this, [this, pty](int status) {
@@ -148,6 +170,11 @@ void TerminalView::fitToViewport() {
 
 QRect TerminalView::cellRect(int row, int col, int width) const {
   return QRect(col * cellW_, row * cellH_, width * cellW_, cellH_);
+}
+
+QRect TerminalView::cursorRectangle() const {
+  const QPoint c = screen_->cursor();
+  return cellRect(c.y(), c.x()).translated(viewport()->pos());  // the viewport is inset
 }
 
 // --- painting
@@ -177,6 +204,7 @@ void TerminalView::repaintDamaged() {
     r = end;
   }
   viewport()->update(region);
+  tellInputMethodCursor(false);  // a cursor that moved damaged its rows
 }
 
 TerminalView::Style TerminalView::styleOf(const TermCell &cell) const {
@@ -191,11 +219,15 @@ const QFont &TerminalView::fontFor(const Style &style) const { return fonts_[fon
 
 void TerminalView::paintEvent(QPaintEvent *e) {
   ++paints_;
+  rowsPainted_ = 0;
   QPainter p(viewport());
   const QRegion &region = e->region();
   const int rows = screen_->rows(), width = viewport()->width();
-  for (int row = 0; row < rows; ++row)
-    if (region.intersects(QRect(0, row * cellH_, width, cellH_))) paintRow(p, row);
+  for (int row = 0; row < rows; ++row) {
+    if (!region.intersects(QRect(0, row * cellH_, width, cellH_))) continue;
+    paintRow(p, row);
+    ++rowsPainted_;
+  }
   p.setClipping(false);
   const QRect below(0, rows * cellH_, width, viewport()->height() - rows * cellH_);
   if (below.isValid() && region.intersects(below)) p.fillRect(below, kBackground);
@@ -204,19 +236,23 @@ void TerminalView::paintEvent(QPaintEvent *e) {
 // a row as runs of cells that look the same, the cursor or the composition on it
 void TerminalView::paintRow(QPainter &p, int row) {
   const int cols = screen_->cols();
-  std::vector<TermCell> cells(static_cast<size_t>(cols));
-  for (int col = 0; col < cols; ++col) cells[static_cast<size_t>(col)] = screen_->cell(row, col);
+  rowCells_.resize(static_cast<size_t>(cols));
+  for (int col = 0; col < cols; ++col) rowCells_[static_cast<size_t>(col)] = screen_->cell(row, col);
+  const std::vector<TermCell> &cells = rowCells_;
   const QRect line(0, row * cellH_, viewport()->width(), cellH_);
   p.setClipRect(line);  // a glyph that reaches past its row would not be repainted with that row
+  Style style = styleOf(cells[0]);
   for (int col = 0; col < cols;) {
-    const Style style = styleOf(cells[static_cast<size_t>(col)]);
     int end = col + 1;
-    // the second half of a wide character goes with its first, whatever it says itself
-    while (end < cols && (cells[static_cast<size_t>(end)].width == 0 ||
-                          styleOf(cells[static_cast<size_t>(end)]) == style))
-      ++end;
+    Style next;
+    for (; end < cols; ++end) {
+      if (cells[static_cast<size_t>(end)].width == 0) continue;  // goes with its first half
+      next = styleOf(cells[static_cast<size_t>(end)]);
+      if (!(next == style)) break;
+    }
     paintCells(p, row, col, end, style, cells);
     col = end;
+    style = next;
   }
   const int right = cols * cellW_;
   if (right < line.width()) p.fillRect(QRect(right, line.top(), line.width() - right, cellH_), kBackground);
@@ -278,7 +314,7 @@ void TerminalView::paintText(QPainter &p, int row, int from, int to, const Style
   }
   if (others.empty()) return;
   p.setFont(fontFor(style));
-  const QFontMetricsF fm(fontFor(style));
+  const QFontMetricsF &fm = metrics_[static_cast<size_t>(fontIndex(style))];
   for (const int col : others) {
     const TermCell &cell = cells[static_cast<size_t>(col)];
     qreal x = col * cellW_;
@@ -308,7 +344,7 @@ void TerminalView::paintCursor(QPainter &p, int row, const std::vector<TermCell>
 // what the input method is composing, over the cells from the cursor on, underlined
 void TerminalView::paintComposition(QPainter &p, int row) {
   const int x = screen_->cursor().x() * cellW_;
-  const int width = QFontMetrics(fonts_[0]).horizontalAdvance(composing_);
+  const int width = qCeil(metrics_[0].horizontalAdvance(composing_));
   const int cells = std::max(1, (width + cellW_ - 1) / cellW_);
   p.fillRect(cellRect(row, screen_->cursor().x(), cells), kBackground);
   p.setPen(kForeground);
@@ -328,7 +364,8 @@ bool TerminalView::event(QEvent *e) {
   // the application's shortcuts get no key the program would: only Command ones
   if (e->type() == QEvent::ShortcutOverride) {
     auto *k = static_cast<QKeyEvent *>(e);
-    if (!translate(k->modifiers()).command || viewCommand(k->key())) {
+    const KeyMods mods = translate(k->modifiers());
+    if (!mods.command || viewCommand(k->key(), mods)) {
       e->accept();
       return true;
     }
@@ -345,42 +382,51 @@ void TerminalView::keyPressEvent(QKeyEvent *e) {
 // Command combination the application may have a use for
 bool TerminalView::sendKey(QKeyEvent *e) {
   const KeyMods mods = translate(e->modifiers());
-  if (mods.command) return viewCommand(e->key());
+  if (!modifierKey(e->key())) typed_.clear();
+  if (mods.command) return viewCommand(e->key(), mods);
   QString text = e->text();
   // Option is Meta: the key's own character goes out with ESC before it, not the one Option
   // composes (Option+b is ESC b, not ∫). A key that makes no character keeps its text.
   if (mods.terminal & Qt::AltModifier) {
     const QString own = keyCharacter(e->key(), mods.terminal);
     if (!own.isEmpty()) text = own;
-    // libvterm sends Alt with a character past ASCII as ESC and one byte of the character, not its
-    // UTF-8 (Option+ö on a German keyboard): ESC goes as a key of its own, then the character
-    const bool pastAscii = std::any_of(text.begin(), text.end(), [](QChar c) { return c.unicode() >= 0x80; });
-    if (pastAscii && !(mods.terminal & Qt::ControlModifier)) {
-      screen_->key(Qt::Key_Escape, Qt::NoModifier, {});
-      screen_->key(0, mods.terminal & ~Qt::AltModifier, text);
-      return true;
-    }
   }
   screen_->key(e->key(), mods.terminal, text);
+  if (!(mods.terminal & (Qt::ControlModifier | Qt::AltModifier)) && plainText(text)) typed_ = text;
   return true;
 }
 
 void TerminalView::inputMethodEvent(QInputMethodEvent *e) {
-  // what the input method takes back from just before the cursor (the press-and-hold menu replaces
-  // the letter it was opened on) is erased with Backspace, one per character; a terminal cannot
-  // replace text anywhere else
+  // the input method may take back what was just typed: the press-and-hold menu replaces the letter
+  // it was opened on. When what it replaces ends at the cursor and is within what the view itself
+  // sent last, it is erased with Backspace, one per character. Anything else (text the program
+  // drew, or that the view did not send) cannot be replaced in a terminal: the commit goes alone.
   const int start = e->replacementStart(), length = e->replacementLength();
-  if (length > 0 && start + length == 0) {
-    const QString gone = textBeforeCursor().right(length);
-    const qsizetype count = gone.size() == length ? gone.toUcs4().size() : length;
+  if (length > 0 && start + length == 0 && length <= typed_.size()) {
+    const qsizetype count = typed_.right(length).toUcs4().size();
     for (qsizetype i = 0; i < count; ++i) screen_->key(Qt::Key_Backspace, Qt::NoModifier, {});
+    typed_.chop(length);
   }
-  if (!e->commitString().isEmpty()) screen_->key(0, Qt::NoModifier, e->commitString());
+  if (!e->commitString().isEmpty()) {
+    screen_->key(0, Qt::NoModifier, e->commitString());
+    typed_ = e->commitString();
+  }
   if (e->preeditString() != composing_) {
     composing_ = e->preeditString();
     damage(screen_->cursor().y(), screen_->cursor().y());
+    tellInputMethodCursor(true);
   }
   e->accept();
+}
+
+// while the view has the focus, the input method's picker and candidates follow the cursor:
+// told when the cursor's cell has moved, or always (the composition changed)
+void TerminalView::tellInputMethodCursor(bool always) {
+  if (!hasFocus()) return;
+  const QRect cursor = cursorRectangle();
+  if (!always && cursor == imCursor_) return;
+  imCursor_ = cursor;
+  QGuiApplication::inputMethod()->update(Qt::ImCursorRectangle);
 }
 
 QVariant TerminalView::inputMethodQuery(Qt::InputMethodQuery query) const {
@@ -389,10 +435,8 @@ QVariant TerminalView::inputMethodQuery(Qt::InputMethodQuery query) const {
       // Option is Meta: while it is held the key must come as a key press, not go to macOS for
       // composing (Option+e would start an accent)
       return !(QGuiApplication::queryKeyboardModifiers() & Qt::AltModifier);
-    case Qt::ImCursorRectangle: {  // where a picker opens: in this widget, the viewport is inset
-      const QPoint c = screen_->cursor();
-      return cellRect(c.y(), c.x()).translated(viewport()->pos());
-    }
+    case Qt::ImCursorRectangle:  // where a picker opens
+      return cursorRectangle();
     case Qt::ImHints:
       return static_cast<int>(Qt::ImhNoAutoUppercase | Qt::ImhNoPredictiveText);
     case Qt::ImFont:

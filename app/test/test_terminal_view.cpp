@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QInputMethod>
 #include <QInputMethodEvent>
 #include <QLineEdit>
 #include <QTemporaryDir>
@@ -187,6 +188,50 @@ private slots:
     QVERIFY(QTest::qWaitFor([&] { return t.view.screen()->text(1) == "é"; }));  // what cat read
     QCOMPARE(t.view.screen()->text(0), QString("é"));
   }
+  void theInputMethodTakesBackOnlyWhatTheViewSent() {
+    Term t;
+    auto replace = [&](const QString &commit, int start, int length, const QString &preedit = "") {
+      QInputMethodEvent e(preedit, {});
+      e.setCommitString(commit, start, length);
+      QApplication::sendEvent(&t.view, &e);
+    };
+    QVERIFY(startDump(t.view, 12));
+    replace("é", -1, 1);                                     // "ready" is the program's: c3 a9
+    press(&t.view, Qt::Key_X, Qt::NoModifier, "x");          // 78
+    press(&t.view, Qt::Key_Left, Qt::KeypadModifier, "");    // 1b 5b 44, and the x is forgotten
+    replace("é", -1, 1);                                     // c3 a9
+    press(&t.view, Qt::Key_E, Qt::NoModifier, "e");          // 65
+    replace("é", -1, 1);                                     // 7f c3 a9: the e is taken back
+    QCOMPARE(dumped(t.view), QString("c3 a9 78 1b 5b 44 c3 a9 65 7f c3 a9"));
+    QVERIFY(startDump(t.view, 7));
+    press(&t.view, Qt::Key_E, Qt::NoModifier, "e");          // 65
+    replace("é", -2, 2);                                     // more than was sent: c3 a9 alone
+    press(&t.view, Qt::Key_A, Qt::NoModifier, "a");          // 61
+    replace("", -1, 1, "a");                                 // 7f: taken back into a composition
+    replace("à", 0, 0);                                      // c3 a0
+    QCOMPARE(dumped(t.view), QString("65 c3 a9 61 7f c3 a0"));
+  }
+  void theInputMethodIsToldWhereTheCursorGoes() {
+    Term t;
+    QVERIFY(t.shown());
+    QVERIFY(t.focused());
+    QTest::qWait(50);
+    QSignalSpy told(QGuiApplication::inputMethod(), &QInputMethod::cursorRectangleChanged);
+    t.view.screen()->feed("abc");  // the cursor moves
+    QVERIFY(QTest::qWaitFor([&] { return told.count() == 1; }));
+    QInputMethodEvent compose("x", {});  // the composition changes
+    QApplication::sendEvent(&t.view, &compose);
+    QCOMPARE(told.count(), 2);
+    t.view.screen()->feed("\x1b[5;1Hy\x1b[1;4H");  // a row changes, the cursor ends where it was
+    QTest::qWait(50);
+    QCOMPARE(told.count(), 2);
+    t.view.clearFocus();
+    QTest::qWait(50);
+    told.clear();
+    t.view.screen()->feed("def");  // without the focus it is not told
+    QTest::qWait(50);
+    QCOMPARE(told.count(), 0);
+  }
   void inputMethodQueries() {
     Term t;
     QVERIFY(t.shown());
@@ -244,6 +289,18 @@ private slots:
     Term t;
     QVERIFY(t.shown());
     QTest::qWait(100);
+    // damage is gathered for 16 ms: a burst of a few milliseconds, with the event loop turning
+    // between its pieces, is painted at most once while it lasts and once when the time is up
+    const int burst = t.view.paints();
+    for (int i = 0; i < 100; ++i) {
+      t.view.screen()->feed("x");
+      QCoreApplication::processEvents();
+    }
+    const int during = t.view.paints() - burst;
+    QVERIFY2(during <= 1, qPrintable(QString::number(during)));
+    QTest::qWait(50);
+    QCOMPARE(t.view.paints() - burst - during, 1);
+    // and a real flood, from a program
     const int before = t.view.paints();
     QVERIFY(t.run("/bin/sh", {"-c", "i=0; while [ $i -lt 5000 ]; do printf 'line %d\\n' $i; i=$((i+1)); done; sleep 5"}));
     QVERIFY(shows(t.view, "line 4999", 10000));
@@ -267,13 +324,18 @@ private slots:
     v.screen()->feed("row four");
     QVERIFY(QTest::qWaitFor([&] { return !v.painted.isEmpty(); }));
     QTest::qWait(50);
-    QCOMPARE(v.painted - row4, QRegion());
+    QCOMPARE(v.painted - row4, QRegion());  // what Qt was asked to repaint
+    QCOMPARE(v.rowsPainted(), 1);           // and what was drawn
     // losing the focus repaints the cursor's row, and only that
     v.painted = QRegion();
     v.clearFocus();
     QVERIFY(QTest::qWaitFor([&] { return !v.painted.isEmpty(); }));
     QTest::qWait(50);
     QCOMPARE(v.painted - row4, QRegion());
+    QCOMPARE(v.rowsPainted(), 1);
+    // a whole repaint draws every row
+    v.viewport()->repaint();
+    QCOMPARE(v.rowsPainted(), v.screen()->rows());
   }
   void theCursorIsABlockWhenFocusedAnOutlineWhenNotAndHiddenWhenAsked() {
     Term t;
@@ -372,11 +434,23 @@ private slots:
     QVERIFY(press(&t.view, Qt::Key_V, Qt::ControlModifier, "v"));
     QVERIFY(press(&t.view, Qt::Key_A, Qt::ControlModifier, "a"));
     QVERIFY(!press(&t.view, Qt::Key_Q, Qt::ControlModifier, "q"));  // left for the application
+    // and so is any chord of Command with other modifiers, even on C, V or A
+    QVERIFY(!press(&t.view, Qt::Key_C, Qt::ControlModifier | Qt::ShiftModifier, "C"));
+    QVERIFY(!press(&t.view, Qt::Key_V, Qt::ControlModifier | Qt::AltModifier, "√"));
+    QVERIFY(!press(&t.view, Qt::Key_A, Qt::ControlModifier | Qt::MetaModifier, "\x01"));
     // and the application's shortcuts may have Command, but no other key the program wants
     QKeyEvent quit(QEvent::ShortcutOverride, Qt::Key_Q, Qt::ControlModifier);
     quit.ignore();
     QApplication::sendEvent(&t.view, &quit);
     QVERIFY(!quit.isAccepted());
+    QKeyEvent copyShifted(QEvent::ShortcutOverride, Qt::Key_C, Qt::ControlModifier | Qt::ShiftModifier);
+    copyShifted.ignore();
+    QApplication::sendEvent(&t.view, &copyShifted);
+    QVERIFY(!copyShifted.isAccepted());
+    QKeyEvent copy(QEvent::ShortcutOverride, Qt::Key_C, Qt::ControlModifier);
+    copy.ignore();
+    QApplication::sendEvent(&t.view, &copy);
+    QVERIFY(copy.isAccepted());
     QKeyEvent escape(QEvent::ShortcutOverride, Qt::Key_Escape, Qt::NoModifier);
     escape.ignore();
     QApplication::sendEvent(&t.view, &escape);

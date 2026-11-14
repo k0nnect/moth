@@ -3,6 +3,7 @@
 #include <QAbstractScrollArea>
 #include <QColor>
 #include <QFont>
+#include <QFontMetricsF>
 #include <QRawFont>
 #include <QString>
 #include <QStringList>
@@ -33,6 +34,7 @@ public:
   bool running() const;
   qint64 pid() const;
   int paints() const;        // how many times it has painted, for tests
+  int rowsPainted() const;   // how many rows the last paint drew, for tests
   QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
 signals:
   void exited(int status);
@@ -58,6 +60,7 @@ private:
   // size
   void fitToViewport();
   QRect cellRect(int row, int col, int width = 1) const;  // in the viewport
+  QRect cursorRectangle() const;                          // the cursor's cell, in this widget
 
   // painting
   void damage(int firstRow, int lastRow);
@@ -73,15 +76,20 @@ private:
 
   // keys
   bool sendKey(QKeyEvent *e);
+  void tellInputMethodCursor(bool always);
   QString textBeforeCursor() const;
 
   TermScreen *screen_;
   Pty *pty_ = nullptr;
   QFont fonts_[4];             // regular, bold, italic, bold italic
   QRawFont rawFonts_[4];       // the same, Menlo's own glyphs only
+  std::vector<QFontMetricsF> metrics_;  // the same, fallback fonts' advances included
   int cellW_ = 1, cellH_ = 1, ascent_ = 0, underlineY_ = 0, lineWidth_ = 1;
   std::vector<bool> damaged_;  // rows waiting to be repainted
   QTimer repaint_;
-  int paints_ = 0;
+  std::vector<TermCell> rowCells_;  // the row being painted
+  int paints_ = 0, rowsPainted_ = 0;
   QString composing_;          // the input method's text not yet committed
+  QRect imCursor_;             // where the input method was last told the cursor is
+  QString typed_;              // what the last key press or commit sent, as far as not taken back
 };

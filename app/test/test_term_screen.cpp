@@ -222,6 +222,14 @@ private slots:
     QCOMPARE(t.key(Qt::Key_A, Qt::NoModifier, ""), QByteArray("a"));  // no text: the key itself
     QCOMPARE(t.key(Qt::Key_Shift, Qt::ShiftModifier, ""), QByteArray());
   }
+  void altWithACharacterPastAsciiIsEscAndItsUtf8() {
+    Scr t;
+    QCOMPARE(t.key(Qt::Key_Odiaeresis, Qt::AltModifier, QString::fromUtf8("ö")), QByteArray("\x1b\xc3\xb6"));
+    QCOMPARE(t.key(Qt::Key_Odiaeresis, Qt::AltModifier | Qt::ShiftModifier, QString::fromUtf8("Ö")),
+             QByteArray("\x1b\xc3\x96"));
+    QCOMPARE(t.key(Qt::Key_unknown, Qt::AltModifier, QString::fromUtf8("π")), QByteArray("\x1b\xcf\x80"));
+    QCOMPARE(t.key(0, Qt::AltModifier, QString::fromUcs4(U"\U0001F600")), QByteArray("\x1b\xf0\x9f\x98\x80"));
+  }
   void optionArrowsMoveByWord() {
     Scr t;
     QCOMPARE(t.key(Qt::Key_Left, Qt::AltModifier), QByteArray("\x1b" "b"));
