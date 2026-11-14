@@ -229,6 +229,20 @@ private slots:
     QCOMPARE(t.key(Qt::Key_Left, Qt::AltModifier | Qt::ShiftModifier), QByteArray("\x1b[1;4D"));
     QCOMPARE(t.key(Qt::Key_Up, Qt::AltModifier), QByteArray("\x1b[1;3A"));
   }
+  void optionArrowsWithTheKeypadFlagMacOsAdds() {
+    Scr t;
+    const auto kp = Qt::KeypadModifier;
+    QCOMPARE(t.key(Qt::Key_Left, Qt::AltModifier | kp), QByteArray("\x1b" "b"));
+    QCOMPARE(t.key(Qt::Key_Right, Qt::AltModifier | kp), QByteArray("\x1b" "f"));
+    QCOMPARE(t.key(Qt::Key_Up, kp), QByteArray("\x1b[A"));
+    QCOMPARE(t.key(Qt::Key_Up, Qt::ShiftModifier | kp), QByteArray("\x1b[1;2A"));
+  }
+  void backspaceAndReturnWithShift() {
+    Scr t;
+    QCOMPARE(t.key(Qt::Key_Backspace, Qt::ShiftModifier), QByteArray("\x7f"));
+    // left to libvterm on purpose: Claude Code reads this as a new line in its prompt
+    QCOMPARE(t.key(Qt::Key_Return, Qt::ShiftModifier), QByteArray("\x1b[13;2u"));
+  }
   void controlKeysAreC0Bytes() {
     Scr t;
     QCOMPARE(t.key(Qt::Key_I, Qt::ControlModifier, "\t"), QByteArray("\t"));

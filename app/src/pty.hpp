@@ -37,7 +37,7 @@ private:
   void writable();
   void flush();
   void check();                 // has the child ended? when it has, drain, reap, emit
-  void drain();
+  bool drain();
   void finish(int rawStatus);
   QString find(const QString &program, const QStringList &env) const;
 

@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFileInfo>
+#include <QPointer>
 #include <QSocketNotifier>
 #include <QTimer>
 #include <cerrno>
@@ -51,7 +52,11 @@ Pty::~Pty() {
   master_ = -1;
   if (pid_ <= 0) return;
   int status = 0;
-  auto reaped = [&] { return waitpid(pid_, &status, WNOHANG) == pid_; };
+  // ECHILD: already reaped (the child's exit was seen), so there is nothing to signal or wait for
+  auto reaped = [&] {
+    const pid_t r = waitpid(pid_, &status, WNOHANG);
+    return r == pid_ || (r < 0 && errno == ECHILD);
+  };
   bool gone = reaped();
   if (!gone) {
     kill(-pid_, SIGHUP);
@@ -107,16 +112,18 @@ bool Pty::start(const QString &program, const QStringList &args, const QStringLi
   winsize ws = sizeOf(rows, cols);
   // the kernel's own defaults, and UTF-8 on, so that Backspace in a line editor erases a character
   // (read from a fresh pty, then IUTF8 added)
+  // when either call fails the kernel's own defaults are used as they are
   termios tio{};
+  bool haveTermios = false;
   int m = -1, sl = -1;
   if (openpty(&m, &sl, nullptr, nullptr, nullptr) == 0) {
-    tcgetattr(sl, &tio);
+    haveTermios = tcgetattr(sl, &tio) == 0;
     ::close(m);
     ::close(sl);
   }
   tio.c_iflag |= IUTF8;
   int fd = -1;
-  const pid_t pid = forkpty(&fd, nullptr, &tio, &ws);
+  const pid_t pid = forkpty(&fd, nullptr, haveTermios ? &tio : nullptr, &ws);
   if (pid < 0) return false;
   if (pid == 0) childMain(cwdB.constData(), argv.data(), envp.data());
 
@@ -193,14 +200,22 @@ void Pty::check() {
   }
 }
 
-void Pty::drain() {
+// false when a slot deleted this Pty while it ran
+bool Pty::drain() {
+  QPointer<Pty> self(this);
   char buf[65536];
   for (;;) {
     const ssize_t n = ::read(master_, buf, sizeof buf);
-    if (n > 0) emit output(QByteArray(buf, static_cast<qsizetype>(n)));
-    else if (n < 0 && errno == EINTR) continue;
-    else break;
+    if (n > 0) {
+      emit output(QByteArray(buf, static_cast<qsizetype>(n)));
+      if (!self) return false;
+    } else if (n < 0 && errno == EINTR) {
+      continue;
+    } else {
+      break;
+    }
   }
+  return true;
 }
 
 void Pty::finish(int raw) {
@@ -209,7 +224,10 @@ void Pty::finish(int raw) {
   readNotifier_->setEnabled(false);
   writeNotifier_->setEnabled(false);
   pending_.clear();
-  drain();
+  // what the child wrote last may still be in the pty when its exit is seen. (On macOS the session
+  // leader cannot be reaped before its output is read, so no test can show this drain here; it
+  // matters on systems where it can.)
+  if (!drain()) return;
   pid_ = 0;
   ::close(master_);
   master_ = -1;

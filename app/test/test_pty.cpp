@@ -170,6 +170,10 @@ private slots:
     QVERIFY2(r.out.contains("iutf8") && !r.out.contains("-iutf8"), r.out.constData());
   }
   void aRelativeProgramMeansTheSameFileBeforeAndAfterTheChdir() {
+    struct Back {  // the working folder, put back on every path out
+      QString was = QDir::currentPath();
+      ~Back() { QDir::setCurrent(was); }
+    } back;
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
     QVERIFY(QDir::setCurrent(dir.path()));
@@ -182,7 +186,33 @@ private slots:
     QVERIFY(r.pty.start("./tool.sh", {}, plainEnv, "/", 24, 80));  // the child runs in /
     QVERIFY(r.waitExit());
     QCOMPARE(r.out, QByteArray("ran"));
-    QDir::setCurrent("/");
+  }
+  void deletingThePtyFromItsOutputSlotIsSafe() {
+    for (int round = 0; round < 20; ++round) {
+      auto *pty = new Pty;
+      bool deleted = false;
+      QObject::connect(pty, &Pty::output, pty, [&, pty](const QByteArray &) {
+        if (!deleted) {
+          deleted = true;
+          delete pty;
+        }
+      });
+      QVERIFY(pty->start("/bin/sh", {"-c", "printf hello"}, plainEnv, "/", 24, 80));
+      QElapsedTimer t;
+      t.start();
+      while (!deleted && t.elapsed() < 3000) QTest::qWait(10);
+      QVERIFY(deleted);
+      QTest::qWait(20);  // anything left queued runs now
+    }
+  }
+  void destroyingAfterTheExitWasSeenIsQuick() {
+    auto r = std::make_unique<Run>();
+    QVERIFY(r->start("/bin/sh", {"-c", "exit 0"}));
+    QVERIFY(r->waitExit());
+    QElapsedTimer t;
+    t.start();
+    r.reset();
+    QVERIFY(t.elapsed() < 200);
   }
   void startingAgainAfterAnExitWorks() {
     Run r;

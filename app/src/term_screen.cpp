@@ -187,6 +187,7 @@ bool TermScreen::mouseWanted() const { return mouse_; }
 QString TermScreen::title() const { return title_; }
 
 void TermScreen::key(int qtKey, Qt::KeyboardModifiers mods, const QString &text) {
+  mods &= ~Qt::KeypadModifier;  // macOS sets it on every arrow key; it means nothing to a terminal
   VTermModifier m = vtermMods(mods);
   if (qtKey == Qt::Key_Backtab) m = static_cast<VTermModifier>(m | VTERM_MOD_SHIFT);
   // Alt+arrow is how a Mac terminal asks for a word at a time: ESC b and ESC f
@@ -194,8 +195,10 @@ void TermScreen::key(int qtKey, Qt::KeyboardModifiers mods, const QString &text)
     emit reply(qtKey == Qt::Key_Left ? QByteArray("\x1b" "b") : QByteArray("\x1b" "f"));
     return;
   }
-  // Ctrl+Backspace is Backspace, as Terminal.app sends it
-  if (qtKey == Qt::Key_Backspace) m = static_cast<VTermModifier>(m & ~VTERM_MOD_CTRL);
+  // Ctrl+Backspace and Shift+Backspace are Backspace (libvterm would send CSI-u, which a shell
+  // shows as junk). Shift+Return and Ctrl+Return stay libvterm's: Claude Code reads ESC [ 13 ; 2 u
+  // as a new line in its prompt.
+  if (qtKey == Qt::Key_Backspace) m = static_cast<VTermModifier>(m & ~(VTERM_MOD_CTRL | VTERM_MOD_SHIFT));
   const VTermKey special = vtermKey(qtKey);
   if (special != VTERM_KEY_NONE) {
     vterm_keyboard_key(vt_, special, m);
