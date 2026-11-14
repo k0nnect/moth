@@ -253,15 +253,14 @@ let agent args =
       match Agent.prepare ~home ~moth ~path ~pid:(Unix.getpid ()) with
       | Error m -> fail 1 m
       | Ok dir -> (
-          Unix.chdir (Filename.concat (Filename.dirname dir) "work");
-          Unix.putenv "MOTH_ACTOR" "agent";
-          Unix.putenv "MOTH_HOME" home;
-          Unix.putenv "PATH" (Filename.dirname moth ^ ":" ^ path);
-          let argv = Agent.command ~claude ~dir in
-          try Unix.execv claude argv
-          with Unix.Unix_error _ ->
+          let give_up m =
             Agent.remove_session dir;
-            fail 1 not_installed))
+            fail 1 m
+          in
+          (try Unix.chdir (Filename.concat (Filename.dirname dir) "work")
+           with Unix.Unix_error (e, _, _) -> give_up ("cannot start in moth's agent folder: " ^ Unix.error_message e));
+          List.iter (fun (k, v) -> Unix.putenv k v) (Agent.env ~home ~moth ~path);
+          try Unix.execv claude (Agent.command ~claude ~dir) with Unix.Unix_error _ -> give_up not_installed))
 
 let () =
   match List.tl (Array.to_list Sys.argv) with

@@ -26,10 +26,12 @@ let quote s =
   Buffer.add_char b '\'';
   Buffer.contents b
 
+let env ~home ~moth ~path = [ ("MOTH_ACTOR", "agent"); ("MOTH_HOME", home); ("PATH", Filename.dirname moth ^ ":" ^ path) ]
+
 let settings ~home ~moth ~path ~dir : Yojson.Safe.t =
   `Assoc
     [
-      ("env", `Assoc [ ("MOTH_ACTOR", `String "agent"); ("MOTH_HOME", `String home); ("PATH", `String (Filename.dirname moth ^ ":" ^ path)) ]);
+      ("env", `Assoc (List.map (fun (k, v) -> (k, `String v)) (env ~home ~moth ~path)));
       ("permissions", `Assoc [ ("allow", `List [ `String "Bash(moth *)" ]) ]);
       ( "hooks",
         `Assoc
@@ -92,6 +94,7 @@ let prepare ~home ~moth ~path ~pid =
       (fun name -> match session_pid name with Some p when p <> pid && not (alive p) -> rm (Filename.concat agent name) | _ -> ())
       (Sys.readdir agent);
     let dir = Filename.concat agent (string_of_int pid) in
+    rm dir;
     mkdir dir;
     write_private (Filename.concat dir "settings.json") (Yojson.Safe.pretty_to_string (settings ~home ~moth ~path ~dir) ^ "\n");
     write_private (Filename.concat dir "instructions.md") instructions;

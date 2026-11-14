@@ -6,13 +6,18 @@ val instructions : string
 (** what moth says to it first, so its first turn ends and the hook is armed *)
 val first_prompt : string
 
+(** the three variables the agent runs with: [MOTH_ACTOR], [MOTH_HOME] and [PATH] (moth's own folder
+    first). The settings' [env] and the process environment are both this. *)
+val env : home:string -> moth:string -> path:string -> (string * string) list
+
 (** the settings for one session: env, the one approval, the Stop hook. [moth] is the absolute
     path of the running [moth], [path] the PATH it was started with, [dir] the session folder. *)
 val settings : home:string -> moth:string -> path:string -> dir:string -> Yojson.Safe.t
 
 (** makes [home]/agent/<pid> (0700) with settings.json and instructions.md (0600), makes
     [home]/agent/work, and removes sibling session folders whose process is not alive (a folder
-    named for a process id; nothing else under agent/ is touched). Returns the session folder. *)
+    named for a process id; nothing else under agent/ is touched). A folder already there for [pid] can only be stale, and is
+    removed first. Returns the session folder. *)
 val prepare : home:string -> moth:string -> path:string -> pid:int -> (string, string) result
 
 (** the program and arguments to run *)

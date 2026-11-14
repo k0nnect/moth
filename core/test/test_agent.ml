@@ -66,36 +66,54 @@ let prepare_makes_files () =
   with_tmp (fun d ->
       let home = Filename.concat d "home" in
       let agent = Filename.concat home "agent" in
-      (* a dead pid: a child that has been reaped *)
-      let dead =
-        match Unix.fork () with
-        | 0 -> Unix._exit 0
-        | p ->
-            ignore (Unix.waitpid [] p);
-            string_of_int p
-      in
-      Unix.mkdir home 0o700;
+      let moth = "/opt/moth/bin/moth" in
+      match Agent.prepare ~home ~moth ~path:"/usr/bin" ~pid:(Unix.getpid ()) with
+      | Error m -> Alcotest.failf "prepare: %s" m
+      | Ok dir ->
+          check_str "the folder" (Filename.concat agent (string_of_int (Unix.getpid ()))) dir;
+          Alcotest.(check int) "home mode" 0o700 (mode home);
+          Alcotest.(check int) "agent mode" 0o700 (mode agent);
+          Alcotest.(check int) "work mode" 0o700 (mode (Filename.concat agent "work"));
+          Alcotest.(check int) "dir mode" 0o700 (mode dir);
+          Alcotest.(check int) "settings mode" 0o600 (mode (Filename.concat dir "settings.json"));
+          Alcotest.(check int) "instructions mode" 0o600 (mode (Filename.concat dir "instructions.md"));
+          check_str "settings parse and equal"
+            (Yojson.Safe.to_string (Agent.settings ~home ~moth ~path:"/usr/bin" ~dir))
+            (Yojson.Safe.to_string (Yojson.Safe.from_file (Filename.concat dir "settings.json")));
+          check_str "instructions" Agent.instructions (read (Filename.concat dir "instructions.md")))
+
+(* a child that has been reaped: its pid is not alive, and never the test's own *)
+let dead_pid () =
+  match Unix.fork () with
+  | 0 -> Unix._exit 0
+  | p ->
+      ignore (Unix.waitpid [] p);
+      string_of_int p
+
+let prepare_removes_dead () =
+  with_tmp (fun d ->
+      let agent = Filename.concat d "agent" in
+      let dead = dead_pid () in
       Unix.mkdir agent 0o700;
       List.iter (fun n -> Unix.mkdir (Filename.concat agent n) 0o700) [ dead; "notapid"; "0"; "work" ];
       write (Filename.concat (Filename.concat agent dead) "cursor") "1";
       write (Filename.concat (Filename.concat agent "work") "keep.txt") "x";
-      let pid = Unix.getpid () + 1 in
-      (match Agent.prepare ~home ~moth:"/opt/moth/bin/moth" ~path:"/usr/bin" ~pid with
-      | Error m -> Alcotest.failf "prepare: %s" m
-      | Ok dir ->
-          check_str "the folder" (Filename.concat agent (string_of_int pid)) dir;
-          Alcotest.(check int) "dir mode" 0o700 (mode dir);
-          Alcotest.(check int) "agent mode" 0o700 (mode agent);
-          Alcotest.(check int) "work mode" 0o700 (mode (Filename.concat agent "work"));
-          Alcotest.(check int) "settings mode" 0o600 (mode (Filename.concat dir "settings.json"));
-          Alcotest.(check int) "instructions mode" 0o600 (mode (Filename.concat dir "instructions.md"));
-          check_str "settings parse and equal"
-            (Yojson.Safe.to_string (Agent.settings ~home ~moth:"/opt/moth/bin/moth" ~path:"/usr/bin" ~dir))
-            (Yojson.Safe.to_string (Yojson.Safe.from_file (Filename.concat dir "settings.json")));
-          check_str "instructions" Agent.instructions (read (Filename.concat dir "instructions.md")));
+      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"/usr/bin" ~pid:(Unix.getpid ()) with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
       check_bool "dead sibling removed" false (Sys.file_exists (Filename.concat agent dead));
       List.iter (fun n -> check_bool (n ^ " kept") true (Sys.file_exists (Filename.concat agent n))) [ "notapid"; "0"; "work" ];
       check_bool "work content kept" true (Sys.file_exists (Filename.concat (Filename.concat agent "work") "keep.txt")))
+
+let prepare_replaces_stale_own () =
+  with_tmp (fun d ->
+      let pid = Unix.getpid () in
+      let dir = Filename.concat (Filename.concat d "agent") (string_of_int pid) in
+      Unix.mkdir (Filename.concat d "agent") 0o700;
+      Unix.mkdir dir 0o755;
+      write (Filename.concat dir "cursor") "7 quiet";
+      write (Filename.concat dir "waiter") "1";
+      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"/usr/bin" ~pid with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
+      Alcotest.(check (list string)) "only the two files" [ "instructions.md"; "settings.json" ] (List.sort compare (Array.to_list (Sys.readdir dir)));
+      Alcotest.(check int) "mode" 0o700 (mode dir))
 
 let prepare_keeps_live () =
   with_tmp (fun d ->
@@ -120,7 +138,7 @@ let command_shape () =
 
 (* ---- the real moth agent, with a stand-in for claude ---- *)
 
-let run ?(env = []) ~home ~tmphome args =
+let run ?(env = []) ?cwd ~home ~tmphome args =
   let err = Filename.concat tmphome "stderr.txt" and out = Filename.concat tmphome "stdout.txt" in
   let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
   let o = Unix.openfile out [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
@@ -129,7 +147,14 @@ let run ?(env = []) ~home ~tmphome args =
   let drop k = not (List.exists (fun p -> String.starts_with ~prefix:(p ^ "=") k) [ "MOTH_HOME"; "HOME"; "MOTH_CLAUDE"; "MOTH_ACTOR"; "PATH" ]) in
   let base = List.filter drop (Array.to_list (Unix.environment ())) in
   let env = Array.of_list (("MOTH_HOME=" ^ home) :: ("HOME=" ^ tmphome) :: (List.map (fun (k, v) -> k ^ "=" ^ v) env @ base)) in
-  let pid = Unix.create_process_env exe (Array.of_list (exe :: args)) env null o e in
+  let pid =
+    match cwd with
+    | None -> Unix.create_process_env exe (Array.of_list (exe :: args)) env null o e
+    | Some c ->
+        let old = Sys.getcwd () in
+        Sys.chdir c;
+        Fun.protect ~finally:(fun () -> Sys.chdir old) (fun () -> Unix.create_process_env exe (Array.of_list (exe :: args)) env null o e)
+  in
   List.iter Unix.close [ null; o; e ];
   let _, st = Unix.waitpid [] pid in
   ((match st with Unix.WEXITED n -> n | _ -> -1), String.trim (read out), String.trim (read err), pid)
@@ -157,11 +182,14 @@ let agent_runs_stub () =
       Fun.protect
         ~finally:(fun () -> stop_service ~home ~tmphome:tmp)
         (fun () ->
-          let code, _, err, pid = run ~env:[ ("MOTH_CLAUDE", stub); ("PATH", "/usr/bin:/bin") ] ~home ~tmphome:tmp [ "agent" ] in
+          (* MOTH_HOME given relative: the agent must see the absolute one *)
+          let code, _, err, pid = run ~cwd:tmp ~env:[ ("MOTH_CLAUDE", stub); ("PATH", "/usr/bin:/bin") ] ~home:"moth home" ~tmphome:tmp [ "agent" ] in
           Alcotest.(check int) ("exit 0 (" ^ err ^ ")") 0 code;
           let dir = Filename.concat (Filename.concat home "agent") (string_of_int pid) in
           check_bool "session folder is the stub's pid" true (Sys.file_exists (Filename.concat dir "settings.json"));
-          let expect = Array.to_list (Agent.command ~claude:stub ~dir) |> List.tl in
+          (* the relative MOTH_HOME was made absolute in the agent's own (resolved) folder *)
+          let rdir = Filename.concat (Filename.concat (Unix.realpath home) "agent") (string_of_int pid) in
+          let expect = Array.to_list (Agent.command ~claude:stub ~dir:rdir) |> List.tl in
           let got = read out in
           let want = String.concat "\n" (List.map (fun a -> "[" ^ a ^ "]") expect) ^ "\n" in
           check_bool "the arguments are command's" true (String.starts_with ~prefix:want got);
@@ -169,7 +197,7 @@ let agent_runs_stub () =
           let real p = try Unix.realpath p with _ -> p in
           check_str "directory" (real (Filename.concat (Filename.concat home "agent") "work")) (Option.get (field "pwd"));
           check_str "actor" "agent" (Option.get (field "actor"));
-          check_str "home" home (Option.get (field "home"));
+          check_str "home" (Unix.realpath home) (Option.get (field "home"));
           check_str "pid" (string_of_int pid) (Option.get (field "pid"));
           let mothdir = Filename.dirname (Lazy.force moth_exe) in
           check_bool "path starts with moth's folder" true (String.starts_with ~prefix:(real mothdir ^ ":") (Option.get (field "path")) || String.starts_with ~prefix:(mothdir ^ ":") (Option.get (field "path")));
@@ -193,6 +221,51 @@ let not_installed_cases () =
       check "not executable" [ ("MOTH_CLAUDE", plain); ("PATH", "/usr/bin:/bin") ];
       check "empty path" [ ("PATH", "") ])
 
+let exec_fails () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      let bad = Filename.concat tmp "bad" in
+      write ~perm:0o755 bad "#!/nonexistent/interpreter\n";
+      Fun.protect
+        ~finally:(fun () -> stop_service ~home ~tmphome:tmp)
+        (fun () ->
+          let code, _, err, pid = run ~env:[ ("MOTH_CLAUDE", bad); ("PATH", "/usr/bin:/bin") ] ~home ~tmphome:tmp [ "agent" ] in
+          Alcotest.(check int) "exit" 1 code;
+          check_str "text" not_installed err;
+          check_bool "no session folder" false (Sys.file_exists (Filename.concat (Filename.concat home "agent") (string_of_int pid)))))
+
+(* a listener on core.sock that answers one status with no proto, then goes *)
+let other_build () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      Unix.mkdir home 0o700;
+      let stub = Filename.concat tmp "stub" in
+      let ran = Filename.concat tmp "ran" in
+      write ~perm:0o755 stub (Printf.sprintf "#!/bin/sh\n: > %s\n" (Filename.quote ran));
+      let listener = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      Unix.bind listener (Unix.ADDR_UNIX (Filename.concat home "core.sock"));
+      Unix.listen listener 4;
+      let th =
+        Thread.create
+          (fun () ->
+            let c, _ = Unix.accept listener in
+            let ic = Unix.in_channel_of_descr c and oc = Unix.out_channel_of_descr c in
+            let line = input_line ic in
+            let id = try Yojson.Safe.Util.(member "id" (Yojson.Safe.from_string line)) with _ -> `Null in
+            output_string oc (Yojson.Safe.to_string (`Assoc [ ("id", id); ("ok", `Bool true); ("result", `Assoc [ ("attached", `Bool false) ]); ("text", `String "") ]) ^ "\n");
+            flush oc;
+            (try ignore (input_line ic) with End_of_file | Sys_error _ -> ());
+            Unix.close c)
+          ()
+      in
+      let code, _, err, _ = run ~env:[ ("MOTH_CLAUDE", stub); ("PATH", "/usr/bin:/bin") ] ~home ~tmphome:tmp [ "agent" ] in
+      Thread.join th;
+      Unix.close listener;
+      Alcotest.(check int) "exit" 1 code;
+      check_str "text" "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop" err;
+      check_bool "no session folder" false (Sys.file_exists (Filename.concat home "agent"));
+      check_bool "stub not run" false (Sys.file_exists ran))
+
 let takes_no_arguments () =
   with_tmp (fun tmp ->
       let code, _, err, _ = run ~home:(Filename.concat tmp "h") ~tmphome:tmp [ "agent"; "now" ] in
@@ -207,6 +280,8 @@ let () =
           Alcotest.test_case "settings" `Quick settings_exact;
           Alcotest.test_case "hook command" `Quick hook_command_runs;
           Alcotest.test_case "prepare" `Quick prepare_makes_files;
+          Alcotest.test_case "prepare removes dead sessions" `Quick prepare_removes_dead;
+          Alcotest.test_case "prepare replaces a stale own folder" `Quick prepare_replaces_stale_own;
           Alcotest.test_case "prepare keeps a live session" `Quick prepare_keeps_live;
           Alcotest.test_case "instructions" `Quick instructions_say;
           Alcotest.test_case "command" `Quick command_shape;
@@ -216,5 +291,7 @@ let () =
           Alcotest.test_case "stand-in agent" `Quick agent_runs_stub;
           Alcotest.test_case "not installed" `Quick not_installed_cases;
           Alcotest.test_case "no arguments" `Quick takes_no_arguments;
+          Alcotest.test_case "program that cannot run" `Quick exec_fails;
+          Alcotest.test_case "service from another build" `Quick other_build;
         ] );
     ]
