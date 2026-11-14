@@ -373,7 +373,9 @@ void TestResults::theKindColumnFitsItsWidestWord() {
   h.list.total = 48;
   QVERIFY(h.start());
   QVERIFY(h.view->columnWidth(ResultsModel::Kind) >= h.view->fontMetrics().horizontalAdvance("whole number (8-byte)"));
-  QVERIFY(h.view->columnWidth(ResultsModel::Number) >= h.view->fontMetrics().horizontalAdvance("999999"));
+  const int six = h.view->fontMetrics().horizontalAdvance("999999");
+  QVERIFY(h.view->columnWidth(ResultsModel::Number) >= six);
+  QVERIFY(h.view->columnWidth(ResultsModel::Number) < six + 40);  // fits six digits, no more than that
   QCOMPARE(h.shown->text(), QString());  // 48 of 48: nothing to say
 }
 

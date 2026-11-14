@@ -97,12 +97,15 @@ void SearchBar::snapshot() { step("snapshot", {}, true); }
 void SearchBar::compare(const QString &how) { step("next", {how}, false); }
 
 // a second press before the first step is answered sends nothing: Board::run refuses it and the
-// line says what is running. A step the box started (`fromBox`) empties it once it worked; the
+// line says what is running. A step the box started (`fromBox`) empties it once it worked, unless
+// something else was typed meanwhile; the
 // four relation buttons leave it alone
 void SearchBar::step(const QString &cmd, const QStringList &args, bool fromBox) {
-  board_->run(cmd, args, {}, [self = QPointer<SearchBar>(this), fromBox](const Reply &r) {
+  const QString sent = number_->text().trimmed();
+  board_->run(cmd, args, {}, [self = QPointer<SearchBar>(this), fromBox, sent](const Reply &r) {
     if (!self) return;
-    if (fromBox && r.ok) self->number_->clear();
+    // what was typed meanwhile stays
+    if (fromBox && r.ok && self->number_->text().trimmed() == sent) self->number_->clear();
     self->selectNext_ = r.ok;
     self->showState();
   });

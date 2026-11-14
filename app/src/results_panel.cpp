@@ -62,6 +62,7 @@ ResultsPanel::ResultsPanel(Board *board, QWidget *parent) : QWidget(parent), boa
                          QAbstractItemView::AnyKeyPressed);
   view_->verticalHeader()->hide();
   // `kind` shows its widest word whole, `#` six digits; `address` takes the rest
+  view_->ensurePolished();  // the font measured is the one the table will show
   const int pad = 2 * view_->style()->pixelMetric(QStyle::PM_FocusFrameHMargin) + 16;
   view_->setColumnWidth(ResultsModel::Number, view_->fontMetrics().horizontalAdvance("999999") + pad);
   view_->setColumnWidth(ResultsModel::Kind, view_->fontMetrics().horizontalAdvance("whole number (8-byte)") + pad);

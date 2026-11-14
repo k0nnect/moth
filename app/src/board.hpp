@@ -32,19 +32,24 @@ public:
   bool connected() const;
   QString line() const;      // the newest thing to tell the user; the stale sentence while stale()
   bool quiet() const;        // the last status read said the agent is not told what the user does
-  bool stale() const;        // the last status read had a `proto` other than 2, or none: the service is from another build
+  // the last status read had a `proto` other than 2, or none: the service is from another build.
+  // A status read that fails, or the feed dropping, clears it: the user's next action then starts
+  // whatever build is installed
+  bool stale() const;
   void say(const QString &line);
   QString home() const;      // moth's home, as the client uses it
   // why a request would not be sent now: "moth is busy: <words>" while one of the user's own
   // requests is unanswered (its words: "undo", "find 100") or while working ("moth is busy: " +
   // what()); "moth is starting…" while the service is being started at the board's start; ""
-  // when nothing stands in the way
+  // when nothing stands in the way. While stale() it is the stale sentence instead, whatever else
+  // is going on
   QString busyText() const;
   // a recorded request as the user; true when it was sent. Refused while one of the user's own
   // requests is still unanswered, or while working: the line becomes busyText(), nothing is sent,
   // `then` is not called, and it returns false. The core's whole answer becomes the line, all its
   // lines: the text when it worked, the error when it failed; its event (whose summary is the
-  // answer's first line) leaves it so. With no service answering, it starts one.
+  // answer's first line) leaves it so. With no service answering, it starts one. While stale()
+  // (the service is from another build) it is refused the same way, with the stale sentence.
   bool run(const QString &cmd, const QStringList &args = {}, const Opts &opts = {},
            std::function<void(const Reply &)> then = {});
   // an unrecorded read. Dropped while working or while the service is being started at the

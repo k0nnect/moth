@@ -180,9 +180,16 @@ void Board::readStatus() {
 void Board::tookStatus(const Reply &r) {
   if (r.ok) {
     showStatus(r);
-  } else if (!lost_ && r.error != line_) {  // while the feed is lost, the line already says so
-    line_ = r.error;
-    emit changed();
+  } else {
+    // a read that fails clears stale: with the service stopped and no feed to say so, the next
+    // action of the user must be able to start the right build
+    const bool wasStale = std::exchange(stale_, false);
+    if (!lost_ && r.error != line_) {  // while the feed is lost, the line already says so
+      line_ = r.error;
+      emit changed();
+    } else if (wasStale) {
+      emit changed();
+    }
   }
   if (std::exchange(statusAgain_, false)) refresh();
   else turn();

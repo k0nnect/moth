@@ -62,5 +62,5 @@ void MainWindow::hideEvent(QHideEvent *e) {
 }
 
 void MainWindow::showLine() {
-  line_->setText(board_->working() ? "working: " + board_->what() + QString::fromUtf8("…") : board_->line());
+  line_->setText(!board_->stale() && board_->working() ? "working: " + board_->what() + QString::fromUtf8("…") : board_->line());
 }

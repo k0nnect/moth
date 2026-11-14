@@ -59,6 +59,7 @@ private slots:
   void nothingTypedSendsNothing();
   void whatEachButtonNeeds();
   void theBoxIsEmptiedOnlyWhenItsOwnStepWorked();
+  void whatIsTypedBeforeTheReplyStays();
   void aHeldFindDisablesEverything();
   void someoneElsesStepDisablesEverything();
   void anErrorIsTheLineWordForWord();
@@ -136,11 +137,13 @@ void TestSearchBar::theBoxIsEmptiedOnlyWhenItsOwnStepWorked() {
   QTest::keyClicks(number, "42");
   QTest::keyClick(number, Qt::Key_Return);
   QTRY_COMPARE(seenOf(rig.fake, "next").size(), 1);
+  QTRY_COMPARE(rig.board.line(), QString("no"));  // the reply has come
   QTRY_VERIFY(number->isEnabled());
   QCOMPARE(number->text(), QString("42"));
   // a relation button leaves the box alone
   button(bar, "down")->click();
   QTRY_COMPARE(seenOf(rig.fake, "next").size(), 2);
+  QTRY_COMPARE(rig.board.line(), QString("3 matches"));
   QTRY_VERIFY(number->isEnabled());
   QCOMPARE(number->text(), QString("42"));
   // a step that works empties it; a second Return sends nothing
@@ -149,9 +152,30 @@ void TestSearchBar::theBoxIsEmptiedOnlyWhenItsOwnStepWorked() {
   QTRY_COMPARE(seenOf(rig.fake, "next").size(), 3);
   QTRY_VERIFY(number->text().isEmpty());
   QTRY_VERIFY(number->isEnabled());
+  QTRY_VERIFY(number->hasFocus());  // and it keeps the focus
   QTest::keyClick(number, Qt::Key_Return);
   QTest::qWait(100);
   QCOMPARE(seenOf(rig.fake, "next").size(), 3);
+}
+
+void TestSearchBar::whatIsTypedBeforeTheReplyStays() {
+  Rig rig;
+  statusIs(rig.fake, huntWith(true));
+  QVERIFY(rig.ready());
+  QVERIFY(reads(rig, true, true));
+  SearchBar bar(&rig.board);
+  bar.show();
+  auto *number = bar.findChild<QLineEdit *>("number");
+  rig.fake.on("next", [](const QStringList &, const Opts &) { return ok(QJsonObject{{"main", 3}}, "3 matches"); });
+  rig.fake.hold("next");
+  number->setFocus();
+  QTest::keyClicks(number, "42");
+  QTest::keyClick(number, Qt::Key_Return);
+  QTRY_COMPARE(seenOf(rig.fake, "next").size(), 1);
+  number->setText("43");
+  rig.fake.release("next");
+  QTRY_COMPARE(rig.board.line(), QString("3 matches"));
+  QCOMPARE(number->text(), QString("43"));
 }
 
 void TestSearchBar::whatEachButtonNeeds() {

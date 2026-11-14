@@ -31,6 +31,9 @@ private slots:
   void aReadsEventLeavesTheLineAlone();
   void aServiceFromAnotherBuildIsSaid();
   void quietComesFromStatus();
+  void aFailedStatusReadClearsStale();
+  void theFeedDroppingClearsStale();
+  void aReadsEventStillEndsWorkAndTurns();
 };
 
 namespace {
@@ -550,33 +553,65 @@ void TestBoard::aServiceFromAnotherBuildIsSaid() {
   QVERIFY(rig.ready());
   QVERIFY(!rig.board.stale());
   rig.fake.statusAsWritten();
-  statusWith(rig.fake, {{"proto", 1}});
+  // no proto at all is stale, on a board that was not
+  statusWith(rig.fake, {});
   rig.board.tick();
   QTRY_VERIFY(rig.board.stale());
   QCOMPARE(rig.board.line(), staleSentence);
-  QCOMPARE(rig.board.busyText(), staleSentence);
-  const int before = rig.fake.seen().size();
-  QVERIFY(!rig.board.run("find", {"3"}));
-  QCOMPARE(rig.board.line(), staleSentence);
-  QCOMPARE(timesSeen(rig.fake, "find"), 0);
-  // events do not replace it
-  rig.fake.push(withAct(eventLine(7, "agent", "set", {"3", "9"}, "set #3 to 9"), true));
-  QTest::qWait(300);
-  QCOMPARE(rig.board.line(), staleSentence);
-  Q_UNUSED(before);
-  // no proto at all is stale too, and polls go on
-  statusWith(rig.fake, {});
+  // so is another proto, and polls go on
+  statusWith(rig.fake, {{"proto", 1}});
   const int polls = timesSeen(rig.fake, "status");
   rig.board.tick();
   QTRY_VERIFY(timesSeen(rig.fake, "status") > polls);
   QVERIFY(rig.board.stale());
-  // restarted: it clears by itself
+  QCOMPARE(rig.board.busyText(), staleSentence);
+  QVERIFY(!rig.board.run("find", {"3"}));
+  QCOMPARE(rig.board.line(), staleSentence);
+  // events do not replace it
+  rig.fake.push(withAct(eventLine(7, "agent", "set", {"3", "9"}, "set #3 to 9"), true));
+  QTest::qWait(300);
+  QCOMPARE(rig.board.line(), staleSentence);
+  QCOMPARE(timesSeen(rig.fake, "find"), 0);  // after the wait: nothing was sent
+  // restarted: it clears by itself, and the line is the status again
   statusWith(rig.fake, {{"proto", 2}});
   rig.board.tick();
   QTRY_VERIFY(!rig.board.stale());
-  QVERIFY(rig.board.line() != staleSentence);
+  QTRY_COMPARE(rig.board.line(), QString("not attached"));
   rig.fake.on("find", [](const QStringList &, const Opts &) { return Reply{true, QJsonObject(), "ok", ""}; });
   QVERIFY(rig.board.run("find", {"3"}));
+}
+
+// R9: with no feed to say the service went, a status read that fails clears stale, so the user's
+// next action is sent (and starts the service that is installed)
+void TestBoard::aFailedStatusReadClearsStale() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.statusAsWritten();
+  rig.fake.refuseWatch("too many watchers");
+  rig.fake.dropWatchers();
+  QTRY_VERIFY(!rig.board.connected());
+  statusWith(rig.fake, {{"proto", 1}});
+  rig.board.tick();
+  QTRY_VERIFY(rig.board.stale());
+  rig.fake.on("status", [](const QStringList &, const Opts &) { return Reply{false, QJsonValue(), "", "boom"}; });
+  rig.board.tick();
+  QTRY_VERIFY(!rig.board.stale());
+  rig.fake.on("find", [](const QStringList &, const Opts &) { return Reply{true, QJsonObject(), "ok", ""}; });
+  QVERIFY(rig.board.run("find", {"3"}));
+  QTRY_COMPARE(timesSeen(rig.fake, "find"), 1);
+}
+
+// the feed dropping clears stale: the service that was from another build is gone
+void TestBoard::theFeedDroppingClearsStale() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.statusAsWritten();
+  statusWith(rig.fake, {{"proto", 1}});
+  rig.board.tick();
+  QTRY_VERIFY(rig.board.stale());
+  rig.fake.dropWatchers();
+  QTRY_VERIFY(!rig.board.stale());
+  QTRY_COMPARE(rig.board.line(), lost);
 }
 
 void TestBoard::quietComesFromStatus() {
@@ -591,6 +626,30 @@ void TestBoard::quietComesFromStatus() {
   rig.board.tick();
   QTest::qWait(300);
   QCOMPARE(changed.count(), 1);
+  // and back
+  statusWith(rig.fake, {{"proto", 2}, {"quiet", false}});
+  rig.board.tick();
+  QTRY_VERIFY(!rig.board.quiet());
+  QTRY_COMPARE(changed.count(), 2);
+  rig.board.tick();
+  QTest::qWait(300);
+  QCOMPARE(changed.count(), 2);
+}
+
+// a read's event (act false) leaves the line, but it still ends the work, brings a status read and turns
+void TestBoard::aReadsEventStillEndsWorkAndTurns() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  QSignalSpy turned(&rig.board, &Board::turned);
+  rig.fake.push(busyLine("agent", "log", {}));
+  QTRY_VERIFY(rig.board.working());
+  const QString before = rig.board.line();
+  const int statuses = timesSeen(rig.fake, "status");
+  rig.fake.push(withAct(eventLine(9, "agent", "log", {}, "five lines of log"), false));
+  QTRY_VERIFY(!rig.board.working());
+  QTRY_COMPARE(turned.count(), 1);
+  QTRY_VERIFY(timesSeen(rig.fake, "status") > statuses);
+  QCOMPARE(rig.board.line(), before);
 }
 
 QTEST_GUILESS_MAIN(TestBoard)

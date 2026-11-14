@@ -25,6 +25,7 @@ private slots:
   void theLineGrowsToShowAWholeAnswer();
   void pollsWhileShown();
   void pollingCanBeKeptOff();
+  void theStaleSentenceStaysWhileSomeoneWorks();
 };
 
 void TestMainWindow::itsShapeAndItsLine() {
@@ -62,6 +63,26 @@ void TestMainWindow::itsShapeAndItsLine() {
 }
 
 // R13: the user's own action shows the core's whole answer, which can be several lines
+// R10: a service from another build is said even while a request runs on it
+void TestMainWindow::theStaleSentenceStaysWhileSomeoneWorks() {
+  Rig rig;
+  QVERIFY(rig.ready());
+  rig.fake.statusAsWritten();
+  rig.fake.on("status", [](const QStringList &, const Opts &) {
+    return Reply{true, QJsonObject{{"attached", QJsonValue::Null}, {"hunt", QJsonValue::Null}, {"proto", 1}}, "not attached", ""};
+  });
+  MainWindow w(&rig.board);
+  w.setPolling(false);
+  auto *line = w.findChild<QLabel *>("line");
+  rig.board.tick();
+  const QString stale = "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop";
+  QTRY_COMPARE(line->text(), stale);
+  rig.fake.push({{"busy", QJsonObject{{"actor", "agent"}, {"cmd", "find"}, {"args", QJsonArray{"100"}}}}});
+  QTRY_VERIFY(rig.board.working());
+  QTest::qWait(200);
+  QCOMPARE(line->text(), stale);
+}
+
 void TestMainWindow::theLineGrowsToShowAWholeAnswer() {
   Rig rig;
   QVERIFY(rig.ready());
