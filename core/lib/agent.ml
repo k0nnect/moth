@@ -85,7 +85,7 @@ let alive pid = match Unix.kill pid 0 with () -> true | exception Unix.Unix_erro
 let session_pid name =
   match int_of_string_opt name with Some p when p > 0 && String.for_all (function '0' .. '9' -> true | _ -> false) name -> Some p | _ -> None
 
-let prepare ~home ~moth ~path ~pid =
+let prepare ~home ~moth ~path ~pid ~cursor:(seq, quiet) =
   try
     mkdir home;
     let agent = Filename.concat home "agent" in
@@ -99,6 +99,7 @@ let prepare ~home ~moth ~path ~pid =
     mkdir dir;
     write_private (Filename.concat dir "settings.json") (Yojson.Safe.pretty_to_string (settings ~home ~moth ~path ~dir) ^ "\n");
     write_private (Filename.concat dir "instructions.md") instructions;
+    write_private (Filename.concat dir "cursor") (Wait.cursor_text seq quiet);
     Ok dir
   with Unix.Unix_error (e, _, p) -> Error (Printf.sprintf "cannot prepare the agent's folder: %s: %s" p (Unix.error_message e)) | Sys_error m | Failure m -> Error ("cannot prepare the agent's folder: " ^ m)
 let remove_session = rm

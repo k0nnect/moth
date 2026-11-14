@@ -80,11 +80,11 @@ let read_file path =
   | ic -> Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> try Some (String.trim (really_input_string ic (in_channel_length ic))) with Sys_error _ | End_of_file -> None)
 
 (* through a temporary name of the writer's own, so a reader never sees half a text and two
-   writers never share a file *)
+   writers never share a file; readable by the owner alone, as the session's other files are *)
 let write_file path text =
   let tmp = Printf.sprintf "%s.%d.tmp" path (Unix.getpid ()) in
   try
-    let oc = open_out_bin tmp in
+    let oc = open_out_gen [ Open_wronly; Open_creat; Open_trunc; Open_binary ] 0o600 tmp in
     Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () -> output_string oc text);
     Sys.rename tmp path
   with Sys_error _ -> ( try Sys.remove tmp with Sys_error _ -> ())
@@ -94,15 +94,6 @@ let process_alive pid = match Unix.kill pid 0 with () -> true | exception Unix.U
 (* a session folder's name: a process id, decimal digits and above 0 *)
 let session_pid name =
   match int_of_string_opt name with Some p when p > 0 && String.for_all (function '0' .. '9' -> true | _ -> false) name -> Some p | _ -> None
-
-(* the cursor file: the seq, and " quiet" when moth was quiet at it *)
-let cursor_text cursor quiet = string_of_int cursor ^ if quiet then " quiet" else ""
-
-let parse_cursor text =
-  match String.split_on_char ' ' text with
-  | [ n ] -> Option.map (fun n -> (n, false)) (int_of_string_opt n)
-  | [ n; "quiet" ] -> Option.map (fun n -> (n, true)) (int_of_string_opt n)
-  | _ -> None
 
 (* how long [moth wait] gives a service to answer; MOTH_WAIT_TIMEOUT (seconds) is for tests *)
 let answer_limit () = match Option.bind (Sys.getenv_opt "MOTH_WAIT_TIMEOUT") float_of_string_opt with Some t when t > 0. -> t | _ -> 30.
@@ -130,12 +121,12 @@ let wait ~session =
   if not (session_alive ()) then exit 0;
   write_file (in_dir "waiter") me;
   let mine () = read_file (in_dir "waiter") = Some me in
-  let cursor_file () = Option.bind (read_file (in_dir "cursor")) parse_cursor in
+  let cursor_file () = Option.bind (read_file (in_dir "cursor")) Wait.parse_cursor in
   let written = ref (cursor_file ()) in
   let keep_cursor t =
     let now = (Wait.cursor t, Wait.quiet t) in
     if !written <> Some now then begin
-      write_file (in_dir "cursor") (cursor_text (fst now) (snd now));
+      write_file (in_dir "cursor") (Wait.cursor_text (fst now) (snd now));
       written := Some now
     end
   in
@@ -236,6 +227,14 @@ let find_claude () =
           if executable_file f then Some (absolute f) else None)
         dirs
 
+(* the newest event's seq, from the reply to a watch, which ends there *)
+let newest_seq ~home =
+  let exception Seq of int in
+  match Client.watch ~home ~started:(fun seq -> raise (Seq seq)) ~idle:(fun () -> false) (fun _ -> false) with
+  | exception Seq seq -> Ok seq
+  | Ok () -> Error (Client.lost_contact home)
+  | Error m -> Error m
+
 (* [moth agent]: not a request. Writes the session's files and becomes Claude Code. The agent's
    own shell (MOTH_ACTOR=agent) may not start another. *)
 let agent args =
@@ -245,14 +244,21 @@ let agent args =
   | None -> fail 1 not_installed
   | Some claude -> (
       let home = Client.home () in
-      (match Client.call ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
-      | Error m -> fail 1 m
-      | Ok (status, _) ->
-          let proto = match status with `Assoc f -> ( match List.assoc_opt "proto" f with Some (`Int n) -> n | _ -> 1) | _ -> 1 in
-          if proto <> Daemon.protocol then fail 1 "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop");
+      let quiet =
+        match Client.call ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
+        | Error m -> fail 1 m
+        | Ok (status, _) ->
+            let field k = match status with `Assoc f -> List.assoc_opt k f | _ -> None in
+            let proto = match field "proto" with Some (`Int n) -> n | _ -> 1 in
+            if proto <> Daemon.protocol then fail 1 "moth's background service is from another build of moth. stop it and it starts again by itself: moth stop";
+            field "quiet" = Some (`Bool true)
+      in
+      (* the session's cursor starts here, so the first waiter tells everything the person does
+         from now on, however long the agent takes to load and end its first turn *)
+      let seq = match newest_seq ~home with Ok s -> s | Error m -> fail 1 m in
       let moth = absolute Sys.executable_name in
       let path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
-      match Agent.prepare ~home ~moth ~path ~pid:(Unix.getpid ()) with
+      match Agent.prepare ~home ~moth ~path ~pid:(Unix.getpid ()) ~cursor:(seq, quiet) with
       | Error m -> fail 1 m
       | Ok dir -> (
           let give_up m =

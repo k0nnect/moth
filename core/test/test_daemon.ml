@@ -2052,6 +2052,9 @@ let wait_tells_the_agent () =
           let err = read_all w.err in
           check_bool "tells what the person did" true (String.starts_with ~prefix:(heading ^ "- find 3: ") err);
           check_str "the cursor is that event's seq" (string_of_int (newest_seq d)) (String.trim (read_all (Filename.concat dir "cursor")));
+          let mode f = (Unix.stat (Filename.concat dir f)).Unix.st_perm land 0o777 in
+          check_int "the cursor is the owner's alone" 0o600 (mode "cursor");
+          check_int "so is the waiter file" 0o600 (mode "waiter");
           (* the next waiter starts after it, and has nothing to say *)
           let again = spawn_wait ~home:d.home ~session:dir in
           check_bool "still waiting after 3 seconds" true (exit_within again 3. = None)))

@@ -12,6 +12,15 @@ type t = {
 type verdict = Keep_waiting | Tell of { notes : string; cursor : int }
 
 let start ~cursor ~quiet = { cursor; quiet; held = []; first = 0.; last = 0.; busy = 0 }
+
+(* a session's cursor file: the seq, and " quiet" when moth was quiet at it (123 quiet) *)
+let cursor_text cursor quiet = string_of_int cursor ^ if quiet then " quiet" else ""
+
+let parse_cursor text =
+  match String.split_on_char ' ' text with
+  | [ n ] -> Option.map (fun n -> (n, false)) (int_of_string_opt n)
+  | [ n; "quiet" ] -> Option.map (fun n -> (n, true)) (int_of_string_opt n)
+  | _ -> None
 let cursor t = t.cursor
 let quiet t = t.quiet
 let dropped t = t.busy <- 0

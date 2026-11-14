@@ -6,6 +6,13 @@ type t
 (** [cursor]: the newest event already dealt with; [quiet]: whether the agent is not to be told *)
 val start : cursor:int -> quiet:bool -> t
 
+(** the text of a session's cursor file: the seq, and [" quiet"] when moth was quiet at it
+    ([123 quiet]) *)
+val cursor_text : int -> bool -> string
+
+(** the seq and the quiet state in a cursor file's (trimmed) text; None when it is neither form *)
+val parse_cursor : string -> (int * bool) option
+
 (** a feed line (a [busy] line or an event), seen at [now]. An event counts when its [seq] is
     above the cursor, its actor is not [agent], its [act] is true and its command is not [quiet],
     and moth is not quiet. A [quiet] event, from anyone, sets the quiet state when it succeeded;

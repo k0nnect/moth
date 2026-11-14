@@ -6,10 +6,13 @@ val home : unit -> string
 (** the error [call ~autostart:false] gives when no daemon answers *)
 val not_running : string
 
-(** sends one request and waits for its reply: the result and the rendered text, or the error.
-    [record:false] asks for a read that leaves no trace (see [Daemon]). [timeout] is the most
-    seconds to wait for the reply (none by default); a service that stays silent is then lost
-    contact.
+(** the error for a service that stopped answering mid-request, naming [home]'s core.log *)
+val lost_contact : string -> string
+
+(** sends one request, with this build's [proto], and waits for its reply: the result and the
+    rendered text, or the error. [record:false] asks for a read that leaves no trace (see
+    [Daemon]). [timeout] is the most seconds to wait for the reply (none by default); a service
+    that stays silent is then lost contact.
     When no daemon answers and [autostart] (default true) is set, it removes a stale core.sock,
     starts one with [spawn_daemon] and tries again for up to 5 seconds. The default
     [spawn_daemon] runs [Sys.executable_name daemon] in its own session, with no terminal, stdin
@@ -27,9 +30,9 @@ val call :
   unit ->
   (Yojson.Safe.t * string, string) result
 
-(** sends [watch] (with [after], when given), then calls the function with each feed line, the
-    whole object, until it returns false or the daemon closes the connection; then [Ok ()]. An
-    error reply (such as [too many watchers]) is the error. [timeout] is the most seconds to wait for the reply (none by default), after which it is lost contact. [started] is called once with the [seq]
+(** sends [watch] (with [after], when given, and this build's [proto]), then calls the function
+    with each feed line, the whole object, until it returns false or the daemon closes the
+    connection; then [Ok ()]. An error reply (such as [too many watchers]) is the error. [timeout] is the most seconds to wait for the reply (none by default), after which it is lost contact. [started] is called once with the [seq]
     in the reply, before any line. [idle] is called whenever half a second passes with no line;
     when it returns false the watch ends with [Ok ()]. It never starts a daemon: with none
     answering it is [Error not_running]. *)

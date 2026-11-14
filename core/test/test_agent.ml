@@ -67,7 +67,7 @@ let prepare_makes_files () =
       let home = Filename.concat d "home" in
       let agent = Filename.concat home "agent" in
       let moth = "/opt/moth/bin/moth" in
-      match Agent.prepare ~home ~moth ~path:"/usr/bin" ~pid:(Unix.getpid ()) with
+      match Agent.prepare ~home ~moth ~path:"/usr/bin" ~pid:(Unix.getpid ()) ~cursor:(7, true) with
       | Error m -> Alcotest.failf "prepare: %s" m
       | Ok dir ->
           check_str "the folder" (Filename.concat agent (string_of_int (Unix.getpid ()))) dir;
@@ -77,6 +77,8 @@ let prepare_makes_files () =
           Alcotest.(check int) "dir mode" 0o700 (mode dir);
           Alcotest.(check int) "settings mode" 0o600 (mode (Filename.concat dir "settings.json"));
           Alcotest.(check int) "instructions mode" 0o600 (mode (Filename.concat dir "instructions.md"));
+          Alcotest.(check int) "cursor mode" 0o600 (mode (Filename.concat dir "cursor"));
+          check_str "the cursor: the seq, and quiet" "7 quiet" (read (Filename.concat dir "cursor"));
           check_str "settings parse and equal"
             (Yojson.Safe.to_string (Agent.settings ~home ~moth ~path:"/usr/bin" ~dir))
             (Yojson.Safe.to_string (Yojson.Safe.from_file (Filename.concat dir "settings.json")));
@@ -98,7 +100,7 @@ let prepare_removes_dead () =
       List.iter (fun n -> Unix.mkdir (Filename.concat agent n) 0o700) [ dead; "notapid"; "0"; "work" ];
       write (Filename.concat (Filename.concat agent dead) "cursor") "1";
       write (Filename.concat (Filename.concat agent "work") "keep.txt") "x";
-      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"/usr/bin" ~pid:(Unix.getpid ()) with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
+      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"/usr/bin" ~pid:(Unix.getpid ()) ~cursor:(0, false) with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
       check_bool "dead sibling removed" false (Sys.file_exists (Filename.concat agent dead));
       List.iter (fun n -> check_bool (n ^ " kept") true (Sys.file_exists (Filename.concat agent n))) [ "notapid"; "0"; "work" ];
       check_bool "work content kept" true (Sys.file_exists (Filename.concat (Filename.concat agent "work") "keep.txt")))
@@ -111,8 +113,9 @@ let prepare_replaces_stale_own () =
       Unix.mkdir dir 0o755;
       write (Filename.concat dir "cursor") "7 quiet";
       write (Filename.concat dir "waiter") "1";
-      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"/usr/bin" ~pid with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
-      Alcotest.(check (list string)) "only the two files" [ "instructions.md"; "settings.json" ] (List.sort compare (Array.to_list (Sys.readdir dir)));
+      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"/usr/bin" ~pid ~cursor:(3, false) with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
+      Alcotest.(check (list string)) "only the three files" [ "cursor"; "instructions.md"; "settings.json" ] (List.sort compare (Array.to_list (Sys.readdir dir)));
+      check_str "the new cursor, not the stale one" "3" (read (Filename.concat dir "cursor"));
       Alcotest.(check int) "mode" 0o700 (mode dir))
 
 let prepare_keeps_live () =
@@ -121,7 +124,7 @@ let prepare_keeps_live () =
       let agent = Filename.concat d "agent" in
       Unix.mkdir agent 0o700;
       Unix.mkdir (Filename.concat agent live) 0o700;
-      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"" ~pid:(Unix.getpid () + 1) with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
+      (match Agent.prepare ~home:d ~moth:"/m/moth" ~path:"" ~pid:(Unix.getpid () + 1) ~cursor:(0, false) with Ok _ -> () | Error m -> Alcotest.failf "prepare: %s" m);
       check_bool "live kept" true (Sys.file_exists (Filename.concat agent live)))
 
 let instructions_say () =
@@ -214,9 +217,31 @@ let agent_runs_stub () =
           check_str "pid" (string_of_int pid) (Option.get (field "pid"));
           let mothdir = Filename.dirname (Lazy.force moth_exe) in
           check_bool "path starts with moth's folder" true (String.starts_with ~prefix:(real mothdir ^ ":") (Option.get (field "path")) || String.starts_with ~prefix:(mothdir ^ ":") (Option.get (field "path")));
+          (* the cursor is the service's newest seq (moth log's newest; log does not list itself),
+             written before the agent started, so the first waiter tells all after it *)
+          let _, newest, _, _ = run ~home ~tmphome:tmp [ "log"; "-n"; "1"; "--json" ] in
+          let seq = Yojson.Safe.Util.(Yojson.Safe.from_string newest |> index 0 |> member "seq" |> to_int) in
+          check_str "the cursor" (string_of_int seq) (read (Filename.concat dir "cursor"));
+          Alcotest.(check int) "cursor mode" 0o600 (mode (Filename.concat dir "cursor"));
           (* nothing under HOME but the moth home and what the test itself wrote *)
           let names = List.sort compare (List.filter (fun n -> not (List.mem n [ "stub claude"; "stub.out"; "stderr.txt"; "stdout.txt" ])) (Array.to_list (Sys.readdir tmp))) in
           Alcotest.(check (list string)) "HOME holds only the moth home" [ "moth home" ] names))
+
+(* with quiet on, the cursor says so: the first waiter starts quiet *)
+let the_cursor_says_quiet () =
+  with_tmp (fun tmp ->
+      let home = Filename.concat tmp "h" in
+      let stub = Filename.concat tmp "stub" in
+      write ~perm:0o755 stub "#!/bin/sh\n";
+      Fun.protect
+        ~finally:(fun () -> stop_service ~home ~tmphome:tmp)
+        (fun () ->
+          ignore (run ~home ~tmphome:tmp [ "find"; "3" ]);
+          ignore (run ~home ~tmphome:tmp [ "quiet"; "on" ]);
+          let code, _, err, pid = run ~env:[ ("MOTH_CLAUDE", stub); ("PATH", "/usr/bin:/bin") ] ~home ~tmphome:tmp [ "agent" ] in
+          Alcotest.(check int) ("exit 0 (" ^ err ^ ")") 0 code;
+          (* find, quiet on, and moth agent's own status *)
+          check_str "the cursor" "3 quiet" (read (Filename.concat (Filename.concat (Filename.concat home "agent") (string_of_int pid)) "cursor"))))
 
 let not_installed_cases () =
   with_tmp (fun tmp ->
@@ -314,6 +339,7 @@ let () =
       ( "moth agent",
         [
           Alcotest.test_case "stand-in agent" `Quick agent_runs_stub;
+          Alcotest.test_case "the cursor says quiet" `Quick the_cursor_says_quiet;
           Alcotest.test_case "not installed" `Quick not_installed_cases;
           Alcotest.test_case "no arguments" `Quick takes_no_arguments;
           Alcotest.test_case "program that cannot run" `Quick exec_fails;
