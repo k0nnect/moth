@@ -6,7 +6,10 @@ val home : unit -> string
 (** the error [call ~autostart:false] gives when no daemon answers *)
 val not_running : string
 
-(** [record:false] asks for a read that leaves no trace (see [Daemon]). Sends one request and waits for its reply: the result and the rendered text, or the error.
+(** sends one request and waits for its reply: the result and the rendered text, or the error.
+    [record:false] asks for a read that leaves no trace (see [Daemon]). [timeout] is the most
+    seconds to wait for the reply (none by default); a service that stays silent is then lost
+    contact.
     When no daemon answers and [autostart] (default true) is set, it removes a stale core.sock,
     starts one with [spawn_daemon] and tries again for up to 5 seconds. The default
     [spawn_daemon] runs [Sys.executable_name daemon] in its own session, with no terminal, stdin
@@ -14,6 +17,7 @@ val not_running : string
 val call :
   ?autostart:bool ->
   ?record:bool ->
+  ?timeout:float ->
   ?spawn_daemon:(home:string -> unit) ->
   home:string ->
   actor:string ->
@@ -25,12 +29,12 @@ val call :
 
 (** sends [watch] (with [after], when given), then calls the function with each feed line, the
     whole object, until it returns false or the daemon closes the connection; then [Ok ()]. An
-    error reply (such as [too many watchers]) is the error. [started] is called once with the [seq]
+    error reply (such as [too many watchers]) is the error. [timeout] is the most seconds to wait for the reply (none by default), after which it is lost contact. [started] is called once with the [seq]
     in the reply, before any line. [idle] is called whenever half a second passes with no line;
     when it returns false the watch ends with [Ok ()]. It never starts a daemon: with none
     answering it is [Error not_running]. *)
 val watch :
-  home:string -> ?after:int -> ?started:(int -> unit) -> ?idle:(unit -> bool) -> (Yojson.Safe.t -> bool) -> (unit, string) result
+  home:string -> ?after:int -> ?timeout:float -> ?started:(int -> unit) -> ?idle:(unit -> bool) -> (Yojson.Safe.t -> bool) -> (unit, string) result
 
 (** who is speaking, from the value of MOTH_ACTOR: [agent] is the agent; [user], empty or unset is
     the user; anything else is the error [MOTH_ACTOR must be user or agent] *)

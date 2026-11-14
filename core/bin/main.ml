@@ -78,100 +78,140 @@ let read_file path =
   | exception Sys_error _ -> None
   | ic -> Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> try Some (String.trim (really_input_string ic (in_channel_length ic))) with Sys_error _ | End_of_file -> None)
 
-(* through a temporary name, so a reader never sees half a number *)
+(* through a temporary name of the writer's own, so a reader never sees half a text and two
+   writers never share a file *)
 let write_file path text =
-  let tmp = path ^ ".tmp" in
+  let tmp = Printf.sprintf "%s.%d.tmp" path (Unix.getpid ()) in
   try
     let oc = open_out_bin tmp in
     Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () -> output_string oc text);
     Sys.rename tmp path
-  with Sys_error _ -> ()
+  with Sys_error _ -> ( try Sys.remove tmp with Sys_error _ -> ())
 
 let process_alive pid = match Unix.kill pid 0 with () -> true | exception Unix.Unix_error (Unix.EPERM, _, _) -> true | exception Unix.Unix_error _ -> false
 
+(* a session folder's name: a process id, decimal digits and above 0 *)
+let session_pid name =
+  match int_of_string_opt name with Some p when p > 0 && String.for_all (function '0' .. '9' -> true | _ -> false) name -> Some p | _ -> None
+
+(* the cursor file: the seq, and " quiet" when moth was quiet at it *)
+let cursor_text cursor quiet = string_of_int cursor ^ if quiet then " quiet" else ""
+
+let parse_cursor text =
+  match String.split_on_char ' ' text with
+  | [ n ] -> Option.map (fun n -> (n, false)) (int_of_string_opt n)
+  | [ n; "quiet" ] -> Option.map (fun n -> (n, true)) (int_of_string_opt n)
+  | _ -> None
+
+(* how long [moth wait] gives a service to answer; MOTH_WAIT_TIMEOUT (seconds) is for tests *)
+let answer_limit () = match Option.bind (Sys.getenv_opt "MOTH_WAIT_TIMEOUT") float_of_string_opt with Some t when t > 0. -> t | _ -> 30.
+
 (* [moth wait --session <dir>], run by the agent's Stop hook. It follows the feed, and when the
    person has done something (see Wait) prints the note to stderr and exits 2, which wakes the
-   agent. Every other end is exit 0 with nothing printed: the session is gone (its pid, the
-   folder's name, is not alive, or the folder is), a newer waiter took over [dir]/waiter, or the
-   service is from another build. It never starts a service: with none answering it asks again
-   every second. *)
+   agent: 2 means that and nothing else. Every other end is exit 0 with nothing printed: the
+   session is gone (its pid, the folder's name, is not alive, or the folder is), a newer waiter
+   took over [dir]/waiter, or the service is from another build. It never starts a service: with
+   none answering (or none answering in time) it asks again every second, and goes on telling
+   what it holds meanwhile. *)
 let wait ~session =
   let home = Client.home () in
+  let limit = answer_limit () in
   let dir =
     let rec strip d = if String.length d > 1 && d.[String.length d - 1] = '/' then strip (String.sub d 0 (String.length d - 1)) else d in
     strip session
   in
   let in_dir f = Filename.concat dir f in
-  let session_pid = int_of_string_opt (Filename.basename dir) in
-  let session_alive () = Sys.file_exists dir && Sys.is_directory dir && match session_pid with Some p -> process_alive p | None -> false in
+  let session_alive () =
+    (try Sys.file_exists dir && Sys.is_directory dir with Sys_error _ -> false)
+    && match session_pid (Filename.basename dir) with Some p -> process_alive p | None -> false
+  in
   let me = string_of_int (Unix.getpid ()) in
   if not (session_alive ()) then exit 0;
   write_file (in_dir "waiter") me;
   let mine () = read_file (in_dir "waiter") = Some me in
-  let cursor_file () = Option.bind (read_file (in_dir "cursor")) int_of_string_opt in
+  let cursor_file () = Option.bind (read_file (in_dir "cursor")) parse_cursor in
   let written = ref (cursor_file ()) in
-  let keep_cursor n =
-    if !written <> Some n then begin
-      write_file (in_dir "cursor") (string_of_int n);
-      written := Some n
+  let keep_cursor t =
+    let now = (Wait.cursor t, Wait.quiet t) in
+    if !written <> Some now then begin
+      write_file (in_dir "cursor") (cursor_text (fst now) (snd now));
+      written := Some now
     end
   in
   let w = ref None in
-  (* what ended the watch: to tell, or to leave *)
-  let ended = ref None in
+  (* the first look at the service failed: end this watch and try again *)
+  let failed = ref false in
+  (* the session, the waiter and what is held: leaves for good when the session is gone or
+     another waiter has taken over, tells (and exits 2) when there is something to tell, and
+     says whether the watch is to go on *)
   let look () =
-    if not (session_alive () && mine ()) then begin
-      ended := Some None;
-      false
-    end
-    else
-      match !w with
-      | None -> true
-      | Some t -> (
-          match Wait.check t ~now:(Unix.gettimeofday ()) with
-          | Wait.Keep_waiting ->
-              if Wait.quiet t then keep_cursor (Wait.cursor t);
-              true
-          | Wait.Tell { notes; cursor } ->
-              ended := Some (if mine () then Some (notes, cursor) else None);
-              false)
+    if not (session_alive () && mine ()) then exit 0;
+    (match !w with
+    | None -> ()
+    | Some t -> (
+        match Wait.check t ~now:(Unix.gettimeofday ()) with
+        | Wait.Keep_waiting -> if Wait.quiet t then keep_cursor t
+        | Wait.Tell { notes; _ } ->
+            if not (mine ()) then exit 0;
+            keep_cursor t;
+            prerr_endline notes;
+            exit 2));
+    not !failed
   in
   let feed line =
     Option.iter (fun t -> Wait.line t ~now:(Unix.gettimeofday ()) line) !w;
     look ()
   in
-  let rec again () =
-    if not (session_alive () && mine ()) then exit 0;
-    match Client.call ~autostart:false ~record:false ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
-    | Error _ ->
-        Unix.sleepf 1.;
-        again ()
+  (* a second, looking every quarter of it *)
+  let nap () =
+    for _ = 1 to 4 do
+      Unix.sleepf 0.25;
+      ignore (look ())
+    done
+  in
+  (* the unrecorded status read, once the watch is up: [proto] and [quiet], or None *)
+  let first_look () =
+    match Client.call ~autostart:false ~record:false ~timeout:limit ~home ~actor:"user" ~cmd:"status" ~args:[] ~opts:[] () with
+    | Error _ -> None
     | Ok (status, _) ->
-        let open Yojson.Safe.Util in
-        let proto = match member "proto" status with `Int n -> n | _ -> 1 in
+        let field k = match status with `Assoc f -> List.assoc_opt k f | _ -> None in
+        let proto = match field "proto" with Some (`Int n) -> n | _ -> 1 in
         if proto <> Daemon.protocol then exit 0;
-        let quiet = member "quiet" status = `Bool true in
-        (match (!w, cursor_file ()) with None, Some c -> w := Some (Wait.start ~cursor:c ~quiet) | _ -> ());
-        let started seq =
-          match !w with
-          | Some t when seq >= Wait.cursor t -> ()
-          (* the service's events start over: what was seen is no longer the newest *)
-          | _ -> w := Some (Wait.start ~cursor:seq ~quiet)
-        in
-        let after = Option.map Wait.cursor !w in
-        ignore (Client.watch ~home ?after ~started ~idle:look feed);
-        (match !ended with
-        | Some (Some (notes, cursor)) ->
-            write_file (in_dir "cursor") (string_of_int cursor);
-            prerr_endline notes;
-            exit 2
-        | Some None -> exit 0
-        | None -> ());
-        Option.iter Wait.dropped !w;
-        Unix.sleepf 1.;
-        again ()
+        Some (field "quiet" = Some (`Bool true))
+  in
+  let started seq =
+    match first_look () with
+    | None -> failed := true
+    | Some quiet -> (
+        match !w with
+        | Some t when seq >= Wait.cursor t -> ()
+        (* no cursor file yet, or the service's events have started over *)
+        | _ ->
+            let t = Wait.start ~cursor:seq ~quiet in
+            w := Some t;
+            keep_cursor t)
+  in
+  let rec again () =
+    failed := false;
+    ignore (look ());
+    (match (!w, cursor_file ()) with None, Some (c, quiet) -> w := Some (Wait.start ~cursor:c ~quiet) | _ -> ());
+    let after = Option.map Wait.cursor !w in
+    ignore (Client.watch ~home ?after ~timeout:limit ~started ~idle:look feed);
+    Option.iter Wait.dropped !w;
+    ignore (look ());
+    nap ();
+    again ()
   in
   again ()
+
+(* [moth wait ...]: usage errors and anything unexpected exit 1, never 2 *)
+let wait_command args =
+  match Client.parse_args ("wait" :: args) with
+  | Ok { opts; _ } -> (
+      match List.assoc_opt "session" opts with
+      | Some dir -> ( try wait ~session:dir with e -> fail 1 ("moth wait: " ^ Printexc.to_string e))
+      | None -> fail 1 "wait is run by the agent's hook: moth wait --session <dir>")
+  | Error m -> fail 1 m
 
 let () =
   match List.tl (Array.to_list Sys.argv) with
@@ -179,16 +219,13 @@ let () =
   | [ "daemon" ] -> (
       let home = Client.home () in
       try Daemon.run ~home ~start_helper:(Daemon.default_start_helper ~home) ~launch:(Daemon.default_launch ~home) with Failure m -> fail 1 m)
+  | "wait" :: args -> wait_command args
   | argv -> (
       let actor = match Client.actor_of_env (Sys.getenv_opt "MOTH_ACTOR") with Ok a -> a | Error m -> fail 2 m in
       match Client.parse_args argv with
       | Error m -> fail 2 m
       | Ok { cmd = "help"; args = []; _ } -> print_string usage
       | Ok { cmd = ("help" | "daemon") as cmd; _ } -> fail 2 (cmd ^ " takes no arguments")
-      | Ok { cmd = "wait"; opts; _ } -> (
-          match List.assoc_opt "session" opts with
-          | Some dir -> wait ~session:dir
-          | None -> fail 2 "wait is run by the agent's hook: moth wait --session <dir>")
       | Ok inv -> (
           match Daemon.check_usage ~cmd:inv.cmd ~args:inv.args ~opts:inv.opts with
           | Error m -> fail 2 m

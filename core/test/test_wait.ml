@@ -59,6 +59,18 @@ let busy_holds () =
   | Wait.Tell { cursor = 2; _ } -> ()
   | v -> Alcotest.failf "expected a tell, got %a" (Alcotest.pp verdict) v
 
+(* the ten seconds are not waited for while a busy line is: once its event has come, they are over *)
+let busy_holds_past_ten_seconds () =
+  let w = fresh () in
+  Wait.line w ~now:0. (ev 1 "find" [ "100" ]);
+  Wait.line w ~now:0.2 (busy "next" [ "101" ]);
+  check_v "at ten seconds" Wait.Keep_waiting (Wait.check w ~now:10.);
+  check_v "at twelve" Wait.Keep_waiting (Wait.check w ~now:12.);
+  Wait.line w ~now:13. (ev 2 "next" [ "101" ]);
+  match Wait.check w ~now:13. with
+  | Wait.Tell { cursor = 2; _ } -> ()
+  | v -> Alcotest.failf "expected a tell as its event came, got %a" (Alcotest.pp verdict) v
+
 let ten_seconds () =
   let w = fresh () in
   for i = 0 to 10 do
@@ -94,6 +106,16 @@ let quiet_drops_what_is_held () =
   Wait.line w ~now:4. (ev 3 "quiet" [ "off" ]);
   Wait.line w ~now:5. (ev 4 "next" [ "4" ]);
   check_v "only the next" (told (heading ^ "\n- next 4: found 5 places") 4) (Wait.check w ~now:7.)
+
+let bare_and_failed_quiet_change_nothing () =
+  let w = fresh () in
+  Wait.line w ~now:0. (ev 1 "quiet" []);
+  Wait.line w ~now:0. (ev ~ok:false 2 "quiet" [ "maybe" ]);
+  Alcotest.(check bool) "not quiet" false (Wait.quiet w);
+  check_v "nothing told for them" Wait.Keep_waiting (Wait.check w ~now:20.);
+  Alcotest.(check int) "cursor" 2 (Wait.cursor w);
+  Wait.line w ~now:21. (ev 3 "find" [ "3" ]);
+  check_v "still told" (told (heading ^ "\n- find 3: found 5 places") 3) (Wait.check w ~now:23.)
 
 let quiet_from_the_agent_counts () =
   let w = fresh () in
@@ -148,10 +170,12 @@ let () =
           t "one event is told after a pause" one_find;
           t "three events are told together" three_together;
           t "a busy line holds the telling" busy_holds;
+          t "a busy line holds past ten seconds" busy_holds_past_ten_seconds;
           t "a steady stream is told at ten seconds" ten_seconds;
           t "agent, reads and quiet are never told" never_told;
           t "quiet drops, and off replays nothing" quiet_on_off;
           t "going quiet drops what was held" quiet_drops_what_is_held;
+          t "a bare or failed quiet changes nothing" bare_and_failed_quiet_change_nothing;
           t "quiet from anyone, only when it worked" quiet_from_the_agent_counts;
           t "a failure says so" failed;
           t "more than twelve are cut" many;

@@ -141,10 +141,15 @@ let json = function Ok (j, _) -> j | Error e -> Alcotest.failf "unexpected error
 let check_err n msg = function Error e -> check_str n msg e | Ok (_, t) -> Alcotest.failf "%s: expected the error %S, got %S" n msg t
 let check_json n w g = check_str n (Yojson.Safe.to_string w) (Yojson.Safe.to_string g)
 
+(* run first when a daemon is stopped: the waiter tests put their processes away, so none is
+   writing in the home that is removed *)
+let before_daemon_stops = ref (fun () -> ())
+
 let with_daemon ?home ?launch start_helper f =
   let d = start ?home ?launch start_helper in
   Fun.protect
     ~finally:(fun () ->
+      !before_daemon_stops ();
       ignore (call d "stop" []);
       Thread.join d.thread;
       rm d.home)
@@ -1794,10 +1799,7 @@ let home () =
 let quiet_is_kept () =
   let _, sh = fake () in
   let quiet d = Yojson.Safe.Util.(json (call d "status" []) |> member "quiet") in
-  let d = start sh in
-  Fun.protect
-    ~finally:(fun () -> rm d.home)
-    (fun () ->
+  with_daemon sh (fun d ->
       check_json "off to begin with" (`Bool false) (quiet d);
       check_str "no argument" "quiet is off" (text (call d "quiet" []));
       check_str "on" "quiet: the agent is not told what you do. it can still look: moth log" (text (call d "quiet" [ "on" ]));
@@ -1828,20 +1830,24 @@ type waiter = { pid : int; err : string; mutable code : int option }
 let spawned = ref []
 let spawn_count = ref 0
 
-(* [moth wait --session dir] against [home], stdin and stdout on /dev/null, stderr in a file *)
-let spawn_wait ~home ~session =
+(* [moth <args>] against [home] (and [env] besides), stdin and stdout on /dev/null, stderr in a file *)
+let spawn ?(env = []) ~home args =
   incr spawn_count;
   let err = Printf.sprintf "/tmp/moth-wait-%d-%d.err" (Unix.getpid ()) !spawn_count in
   let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
   let errfd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
   let exe = Lazy.force moth_exe in
-  let env = Array.append [| "MOTH_HOME=" ^ home |] (Array.of_list (List.filter (fun e -> not (String.starts_with ~prefix:"MOTH_HOME=" e)) (Array.to_list (Unix.environment ())))) in
-  let pid = Unix.create_process_env exe [| exe; "wait"; "--session"; session |] env null null errfd in
+  let own = List.filter (fun e -> not (String.starts_with ~prefix:"MOTH_HOME=" e)) (Array.to_list (Unix.environment ())) in
+  let env = Array.of_list (("MOTH_HOME=" ^ home) :: (List.map (fun (k, v) -> k ^ "=" ^ v) env @ own)) in
+  let pid = Unix.create_process_env exe (Array.of_list (exe :: args)) env null null errfd in
   Unix.close null;
   Unix.close errfd;
   let w = { pid; err; code = None } in
   spawned := w :: !spawned;
   w
+
+let spawn_wait_with env ~home ~session = spawn ~env ~home [ "wait"; "--session"; session ]
+let spawn_wait = spawn_wait_with []
 
 let reap w =
   if w.code = None then
@@ -1863,32 +1869,54 @@ let exit_within w within =
 
 let read_all path = try In_channel.with_open_bin path In_channel.input_all with Sys_error _ -> ""
 
+(* whether [f] comes true within [within] seconds *)
+let until ?(within = 5.) f =
+  let deadline = Unix.gettimeofday () +. within in
+  let rec go () =
+    f () || (Unix.gettimeofday () < deadline && (Thread.delay 0.05; go ()))
+  in
+  go ()
+
+(* the waiter is watching once it has written its cursor (it does so as soon as the watch is up
+   when there was none) *)
+let watching dir = until (fun () -> Sys.file_exists (Filename.concat dir "cursor"))
+
+let put_waiters_away () =
+  List.iter
+    (fun w ->
+      (match reap w with
+      | None -> (
+          (try Unix.kill w.pid Sys.sigkill with Unix.Unix_error _ -> ());
+          try ignore (Unix.waitpid [] w.pid) with Unix.Unix_error _ -> ())
+      | Some _ -> ());
+      try Sys.remove w.err with Sys_error _ -> ())
+    !spawned;
+  spawned := []
+
+let () = before_daemon_stops := put_waiters_away
+
 (* whatever a test started is gone when it ends, whatever happened *)
-let with_waiters f =
-  Fun.protect f ~finally:(fun () ->
-      List.iter
-        (fun w ->
-          (match reap w with
-          | None -> (
-              (try Unix.kill w.pid Sys.sigkill with Unix.Unix_error _ -> ());
-              try ignore (Unix.waitpid [] w.pid) with Unix.Unix_error _ -> ())
-          | Some _ -> ());
-          try Sys.remove w.err with Sys_error _ -> ())
-        !spawned;
-      spawned := [])
+let with_waiters f = Fun.protect f ~finally:put_waiters_away
 
 let spaced_home () = fresh_home () ^ " with a space"
 
-(* [home]/agent/<this test's pid>: a session that is alive *)
-let session_dir ?(pid = Unix.getpid ()) home =
+(* [home]/agent/<name>, which is this test's pid unless given: a session that is alive *)
+let session_dir ?(name = string_of_int (Unix.getpid ())) home =
   let mk d = try Unix.mkdir d 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> () in
   mk home;
   mk (Filename.concat home "agent");
-  let dir = Filename.concat (Filename.concat home "agent") (string_of_int pid) in
+  let dir = Filename.concat (Filename.concat home "agent") name in
   mk dir;
   dir
 
 let newest_seq d = Yojson.Safe.Util.(member "seq" (List.nth (stored d) (List.length (stored d) - 1)) |> to_int)
+let write_cursor dir text = Out_channel.with_open_bin (Filename.concat dir "cursor") (fun oc -> output_string oc text)
+let heading = "[moth] the person did this in moth:\n"
+
+(* a home that is removed again however the test ends *)
+let in_spaced_home f =
+  let home = spaced_home () in
+  Fun.protect ~finally:(fun () -> rm home) (fun () -> f home)
 
 let wait_tells_the_agent () =
   let fk, sh = fake () in
@@ -1897,12 +1925,12 @@ let wait_tells_the_agent () =
           ignore (text (attach d));
           let dir = session_dir d.home in
           let w = spawn_wait ~home:d.home ~session:dir in
-          Thread.delay 1.;
+          check_bool "it is watching" true (watching dir);
           Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
           ignore (text (call d "find" [ "3" ]));
           check_bool "exits 2 within 4 seconds" true (exit_within w 4. = Some 2);
           let err = read_all w.err in
-          check_bool "tells what the person did" true (String.starts_with ~prefix:"[moth] the person did this in moth:\n- find 3: " err);
+          check_bool "tells what the person did" true (String.starts_with ~prefix:(heading ^ "- find 3: ") err);
           check_str "the cursor is that event's seq" (string_of_int (newest_seq d)) (String.trim (read_all (Filename.concat dir "cursor")));
           (* the next waiter starts after it, and has nothing to say *)
           let again = spawn_wait ~home:d.home ~session:dir in
@@ -1915,74 +1943,168 @@ let two_waiters () =
           ignore (text (attach d));
           let dir = session_dir d.home in
           let first = spawn_wait ~home:d.home ~session:dir in
-          Thread.delay 1.;
+          check_bool "the first is watching" true (watching dir);
           let second = spawn_wait ~home:d.home ~session:dir in
-          Thread.delay 1.5;
+          (* the older one notices on its next tick; the newer one starts from the cursor file, so
+             it hears the find whenever it connects *)
+          check_bool "the older one leaves quietly" true (exit_within first 3. = Some 0);
           Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
           ignore (text (call d "find" [ "3" ]));
-          let a = exit_within first 4. and b = exit_within second 4. in
-          check_bool "the newer one tells" true (b = Some 2);
-          check_bool "the older one leaves quietly" true (a = Some 0);
-          check_str "and says nothing" "" (read_all first.err)))
+          check_bool "the newer one tells" true (exit_within second 4. = Some 2);
+          check_str "the older said nothing" "" (read_all first.err)))
 
-let a_dead_session () =
-  let home = spaced_home () in
-  with_waiters (fun () ->
-      Fun.protect
-        ~finally:(fun () -> rm home)
-        (fun () ->
-          (* a pid that has been and gone *)
-          let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
-          let gone = Unix.create_process "true" [| "true" |] null null null in
-          ignore (Unix.waitpid [] gone);
-          Unix.close null;
-          let dir = session_dir ~pid:gone home in
-          let w = spawn_wait ~home ~session:dir in
-          check_bool "exits 0 within 2 seconds" true (exit_within w 2. = Some 0);
-          check_str "and says nothing" "" (read_all w.err);
-          check_bool "and wrote nothing there" false (Sys.file_exists (Filename.concat dir "waiter"))))
-
-let wait_with_no_daemon () =
-  let fk, sh = fake () in
-  let home = spaced_home () in
-  with_waiters (fun () ->
-      let dir = session_dir home in
-      let w = spawn_wait ~home ~session:dir in
-      check_bool "still waiting after 3 seconds" true (exit_within w 3. = None);
-      check_bool "and started no daemon" false (Sys.file_exists (Filename.concat home "core.sock"));
-      with_daemon ~home sh (fun d ->
-          ignore (text (attach d));
-          Thread.delay 2.;
-          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
-          ignore (text (call d "find" [ "3" ]));
-          check_bool "exits 2 once the person acts" true (exit_within w 4. = Some 2);
-          check_bool "with the note" true (String.starts_with ~prefix:"[moth] the person did this in moth:" (read_all w.err))))
-
-let wait_hears_the_game_closed () =
+(* the older waiter holds a find when a newer one takes over: the note comes once, from the newer *)
+let a_take_over_holding_an_event () =
   let fk, sh = fake () in
   with_waiters (fun () ->
       with_daemon ~home:(spaced_home ()) sh (fun d ->
           ignore (text (attach d));
           let dir = session_dir d.home in
-          Out_channel.with_open_bin (Filename.concat dir "cursor") (fun oc -> output_string oc (string_of_int (newest_seq d)));
+          let first = spawn_wait ~home:d.home ~session:dir in
+          check_bool "the first is watching" true (watching dir);
+          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+          ignore (text (call d "find" [ "3" ]));
+          let second = spawn_wait ~home:d.home ~session:dir in
+          check_bool "the older one leaves without telling" true (exit_within first 3. = Some 0);
+          check_str "saying nothing" "" (read_all first.err);
+          check_bool "the newer one tells" true (exit_within second 4. = Some 2);
+          check_bool "what the older one held" true (String.starts_with ~prefix:(heading ^ "- find 3: ") (read_all second.err))))
+
+let a_dead_session () =
+  in_spaced_home (fun home ->
+      with_waiters (fun () ->
+          (* a pid that has been and gone *)
+          let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
+          let gone = Unix.create_process "true" [| "true" |] null null null in
+          ignore (Unix.waitpid [] gone);
+          Unix.close null;
+          let dir = session_dir ~name:(string_of_int gone) home in
+          let w = spawn_wait ~home ~session:dir in
+          check_bool "exits 0 within 2 seconds" true (exit_within w 2. = Some 0);
+          check_str "and says nothing" "" (read_all w.err);
+          check_bool "and wrote nothing there" false (Sys.file_exists (Filename.concat dir "waiter"))))
+
+(* folder names that are no process id: kill would take 0 and -1 for whole groups of them *)
+let names_that_are_no_pid () =
+  in_spaced_home (fun home ->
+      with_waiters (fun () ->
+          List.iter
+            (fun name ->
+              let w = spawn_wait ~home ~session:(session_dir ~name home) in
+              check_bool (name ^ " exits 0 within 2 seconds") true (exit_within w 2. = Some 0);
+              check_str (name ^ " says nothing") "" (read_all w.err))
+            [ "0"; "-1"; "0x1f"; "12abc"; "agent" ]))
+
+let wait_with_no_daemon () =
+  let fk, sh = fake () in
+  in_spaced_home (fun home ->
+      with_waiters (fun () ->
+          let dir = session_dir home in
+          let w = spawn_wait ~home ~session:dir in
+          check_bool "still waiting after 3 seconds" true (exit_within w 3. = None);
+          check_bool "and started no daemon" false (Sys.file_exists (Filename.concat home "core.sock"));
+          with_daemon ~home sh (fun d ->
+              ignore (text (attach d));
+              check_bool "it finds the service" true (watching dir);
+              Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+              ignore (text (call d "find" [ "3" ]));
+              check_bool "exits 2 once the person acts" true (exit_within w 4. = Some 2);
+              check_bool "with the note" true (String.starts_with ~prefix:heading (read_all w.err)))))
+
+(* the person's own stop: its event is held when the feed closes, and is told with no service up *)
+let wait_tells_a_stop () =
+  let _, sh = fake () in
+  with_waiters (fun () ->
+      with_daemon ~home:(spaced_home ()) sh (fun d ->
+          let dir = session_dir d.home in
+          let w = spawn_wait ~home:d.home ~session:dir in
+          check_bool "it is watching" true (watching dir);
+          ignore (call d "stop" []);
+          Thread.join d.thread;
+          check_bool "exits 2 within 4 seconds" true (exit_within w 4. = Some 2);
+          check_str "with the stop in its note" (heading ^ "- stop: stopped\n") (read_all w.err);
+          check_bool "and no service started" false (Sys.file_exists (sock d.home))))
+
+(* the waiter's own look finds the game closed: recorded, and told *)
+let wait_hears_the_game_closed ~cursor_file () =
+  let fk, sh = fake () in
+  with_waiters (fun () ->
+      with_daemon ~home:(spaced_home ()) sh (fun d ->
+          ignore (text (attach d));
+          let dir = session_dir d.home in
+          if cursor_file then write_cursor dir (string_of_int (newest_seq d));
           fk.alive <- false;
-          (* the waiter's own status read finds the game closed, and that is recorded *)
           let w = spawn_wait ~home:d.home ~session:dir in
           check_bool "exits 2" true (exit_within w 4. = Some 2);
-          check_str "with the closed game in its note" "[moth] the person did this in moth:\n- status: not attached. disco.exe closed.\n" (read_all w.err)))
+          check_str "with the closed game in its note" (heading ^ "- status: not attached. disco.exe closed.\n") (read_all w.err)))
 
 let wait_needs_a_session () =
+  in_spaced_home (fun home ->
+      with_waiters (fun () ->
+          let w = spawn ~home [ "wait" ] in
+          check_bool "exits 1, not 2" true (exit_within w 2. = Some 1);
+          check_str "saying how" "wait is run by the agent's hook: moth wait --session <dir>\n" (read_all w.err);
+          let w = spawn ~home [ "wait"; "--bogus" ] in
+          check_bool "a bad option exits 1 too" true (exit_within w 2. = Some 1)))
+
+(* moth wait does not use MOTH_ACTOR *)
+let wait_ignores_the_actor () =
+  in_spaced_home (fun home ->
+      with_waiters (fun () ->
+          let w = spawn_wait_with [ ("MOTH_ACTOR", "nobody") ] ~home ~session:(session_dir home) in
+          check_bool "still waiting" true (exit_within w 1.5 = None);
+          check_str "and saying nothing" "" (read_all w.err)))
+
+(* the quiet state is kept beside the cursor, and starts a waiter that replays from it *)
+let quiet_travels_with_the_cursor () =
+  let fk, sh = fake () in
   with_waiters (fun () ->
-      let exe = Lazy.force moth_exe in
-      let err = Printf.sprintf "/tmp/moth-wait-%d-usage.err" (Unix.getpid ()) in
-      let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 and errfd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
-      let pid = Unix.create_process exe [| exe; "wait" |] null null errfd in
-      Unix.close null;
-      Unix.close errfd;
-      let w = { pid; err; code = None } in
-      spawned := w :: !spawned;
-      check_bool "exits 2" true (exit_within w 2. = Some 2);
-      check_str "saying how" "wait is run by the agent's hook: moth wait --session <dir>\n" (read_all err))
+      with_daemon ~home:(spaced_home ()) sh (fun d ->
+          ignore (text (attach d));
+          let dir = session_dir d.home in
+          (* a waiter gone, having left the cursor while quiet; what was done after it is not told *)
+          write_cursor dir (string_of_int (newest_seq d) ^ " quiet");
+          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+          ignore (text (call d "find" [ "3" ]));
+          let w = spawn_wait ~home:d.home ~session:dir in
+          check_bool "nothing to tell after 3 seconds" true (exit_within w 3. = None);
+          Unix.kill w.pid Sys.sigkill;
+          ignore (exit_within w 2.);
+          (* and a waiter that sees quiet go on writes it *)
+          Sys.remove (Filename.concat dir "cursor");
+          let w = spawn_wait ~home:d.home ~session:dir in
+          check_bool "it is watching" true (watching dir);
+          ignore (text (call d "quiet" [ "on" ]));
+          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+          ignore (text (call d "find" [ "3" ]));
+          let want = string_of_int (newest_seq d) ^ " quiet" in
+          check_bool "the cursor says quiet" true (until (fun () -> String.trim (read_all (Filename.concat dir "cursor")) = want));
+          check_bool "and it told nothing" true (exit_within w 0.5 = None)))
+
+(* a service that accepts and never answers does not keep the waiter past its session *)
+let a_silent_service () =
+  in_spaced_home (fun home ->
+      with_waiters (fun () ->
+          let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
+          let child = Unix.create_process "sleep" [| "sleep"; "30" |] null null null in
+          Unix.close null;
+          let dir = session_dir ~name:(string_of_int child) home in
+          let listener = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+          Fun.protect
+            ~finally:(fun () ->
+              Unix.close listener;
+              try
+                Unix.kill child Sys.sigkill;
+                ignore (Unix.waitpid [] child)
+              with Unix.Unix_error _ -> ())
+            (fun () ->
+              Unix.bind listener (Unix.ADDR_UNIX (sock home));
+              Unix.listen listener 4;
+              let w = spawn_wait_with [ ("MOTH_WAIT_TIMEOUT", "2") ] ~home ~session:dir in
+              check_bool "waiting while its session lives" true (exit_within w 1. = None);
+              Unix.kill child Sys.sigkill;
+              ignore (Unix.waitpid [] child);
+              check_bool "gone within the limit and two seconds" true (exit_within w 4. = Some 0))))
 
 let () =
   let t n f = Alcotest.test_case n `Quick f in
@@ -2080,7 +2202,14 @@ let () =
           t "two waiters on one session: the newer tells" two_waiters;
           t "a session that is gone" a_dead_session;
           t "no daemon, then a daemon" wait_with_no_daemon;
-          t "the game closed under its own look" wait_hears_the_game_closed;
+          t "the game closed under its own look, with a cursor file" (wait_hears_the_game_closed ~cursor_file:true);
+          t "the game closed under its own look, with none" (wait_hears_the_game_closed ~cursor_file:false);
+          t "a take-over while an event is held" a_take_over_holding_an_event;
+          t "folder names that are no pid" names_that_are_no_pid;
+          t "a stop is told with no service up" wait_tells_a_stop;
+          t "moth wait ignores MOTH_ACTOR" wait_ignores_the_actor;
+          t "quiet travels with the cursor" quiet_travels_with_the_cursor;
+          t "a silent service" a_silent_service;
           t "no session" wait_needs_a_session;
         ] );
       ("client", [ t "parse args" parse_args; t "parse args: results options" parse_results_args; t "home" home ]);

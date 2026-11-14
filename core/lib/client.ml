@@ -89,7 +89,7 @@ let start_and_connect ~spawn_daemon ~home path =
   in
   match Daemon.make_home home with exception Failure m -> Error m | () -> retry false
 
-let call ?(autostart = true) ?(record = true) ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~args ~opts () =
+let call ?(autostart = true) ?(record = true) ?timeout ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~args ~opts () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let* path = Daemon.socket_path ~home in
   let* fd =
@@ -98,6 +98,7 @@ let call ?(autostart = true) ?(record = true) ?(spawn_daemon = spawn_daemon) ~ho
     | None when not autostart -> Error not_running
     | None -> start_and_connect ~spawn_daemon ~home path
   in
+  Option.iter (fun t -> try Unix.setsockopt_float fd Unix.SO_RCVTIMEO t with Unix.Unix_error _ -> ()) timeout;
   let request =
     `Assoc
       ([
@@ -114,7 +115,7 @@ let call ?(autostart = true) ?(record = true) ?(spawn_daemon = spawn_daemon) ~ho
 
 (* every feed line after watch's reply, until [f] says stop or the daemon closes the connection.
    A line cut short (the daemon let go of this watcher mid-line) is not json, and ends it too. *)
-let watch ~home ?after ?started ?idle f =
+let watch ~home ?after ?timeout ?started ?idle f =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let* path = Daemon.socket_path ~home in
   match connect path with
@@ -127,6 +128,7 @@ let watch ~home ?after ?started ?idle f =
       (* lines are read by hand, so that [idle] gets its say whenever half a second passes with
          nothing to read: [`Line l], [`Idle] or [`Eof] *)
       let pending = Buffer.create 4096 and chunk = Bytes.create 4096 in
+      let deadline = Option.map (fun t -> Unix.gettimeofday () +. t) timeout in
       let rec next ~idling =
         let held = Buffer.contents pending in
         match String.index_opt held '\n' with
@@ -136,7 +138,10 @@ let watch ~home ?after ?started ?idle f =
             `Line (String.sub held 0 j)
         | None -> (
             match Unix.select [ fd ] [] [] 0.5 with
-            | [], _, _ -> if idling then `Idle else next ~idling
+            | [], _, _ ->
+                if idling then `Idle
+                else if (match deadline with Some d -> Unix.gettimeofday () >= d | None -> false) then `Eof
+                else next ~idling
             | _ -> (
                 match Unix.read fd chunk 0 (Bytes.length chunk) with
                 | 0 -> `Eof
@@ -151,7 +156,7 @@ let watch ~home ?after ?started ?idle f =
       let sent = try ignore (Unix.write_substring fd line 0 (String.length line)); true with Unix.Unix_error _ -> false in
       if not sent then lost
       else
-        (* the reply is waited for as long as converse waits: no idle turns before it *)
+        (* the reply is waited for as long as converse waits (or [timeout]): no idle turns before it *)
         match next ~idling:false with
         | `Eof -> lost
         | `Idle -> lost

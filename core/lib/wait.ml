@@ -30,9 +30,9 @@ let take_in t ~now ev =
       t.cursor <- seq;
       match words ev with
       | "quiet" :: (("on" | "off") as v) :: _ when member "ok" ev = `Bool true ->
-      t.quiet <- v = "on";
-      (* going quiet drops what was held; the cursor has moved past it *)
-      if t.quiet then t.held <- []
+          t.quiet <- v = "on";
+          (* going quiet drops what was held; the cursor has moved past it *)
+          if t.quiet then t.held <- []
       | "quiet" :: _ -> ()
       | _ :: _ as ws when member "actor" ev <> `String "agent" && member "act" ev = `Bool true && not t.quiet ->
           let held =
