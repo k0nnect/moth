@@ -1,5 +1,6 @@
 #include <QCheckBox>
 #include <QClipboard>
+#include <QDir>
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QLabel>
@@ -25,6 +26,26 @@ void showOffscreen(QWidget &w) {
   QTest::ignoreMessage(QtWarningMsg, "This plugin does not support propagateSizeHints()");
   w.show();
 }
+
+// the working folder, put back when the test ends however it ends
+class WorkingFolder {
+public:
+  WorkingFolder() : was_(QDir::currentPath()) {}
+  ~WorkingFolder() { QDir::setCurrent(was_); }
+
+private:
+  QString was_;
+};
+
+// the clipboard's text, put back when the test ends however it ends
+class ClipboardText {
+public:
+  ClipboardText() : was_(QGuiApplication::clipboard()->text()) {}
+  ~ClipboardText() { QGuiApplication::clipboard()->setText(was_); }
+
+private:
+  QString was_;
+};
 
 // environment variables set for a test and put back as they were
 class Env {
@@ -295,6 +316,7 @@ void TestMainWindow::theTerminalPathsAndEnvironment() {
   QVERIFY(vars.contains("CLAUDE_CONFIG_DIR=/keep/me"));
   QVERIFY(vars.contains("ANTHROPIC_API_KEY=keep"));
   // MOTH_BIN is passed on as an absolute path
+  WorkingFolder folder;
   QDir::setCurrent("/tmp");
   QVERIFY(terminalEnv("/tmp/h", "rel/moth").contains("MOTH_BIN=" + QDir::currentPath() + "/rel/moth"));
 }
@@ -369,7 +391,7 @@ void TestMainWindow::whenTheShellEndedCommandCCopiesTheLastScreen() {
   for (int r = 0; r < t->screen()->rows() && row < 0; ++r)
     if (t->screen()->text(r).startsWith("marker")) row = r;
   QVERIFY(row >= 0);
-  const QString before = QGuiApplication::clipboard()->text();
+  ClipboardText clipboard;
   QGuiApplication::clipboard()->setText("untouched");
   const int cellH = t->viewport()->height() / t->screen()->rows();
   QTest::mouseDClick(t->viewport(), Qt::LeftButton, {}, QPoint(3, row * cellH + cellH / 2));
@@ -377,7 +399,6 @@ void TestMainWindow::whenTheShellEndedCommandCCopiesTheLastScreen() {
   QTest::keyClick(t, Qt::Key_C, Qt::ControlModifier);  // Command, as Qt reports it on macOS
   QCOMPARE(QGuiApplication::clipboard()->text(), QString("marker"));
   QVERIFY(!t->running());  // nothing else started
-  QGuiApplication::clipboard()->setText(before);
 }
 
 // a refused `quiet on` (the board is working) and a failed one leave the box as it was and say why
