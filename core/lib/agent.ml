@@ -29,33 +29,33 @@ let quote s =
 
 let env ~home ~moth ~path = [ ("MOTH_ACTOR", "agent"); ("MOTH_HOME", home); ("PATH", Filename.dirname moth ^ ":" ^ path) ]
 
+(* the waiter is armed when a turn starts as well as when it ends: Claude Code runs no Stop hook
+   after a turn the person interrupted, and the newest waiter takes over from the one before *)
 let settings ~home ~moth ~path ~dir : Yojson.Safe.t =
-  `Assoc
-    [
-      ("env", `Assoc (List.map (fun (k, v) -> (k, `String v)) (env ~home ~moth ~path)));
-      ("permissions", `Assoc [ ("allow", `List [ `String "Bash(moth *)" ]) ]);
-      ( "hooks",
+  let waiter =
+    `List
+      [
         `Assoc
           [
-            ( "Stop",
+            ( "hooks",
               `List
                 [
                   `Assoc
                     [
-                      ( "hooks",
-                        `List
-                          [
-                            `Assoc
-                              [
-                                ("type", `String "command");
-                                ("command", `String (Printf.sprintf "%s wait --session %s" (quote moth) (quote dir)));
-                                ("asyncRewake", `Bool true);
-                                ("timeout", `Int 86400);
-                              ];
-                          ] );
+                      ("type", `String "command");
+                      ("command", `String (Printf.sprintf "%s wait --session %s" (quote moth) (quote dir)));
+                      ("asyncRewake", `Bool true);
+                      ("timeout", `Int 86400);
                     ];
                 ] );
-          ] );
+          ];
+      ]
+  in
+  `Assoc
+    [
+      ("env", `Assoc (List.map (fun (k, v) -> (k, `String v)) (env ~home ~moth ~path)));
+      ("permissions", `Assoc [ ("allow", `List [ `String "Bash(moth *)" ]) ]);
+      ("hooks", `Assoc [ ("UserPromptSubmit", waiter); ("Stop", waiter) ]);
     ]
 
 let command ~claude ~dir = [| claude; "--settings"; Filename.concat dir "settings.json"; "--append-system-prompt"; instructions; first_prompt |]

@@ -3,15 +3,19 @@
 (** what the agent is told about moth, appended to its own system prompt *)
 val instructions : string
 
-(** what moth says to it first, so its first turn ends and the hook is armed *)
+(** what moth says to it first, so its first turn starts and the waiter is armed *)
 val first_prompt : string
 
 (** the three variables the agent runs with: [MOTH_ACTOR], [MOTH_HOME] and [PATH] (moth's own folder
     first). The settings' [env] and the process environment are both this. *)
 val env : home:string -> moth:string -> path:string -> (string * string) list
 
-(** the settings for one session: env, the one approval, the Stop hook. [moth] is the absolute
-    path of the running [moth], [path] the PATH it was started with, [dir] the session folder. *)
+(** the settings for one session: env, the one approval, and the hooks [UserPromptSubmit] and
+    [Stop], in that order, each the same one entry: [moth wait --session <dir>] with [asyncRewake]
+    and a 24-hour [timeout]. A turn's start arms the waiter as well as its end, since Claude Code
+    runs no [Stop] hook after a turn the person interrupted; the newest waiter takes over. [moth]
+    is the absolute path of the running [moth], [path] the PATH it was started with, [dir] the
+    session folder. *)
 val settings : home:string -> moth:string -> path:string -> dir:string -> Yojson.Safe.t
 
 (** makes [home]/agent/<pid> (0700) with settings.json, instructions.md and cursor (0600), makes

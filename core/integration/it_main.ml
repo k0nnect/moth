@@ -1,7 +1,7 @@
 (* End to end in a bottle: the moth command, its daemon and the helper against the stand-in game
    (tests/target/target.cpp), all running in the test bottle MOTH_TEST_BOTTLE through WINE.
    Scenarios drive [bin/moth --json ...] as a subprocess and check its replies against what the
-   target reports; a few speak to the daemon's socket themselves, and four drive the window
+   target reports; a few speak to the daemon's socket themselves, and eight drive the window
    through <dir>/../build/app/it_app. One line per scenario; the exit code is 1 when any
    scenario fails.
 
@@ -964,7 +964,7 @@ let game_goes () =
       let writes = List.filter (fun ev -> List.mem (member "cmd" ev) [ `String "set"; `String "keep"; `String "undo" ]) since in
       check (writes = []) "something wrote: %s" (show (`List writes)))
 
-(* ---- an agent's hand, and the agent in the window (37 to 40) ---- *)
+(* ---- an agent's hand, and the agent in the window (37 to 42) ---- *)
 
 let read_text path = try In_channel.with_open_bin path In_channel.input_all with Sys_error _ -> ""
 let lines_of text = List.filter (fun l -> l <> "") (String.split_on_char '\n' text)
@@ -1198,9 +1198,19 @@ let waits () =
 (* the stand-in's own files, in this scenario's home *)
 let stub_file name = Filename.concat !home name
 
+(* how many times the stand-in started its Stop hook: stub-runs has a line per start, its event *)
+let stop_runs runs = List.length (List.filter (( = ) "Stop") (lines_of (read_text runs)))
+
+let heading = "[moth] the person did this in moth:"
+
+(* how many notes [text] holds: its headings *)
+let notes_in text =
+  let n = String.length heading in
+  let rec go i k = if i + n > String.length text then k else if String.sub text i n = heading then go (i + n) (k + 1) else go (i + 1) k in
+  go 0 0
+
 (* the first note in stub-notes: from the first heading to the next, or to the end *)
 let first_note text =
-  let heading = "[moth] the person did this in moth:" in
   let rec at i = if i + String.length heading > String.length text then None else if String.sub text i (String.length heading) = heading then Some i else at (i + 1) in
   match at 0 with
   | None -> ""
@@ -1211,9 +1221,11 @@ let first_note text =
 (* 39: the window's terminal runs moth agent, which runs the stand-in; what the person does in the
    window reaches the stand-in as a note, quiet stops that (and the stand-in is shown alive and
    waiting while it does, and told again once quiet is off), and when the agent ends the terminal is
-   a shell that can run moth. The stand-in's first hook run waits 5 seconds (STUB_FIRST_DELAY), as
-   the first Stop hook waits for Claude Code's first turn: the window's attach and find come before
-   any waiter, and the first note must still tell the find. Run in a home with a space in its name. *)
+   a shell that can run moth. The stand-in's first turn starts 5 seconds after it is up
+   (STUB_FIRST_DELAY), as Claude Code loads before its first prompt is submitted: the window's
+   attach and find come before any waiter, and the first note must still tell the find. Each turn
+   arms two waiters (a turn's start and its end), and one step must still bring one note. Run in a
+   home with a space in its name. *)
 let agent_in_window () =
   with_spaced_home (fun () ->
       with_target ~attach:false (fun t ->
@@ -1232,8 +1244,8 @@ let agent_in_window () =
                 check (until ~timeout:15. (fun () -> contains (read_text notes) "find 3")) "stub-notes has no note with find 3 within 15s. it holds: %S" (read_text notes);
                 let first = first_note (read_text notes) in
                 check (contains first "- find 3: ") "the first note does not tell the find made before the first waiter: %S" first;
-                (* the hook armed again after the note *)
-                check (until ~timeout:10. (fun () -> List.length (lines_of (read_text runs)) >= 2)) "the stand-in did not run the hook again after the note (stub-runs: %S)" (read_text runs);
+                (* the hook armed again at the end of the turn the note started *)
+                check (until ~timeout:10. (fun () -> stop_runs runs >= 2)) "the stand-in did not run the Stop hook again after the note (stub-runs: %S)" (read_text runs);
                 let a = lines_of (read_text args) in
                 check (List.mem "--settings" a) "the stand-in's arguments have no --settings: %s" (String.concat " | " a);
                 check (settings_of a <> None) "no settings file under %s/agent/ among the arguments: %s" !home (String.concat " | " a);
@@ -1265,8 +1277,10 @@ let agent_in_window () =
                 Target_ctl.set t "points" "3";
                 ignore (find "3");
                 check (until ~timeout:10. (fun () -> String.length (read_text notes) > String.length !after_notes)) "no note reached the agent within 10s of a step once quiet was off";
+                (* a second note of the same step, from the turn's other waiter, would have come by now *)
+                Unix.sleepf 2.;
                 let fresh = String.sub (read_text notes) (String.length !after_notes) (String.length (read_text notes) - String.length !after_notes) in
-                check (contains fresh "find 3" && not (contains fresh "next 4")) "the note after quiet off is not the find alone: %S" fresh;
+                check (notes_in fresh = 1 && contains fresh "find 3" && not (contains fresh "next 4")) "the note after quiet off is not one note with the find alone: %S" fresh;
                 !app_say "bye"
             | _ -> ()
           in
@@ -1307,7 +1321,7 @@ let window_goes_with_agent () =
         | "clicked" ->
             track_app ();
             check (until ~timeout:10. (fun () -> contains (read_text notes) "find 3")) "stub-notes has no note with find 3 within 10s. it holds: %S" (read_text notes);
-            check (until ~timeout:10. (fun () -> List.length (lines_of (read_text runs)) >= 2)) "the stand-in did not run the hook again after the note (stub-runs: %S)" (read_text runs);
+            check (until ~timeout:10. (fun () -> stop_runs runs >= 2)) "the stand-in did not run the Stop hook again after the note (stub-runs: %S)" (read_text runs);
             session := session_of (lines_of (read_text args));
             let waiter_file = Filename.concat (Filename.concat (Filename.concat !home "agent") (string_of_int !session)) "waiter" in
             let armed () =
@@ -1322,6 +1336,58 @@ let window_goes_with_agent () =
       in
       with_nothing_left "the window closed with the agent up" (fun () -> app_ok ~stdin:true ~vars ~on_line [ "term"; bottle (); "moth-target.exe"; "3"; "stub agent up" ]);
       check (!session > 0 && not (alive !session) && not (alive !waiter)) "the stand-in (pid %d) or its moth wait (pid %d) outlived the window" !session !waiter)
+
+(* the moth wait processes running for the session folder [dir], by ps (moth's own process: the
+   hook's shell, when it is one, is not counted) *)
+let waiters_for dir =
+  let r = run ~timeout:20. [| "/bin/ps"; "-axo"; "pid=,args=" |] in
+  List.filter_map
+    (fun l ->
+      let l = String.trim l in
+      if String.ends_with ~suffix:("moth wait --session " ^ dir) l then int_of_string_opt (List.hd (String.split_on_char ' ' l)) else None)
+    (String.split_on_char '\n' r.out)
+
+(* 42: every turn of the stand-in is interrupted (STUB_INTERRUPT), as when the person presses
+   Escape, so no Stop hook runs: the waiter armed as each turn starts still tells the window's
+   find, then a later step of the person's in a note of its own, and exactly one moth wait is left
+   for the session *)
+let interrupted_turn () =
+  with_target ~attach:false (fun t ->
+      Target_ctl.set t "points" "3";
+      ignore (moth [ "quiet"; "off" ]);
+      let notes = stub_file "stub-notes" and args = stub_file "stub-args" and runs = stub_file "stub-runs" and envf = stub_file "stub-env" in
+      List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ notes; args; runs; envf ];
+      let vars = [ ("MOTH_CLAUDE", stub_agent ()); ("STUB_INTERRUPT", "1"); ("SHELL", "/bin/sh"); ("HOME", fake_home ()) ] in
+      let on_line = function
+        | "clicked" ->
+            track_app ();
+            (* each check's words are read after its wait *)
+            let told = until ~timeout:10. (fun () -> contains (read_text notes) "- find 3: ") in
+            check told "stub-notes has no note with find 3 within 10s. it holds: %S" (read_text notes);
+            let session = session_of (lines_of (read_text args)) in
+            let before = read_text notes in
+            Target_ctl.set t "points" "4";
+            ignore (next "4");
+            let told = until ~timeout:10. (fun () -> contains (read_text notes) "- next 4: ") in
+            check told "no note with next 4 within 10s of the person's next 4. stub-notes holds: %S" (read_text notes);
+            (* a second note of the same step, from a second waiter, would have come by now *)
+            Unix.sleepf 2.;
+            let text = read_text notes in
+            let fresh = String.sub text (String.length before) (String.length text - String.length before) in
+            check (notes_in fresh = 1 && not (contains fresh "find 3")) "the person's next 4 did not bring one note with that step alone: %S" fresh;
+            check (stop_runs runs = 0) "the stand-in ran a Stop hook in an interrupted turn (stub-runs: %S)" (read_text runs);
+            let dir = Filename.concat (Filename.concat !home "agent") (string_of_int session) in
+            let one = until ~timeout:5. (fun () -> List.length (waiters_for dir) = 1) in
+            let ws = waiters_for dir in
+            check (one && List.length ws = 1) "%d moth wait for the session (pids %s), expected exactly one" (List.length ws) (String.concat " " (List.map string_of_int ws));
+            let w = List.hd ws in
+            check (List.mem w (descendants session)) "the one moth wait (pid %d) is not under the stand-in (pid %d)" w session;
+            check (int_of_string_opt (String.trim (read_text (Filename.concat dir "waiter"))) = Some w) "the session's waiter file names %S, not the moth wait running (pid %d)" (read_text (Filename.concat dir "waiter")) w;
+            track_app ();
+            !app_say "bye"
+        | _ -> ()
+      in
+      with_nothing_left "the window closed" (fun () -> app_ok ~stdin:true ~vars ~on_line [ "term"; bottle (); "moth-target.exe"; "3"; "stub agent up" ]))
 
 let scenarios =
   [
@@ -1366,6 +1432,7 @@ let scenarios =
     (39, "the agent in the window", agent_in_window);
     (40, "no agent", no_agent);
     (41, "the window goes with the agent up", window_goes_with_agent);
+    (42, "an interrupted turn", interrupted_turn);
   ]
 
 let () =

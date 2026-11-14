@@ -1,5 +1,5 @@
 ; the end-to-end scenarios: run by make test-integration and make bench, never by dune test.
-; stub_agent is the stand-in for claude code that scenarios 37 to 40 point MOTH_CLAUDE at
+; stub_agent is the stand-in for claude code that scenarios 39, 41 and 42 point MOTH_CLAUDE at
 (executables
  (names it_main stub_agent)
  (libraries moth_core yojson unix))

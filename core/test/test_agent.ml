@@ -44,9 +44,17 @@ let settings_exact () =
     Yojson.Safe.from_string
       {|{"env":{"MOTH_ACTOR":"agent","MOTH_HOME":"/tmp/it's a home","PATH":"/opt/my moth/bin:/usr/bin:/bin"},
          "permissions":{"allow":["Bash(moth *)"]},
-         "hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/opt/my moth/bin/moth' wait --session '/tmp/it'\\''s a home/agent/123'","asyncRewake":true,"timeout":86400}]}]}}|}
+         "hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"'/opt/my moth/bin/moth' wait --session '/tmp/it'\\''s a home/agent/123'","asyncRewake":true,"timeout":86400}]}],
+                  "Stop":[{"hooks":[{"type":"command","command":"'/opt/my moth/bin/moth' wait --session '/tmp/it'\\''s a home/agent/123'","asyncRewake":true,"timeout":86400}]}]}}|}
   in
   check_str "settings" (Yojson.Safe.to_string expected) (Yojson.Safe.to_string (Agent.settings ~home ~moth ~path ~dir))
+
+(* a turn's start and its end arm the same waiter: one command, so the newest waiter takes over *)
+let both_hooks_one_command () =
+  let s = Agent.settings ~home:"/h" ~moth:"/m/moth" ~path:"/usr/bin" ~dir:"/h/agent/7" in
+  let command event = Yojson.Safe.Util.(s |> member "hooks" |> member event |> index 0 |> member "hooks" |> index 0 |> member "command" |> to_string) in
+  check_str "the same command" (command "Stop") (command "UserPromptSubmit");
+  Alcotest.(check (list string)) "the two events, in this order" [ "UserPromptSubmit"; "Stop" ] Yojson.Safe.Util.(s |> member "hooks" |> keys)
 
 let hook_command_runs () =
   with_tmp (fun d ->
@@ -328,6 +336,7 @@ let () =
       ( "files",
         [
           Alcotest.test_case "settings" `Quick settings_exact;
+          Alcotest.test_case "both hooks run one command" `Quick both_hooks_one_command;
           Alcotest.test_case "hook command" `Quick hook_command_runs;
           Alcotest.test_case "prepare" `Quick prepare_makes_files;
           Alcotest.test_case "prepare removes dead sessions" `Quick prepare_removes_dead;

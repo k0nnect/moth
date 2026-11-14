@@ -98,7 +98,8 @@ let session_pid name =
 (* how long [moth wait] gives a service to answer; MOTH_WAIT_TIMEOUT (seconds) is for tests *)
 let answer_limit () = match Option.bind (Sys.getenv_opt "MOTH_WAIT_TIMEOUT") float_of_string_opt with Some t when t > 0. -> t | _ -> 30.
 
-(* [moth wait --session <dir>], run by the agent's Stop hook. It follows the feed, and when the
+(* [moth wait --session <dir>], run by the agent's hooks as each turn starts (UserPromptSubmit)
+   and ends (Stop), the newest taking over from the one before. It follows the feed, and when the
    person has done something (see Wait) prints the note to stderr and exits 2, which wakes the
    agent: 2 means that and nothing else. Every other end is exit 0 with nothing printed: the
    session is gone (its pid, the folder's name, is not alive, or the folder is), a newer waiter
