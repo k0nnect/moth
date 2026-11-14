@@ -704,7 +704,9 @@ let hang_up c = try Unix.close c.fd with Unix.Unix_error _ -> ()
    SIGPIPE that ends the harness *)
 let request ?(record = true) c cmd =
   let j =
-    `Assoc ([ ("id", `Int 1); ("actor", `String "user"); ("cmd", `String cmd); ("args", `List []); ("opts", `Assoc []) ] @ if record then [] else [ ("record", `Bool false) ])
+    `Assoc
+      ([ ("id", `Int 1); ("proto", `Int Moth_core.Daemon.protocol); ("actor", `String "user"); ("cmd", `String cmd); ("args", `List []); ("opts", `Assoc []) ]
+      @ if record then [] else [ ("record", `Bool false) ])
   in
   let s = Yojson.Safe.to_string j ^ "\n" in
   let pipe = Sys.signal Sys.sigpipe Sys.Signal_ignore in

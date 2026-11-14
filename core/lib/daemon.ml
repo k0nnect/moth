@@ -689,8 +689,9 @@ let handle st ~record ~cmd ~args ~opts =
 
 (* ---- the protocol ---- *)
 
-(* [record]: false when the request asked to leave no trace *)
-type request = { rid : Yojson.Safe.t; actor : string; cmd : string; args : string list; opts : (string * string) list; record : bool }
+(* [record]: false when the request asked to leave no trace; [proto]: the client's protocol number,
+   when it sent one *)
+type request = { rid : Yojson.Safe.t; actor : string; cmd : string; args : string list; opts : (string * string) list; record : bool; proto : int option }
 
 let parse_request line =
   match Yojson.Safe.from_string line with
@@ -704,7 +705,8 @@ let parse_request line =
           let args = match List.assoc_opt "args" f with Some (`List l) -> List.filter_map text l | _ -> [] in
           let opts = match List.assoc_opt "opts" f with Some (`Assoc l) -> List.filter_map (fun (k, v) -> Option.map (fun s -> (k, s)) (text v)) l | _ -> [] in
           let record = List.assoc_opt "record" f <> Some (`Bool false) in
-          Ok { rid; actor; cmd; args; opts; record }
+          let proto = match List.assoc_opt "proto" f with Some (`Int n) -> Some n | _ -> None in
+          Ok { rid; actor; cmd; args; opts; record; proto }
       | _ -> Error (rid, "bad request: no cmd"))
   | _ -> Error (`Null, "bad request: not an object")
 
@@ -724,12 +726,20 @@ let internal_error st cmd e =
 (* the commands that change nothing, so may be asked to leave no trace *)
 let reads = [ "bottles"; "ps"; "status"; "results"; "kept"; "log"; "games" ]
 
+let other_build = "this moth is from another build than its background service. stop the service and it starts again by itself: moth stop"
+
+(* A client must send this build's protocol number, or it is not served: an older moth would not
+   say who is speaking. stop and status are served whatever it sends, so any moth can see and stop
+   any service, and the window can tell that a service is from another build. *)
+let same_build r = r.proto = Some protocol || List.mem r.cmd [ "stop"; "status" ]
+
 (* A recorded request is told to watchers as it starts and again, as its event, once it ends. An
    unrecorded one takes no seq and tells nobody, unless it made the daemon let go of the game or
    the helper (the game closed, target_gone, helper_lost): that one is recorded all the same, so
    watchers learn why the game went, and its event comes with no busy line before it. *)
 let answer st = function
   | Error (rid, msg) -> reply rid (Error msg)
+  | Ok r when not (same_build r) -> reply r.rid (Error other_build)
   | Ok r when not (r.record || List.mem r.cmd reads) -> reply r.rid (Error "only commands that change nothing can go unrecorded")
   | Ok r ->
       if r.record then feed st (`Assoc [ ("busy", `Assoc [ ("actor", `String r.actor); ("cmd", `String r.cmd); ("args", `List (List.map (fun a -> `String a) r.args)) ]) ]);
@@ -749,13 +759,14 @@ let max_backlog = 1000
    first) as event lines, then the feed. Never recorded. True when [fd] became a watcher; when
    refused it has its error and is the caller's to close. *)
 let add_watcher st fd r =
+  let refuse e =
+    send fd (reply r.rid (Error e));
+    false
+  in
   match check_usage ~cmd:r.cmd ~args:r.args ~opts:r.opts with
-  | Error e ->
-      send fd (reply r.rid (Error e));
-      false
-  | Ok () when List.length st.watchers >= max_watchers ->
-      send fd (reply r.rid (Error "too many watchers"));
-      false
+  | _ when not (same_build r) -> refuse other_build
+  | Error e -> refuse e
+  | Ok () when List.length st.watchers >= max_watchers -> refuse "too many watchers"
   | Ok () ->
       let stored =
         match List.assoc_opt "after" r.opts with

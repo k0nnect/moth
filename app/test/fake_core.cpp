@@ -87,6 +87,8 @@ int FakeCore::watchers() const {
 
 QList<Opts> FakeCore::watches() const { return watches_; }
 
+QList<int> FakeCore::watchProtos() const { return watchProtos_; }
+
 void FakeCore::feedRequests(bool on) { feedRequests_ = on; }
 
 void FakeCore::refuseWatch(const QString &error) { refuseWatch_ = error; }
@@ -126,9 +128,11 @@ void FakeCore::heard(QLocalSocket *socket, const QByteArray &line) {
   const QJsonObject opts = r.value("opts").toObject();
   for (auto it = opts.begin(); it != opts.end(); ++it) req.opts.append({it.key(), it.value().toString()});
   req.record = r.value("record") != QJsonValue(false);
+  req.proto = r.value("proto").isDouble() ? r.value("proto").toInt() : -1;
 
   if (req.cmd == "watch") {
     watches_.append(req.opts);
+    watchProtos_.append(req.proto);
     if (!refuseWatch_.isEmpty()) {
       send(socket, {{"id", id}, {"ok", false}, {"error", refuseWatch_}});
       socket->disconnectFromServer();

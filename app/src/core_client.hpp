@@ -17,6 +17,10 @@ class QProcess;
 using Opts = QList<QPair<QString, QString>>;
 struct Reply { bool ok = false; QJsonValue result; QString text; QString error; };
 
+// the client protocol this build speaks (the core's Daemon.protocol): sent with every request and
+// every watch, and what a service of this build answers in `status` as proto
+constexpr int mothProtocol = 2;
+
 // moth's background service, reached at <home>/core.sock: one connection per request, and one
 // more that follows the feed. Nothing here blocks or uses a thread.
 class CoreClient : public QObject {
@@ -24,8 +28,8 @@ class CoreClient : public QObject {
 public:
   CoreClient(QString home, QString mothBin, QObject *parent = nullptr);
   const QString &home() const;
-  // one request on its own connection, actor "user"; `done` runs once, on the caller's thread, and
-  // never before call() returns. When no service answers, a recorded request (the user's own
+  // one request on its own connection, actor "user", with proto; `done` runs once, on the caller's
+  // thread, and never before call() returns. When no service answers, a recorded request (the user's own
   // action) runs `mothBin status` once to start one and is tried again when that ends (10 seconds
   // at most). An unrecorded one (a poll) never starts it: it fails at once. Failing because no
   // service answers, the error is "moth's background service is not answering. see
@@ -37,7 +41,8 @@ public:
   // `mothBin status` (10 seconds at most); a running service is asked nothing. Then `then`, on the
   // caller's thread, never before this returns.
   void startService(std::function<void()> then);
-  void startFeed();  // `watch`; when it drops, tries again every second with `after` = the last seq seen
+  // `watch`, with proto; when it drops, tries again every second with `after` = the last seq seen
+  void startFeed();
 signals:
   void busy(const QJsonObject &what);   // a recorded request started
   // the signal's name hides QObject::event(QEvent *), which Qt still calls through QObject

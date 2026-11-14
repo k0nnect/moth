@@ -96,6 +96,7 @@ void TestCoreClient::sendsTheRequestAsGiven() {
   QCOMPARE(unrecorded.args, QStringList());
   QCOMPARE(unrecorded.opts, (Opts{{"all", "true"}, {"n", "200"}}));
   QCOMPARE(unrecorded.record, false);
+  QCOMPARE(unrecorded.proto, mothProtocol);  // this build's, or the service would refuse it
 
   core.call("find", {"100"}, {}, true, [&](const Reply &) { ++answers; });
   QTRY_COMPARE(answers, 2);
@@ -104,6 +105,8 @@ void TestCoreClient::sendsTheRequestAsGiven() {
   QCOMPARE(recorded.args, QStringList{"100"});
   QCOMPARE(recorded.actor, QString("user"));
   QCOMPARE(recorded.record, true);
+  QCOMPARE(recorded.proto, mothProtocol);
+  QCOMPARE(mothProtocol, 2);
 
   QTest::qWait(100);
   QCOMPARE(answers, 2);  // each `done` once
@@ -158,6 +161,7 @@ void TestCoreClient::feedComesBackAfterTheLastSeq() {
   core.startFeed();
   QTRY_COMPARE(fake.watchers(), 1);
   QCOMPARE(fake.watches().size(), 1);
+  QCOMPARE(fake.watchProtos(), QList<int>{mothProtocol});  // the feed carries it too
   fake.push({{"event", QJsonObject{{"seq", 12}, {"actor", "user"}, {"cmd", "find"}, {"ok", true}, {"summary", "x"}}}});
   QTRY_COMPARE(events.count(), 1);
 
@@ -168,6 +172,7 @@ void TestCoreClient::feedComesBackAfterTheLastSeq() {
   QTRY_COMPARE_WITH_TIMEOUT(fake.watchers(), 1, 2000);
   QCOMPARE(fake.watches().size(), 2);
   QCOMPARE(fake.watches().at(1), (Opts{{"after", "12"}}));
+  QCOMPARE(fake.watchProtos(), (QList<int>{mothProtocol, mothProtocol}));
   QTRY_COMPARE(up.count(), 2);
   QCOMPARE(up.at(1).at(0).toBool(), true);
 }

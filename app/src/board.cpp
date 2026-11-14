@@ -200,7 +200,7 @@ void Board::showStatus(const Reply &r) {
   const auto attached = attachedOf(o.value("attached"));
   const auto hunt = huntOf(o.value("hunt"));
   const QString counts = hunt ? r.text.section('\n', 1) : QString();
-  const bool stale = o.value("proto").toInt(-1) != 2, quiet = o.value("quiet").toBool();
+  const bool stale = o.value("proto").toInt(-1) != mothProtocol, quiet = o.value("quiet").toBool();
   if (stale_ && !stale) owesLine_ = true;  // the stale sentence goes: the line is the status again
   QString line = line_;
   if (o.contains("closed")) line = r.text;  // the game went: say so, whatever was said before

@@ -1129,15 +1129,19 @@ let answer_of r =
   let open Yojson.Safe.Util in
   if member "ok" r = `Bool true then Ok (member "result" r, to_string (member "text" r)) else Error (to_string (member "error" r))
 
-(* one request with these fields on its own connection; its reply *)
-let request d fields =
+(* the protocol field every client of this build sends *)
+let this_build = [ ("proto", `Int Daemon.protocol) ]
+
+(* one request with these fields (and [proto], this build's unless given) on its own connection;
+   its reply *)
+let request ?(proto = this_build) d fields =
   let s = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   Unix.connect s (Unix.ADDR_UNIX (sock d.home));
   let ic = Unix.in_channel_of_descr s in
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
-      send_line s (`Assoc (("id", `Int 1) :: fields));
+      send_line s (`Assoc ((("id", `Int 1) :: proto) @ fields));
       answer_of (Yojson.Safe.from_string (input_line ic)))
 
 let strings l = `List (List.map (fun a -> `String a) l)
@@ -1149,12 +1153,12 @@ let unrecorded ?(opts = []) d cmd args =
 (* a connection that sent watch, read a line at a time; a line must come within 5 seconds *)
 type watcher = { wfd : Unix.file_descr; wic : in_channel }
 
-let watcher ?after d =
+let watcher ?after ?(proto = this_build) d =
   let s = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   Unix.connect s (Unix.ADDR_UNIX (sock d.home));
   Unix.setsockopt_float s Unix.SO_RCVTIMEO 5.;
   let opts = match after with Some k -> [ ("after", `Int k) ] | None -> [] in
-  send_line s (`Assoc [ ("id", `Int 1); ("cmd", `String "watch"); ("opts", `Assoc opts) ]);
+  send_line s (`Assoc ((("id", `Int 1) :: proto) @ [ ("cmd", `String "watch"); ("opts", `Assoc opts) ]));
   { wfd = s; wic = Unix.in_channel_of_descr s }
 
 let next_line w =
@@ -1363,6 +1367,41 @@ let status_says_its_protocol () =
       check_int "Daemon.protocol" 2 Daemon.protocol;
       fk.alive <- false;
       check_json "just closed" (`Int 2) (proto (call d "status" [])))
+
+(* a request with no proto, or another number, is refused and nothing of it runs; stop and status
+   are served whatever a client sends *)
+let another_build_is_refused () =
+  let fk, sh = fake () in
+  with_daemon sh (fun d ->
+      let refused = "this moth is from another build than its background service. stop the service and it starts again by itself: moth stop" in
+      let fields ?(record = true) cmd args opts =
+        [ ("actor", `String "user"); ("cmd", `String cmd); ("args", strings args); ("opts", `Assoc (List.map (fun (k, v) -> (k, `String v)) opts)) ]
+        @ if record then [] else [ ("record", `Bool false) ]
+      in
+      List.iter
+        (fun (what, proto) ->
+          check_err (what ^ ": attach") refused (request ~proto d (fields "attach" [ "disco.exe" ] [ ("bottle", "uhmm") ]));
+          check_err (what ^ ": quiet on") refused (request ~proto d (fields "quiet" [ "on" ] []));
+          check_err (what ^ ": an unrecorded read") refused (request ~proto d (fields ~record:false "games" [] []));
+          check_err (what ^ ": a command that does not exist") refused (request ~proto d (fields "frobnicate" [] [])))
+        [ ("no proto", []); ("proto 1", [ ("proto", `Int 1) ]); ("the next proto", [ ("proto", `Int (Daemon.protocol + 1)) ]); ("proto as text", [ ("proto", `String "2") ]) ];
+      check_strs "no helper started" [] fk.started;
+      check_int "nothing attached" 0 fk.attaches;
+      check_bool "quiet not kept" false (Sys.file_exists (Filename.concat d.home "quiet"));
+      check_int "nothing recorded" 0 (List.length (stored d));
+      let w = watcher ~proto:[] d in
+      check_json "a watch with no proto" (`Assoc [ ("id", `Int 1); ("ok", `Bool false); ("error", `String refused) ]) (next_line w);
+      check_bool "is let go" true (let_go w);
+      unwatch w;
+      let w = watcher ~proto:[ ("proto", `Int 1) ] d in
+      check_json "a watch with another proto" (`Assoc [ ("id", `Int 1); ("ok", `Bool false); ("error", `String refused) ]) (next_line w);
+      unwatch w;
+      check_int "still nothing recorded" 0 (List.length (stored d));
+      check_str "status with no proto" "not attached" (text (request ~proto:[] d (fields "status" [] [])));
+      check_json "says this build's proto" (`Int Daemon.protocol) Yojson.Safe.Util.(member "proto" (json (request ~proto:[ ("proto", `Int 1) ] d (fields ~record:false "status" [] []))));
+      check_int "recorded as any status is" 1 (List.length (stored d));
+      check_str "stop with no proto" "stopped" (text (request ~proto:[] d (fields "stop" [] [])));
+      check_strs "the last event is the stop" [ "status"; "stop" ] (List.map cmd_of (stored d)))
 
 let client_watch_hooks () =
   let fk, sh = fake () in
@@ -2178,6 +2217,7 @@ let () =
           t "a closed game acts" a_closed_game_acts;
           t "Client.watch: started and idle" client_watch_hooks;
           t "status says its protocol" status_says_its_protocol;
+          t "a moth from another build is refused" another_build_is_refused;
           t "unrecorded results, target_gone: recorded" (a_read_that_loses_the_game "results" (answers_next "peek" "target_gone") game_closed);
           t "unrecorded results, helper_lost: recorded" (a_read_that_loses_the_game "results" (answers_next "peek" "helper_lost") lost_contact);
           t "unrecorded kept, target_gone: recorded" (a_read_that_loses_the_game ~keeping:true "kept" (answers_next "read" "target_gone") game_closed);

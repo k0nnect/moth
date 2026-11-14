@@ -23,7 +23,8 @@ class QLocalSocket;
 // busy line when it arrives and its event (the next seq, its first line as summary) just before
 // its reply, and a command that changes something is refused when sent with `record: false`.
 // `watch` is answered with the newest seq and the connection kept for the feed; `after` is noted
-// (see watches()) but nothing is replayed.
+// (see watches()) but nothing is replayed. Unlike the daemon it serves a request with no `proto`
+// or another one; it notes the one each request and each watch carried (seen(), watchProtos()).
 class FakeCore : public QObject {
 public:
   explicit FakeCore(const QString &home);
@@ -35,10 +36,17 @@ public:
   void push(const QJsonObject &feedLine);        // to every watcher
   void dropWatchers();
   void stop(); void start();                     // the service going away and coming back
-  struct Seen { QString actor, cmd; QStringList args; Opts opts; bool record; };
+  struct Seen {
+    QString actor, cmd;
+    QStringList args;
+    Opts opts;
+    bool record;
+    int proto = -1;  // the proto it carried; -1 when it sent none
+  };
   QList<Seen> seen() const;                      // every request but watch, in order
   int watchers() const;
   QList<Opts> watches() const;                   // the options of every watch request, in order
+  QList<int> watchProtos() const;                // the proto of every watch request, in order; -1: none
   // on (the default): a recorded request sends its own busy and event lines. off: only push() feeds,
   // for tests that set the order of an event and its reply themselves
   void feedRequests(bool on);
@@ -72,6 +80,7 @@ private:
   QList<QPointer<QLocalSocket>> watchers_;
   QList<Seen> seen_;
   QList<Opts> watches_;
+  QList<int> watchProtos_;
   bool feedRequests_ = true, asWritten_ = false;
   QString refuseWatch_;
   QString closing_;          // the game the next unrecorded status finds closed, or ""

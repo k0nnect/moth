@@ -52,7 +52,12 @@ void CoreClient::call(const QString &cmd, const QStringList &args, const Opts &o
                       std::function<void(const Reply &)> done) {
   QJsonObject o;
   for (const auto &[k, v] : opts) o.insert(k, v);
-  QJsonObject request{{"id", 1}, {"actor", "user"}, {"cmd", cmd}, {"args", QJsonArray::fromStringList(args)}, {"opts", o}};
+  QJsonObject request{{"id", 1},
+                      {"proto", mothProtocol},
+                      {"actor", "user"},
+                      {"cmd", cmd},
+                      {"args", QJsonArray::fromStringList(args)},
+                      {"opts", o}};
   if (!record) request.insert("record", false);
   auto x = std::make_shared<Exchange>(Exchange{lineOf(request), std::move(done), record});
   QTimer::singleShot(0, this, [this, x] { attempt(x); });
@@ -162,7 +167,7 @@ void CoreClient::watch() {
   connect(s, &QLocalSocket::connected, this, [this, s] {
     QJsonObject opts;
     if (lastSeq_ >= 0) opts.insert("after", QString::number(lastSeq_));
-    s->write(lineOf({{"id", 1}, {"cmd", "watch"}, {"args", QJsonArray()}, {"opts", opts}}));
+    s->write(lineOf({{"id", 1}, {"proto", mothProtocol}, {"cmd", "watch"}, {"args", QJsonArray()}, {"opts", opts}}));
   });
   connect(s, &QLocalSocket::readyRead, this, [this, s, answered] { heard(s, *answered); });
   auto lost = [this, s] { dropFeed(s); };

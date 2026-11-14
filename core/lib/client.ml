@@ -103,6 +103,7 @@ let call ?(autostart = true) ?(record = true) ?timeout ?(spawn_daemon = spawn_da
     `Assoc
       ([
         ("id", `Int 1);
+        ("proto", `Int Daemon.protocol);
         ("actor", `String actor);
         ("cmd", `String cmd);
         ("args", `List (List.map (fun a -> `String a) args));
@@ -123,7 +124,7 @@ let watch ~home ?after ?timeout ?started ?idle f =
   | Some fd ->
       Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) @@ fun () ->
       let opts = match after with Some k -> [ ("after", `String (string_of_int k)) ] | None -> [] in
-      let request = `Assoc [ ("id", `Int 1); ("cmd", `String "watch"); ("args", `List []); ("opts", `Assoc opts) ] in
+      let request = `Assoc [ ("id", `Int 1); ("proto", `Int Daemon.protocol); ("cmd", `String "watch"); ("args", `List []); ("opts", `Assoc opts) ] in
       let lost = Error (lost_contact home) in
       (* lines are read by hand, so that [idle] gets its say whenever half a second passes with
          nothing to read: [`Line l], [`Idle] or [`Eof] *)
