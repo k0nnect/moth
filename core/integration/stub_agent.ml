@@ -2,7 +2,10 @@
    moth agent starts claude: stub_agent --settings <file> --append-system-prompt <text> <prompt>.
    It writes its arguments to $MOTH_HOME/stub-args, one per line (a long argument as its first
    line only), runs the Stop hook's command from the settings file the way Claude Code does, and
-   prints "stub agent up" once that has started. Each time the command exits 2 it appends what the
+   prints "stub agent up" once that has started. The command runs with the settings file's "env"
+   entries and HOME and nothing else of this program's environment, as Claude Code applies the
+   settings' env; the entries are written to $MOTH_HOME/stub-env (KEY=VALUE lines), and each start of the
+   command adds a line to $MOTH_HOME/stub-runs. Each time the command exits 2 it appends what the
    command wrote to stderr to $MOTH_HOME/stub-notes and runs it again; on any other exit it stops
    running it. It ends when its stdin ends or it reads a line "bye", and kills the command it is
    running first (the command is in a group of its own, so moth wait goes with it). *)
@@ -22,10 +25,16 @@ let hook_command settings =
   let j = Yojson.Safe.from_file settings in
   j |> member "hooks" |> member "Stop" |> index 0 |> member "hooks" |> index 0 |> member "command" |> to_string
 
+(* the settings file's env entries as KEY=VALUE *)
+let settings_env settings =
+  let open Yojson.Safe.Util in
+  Yojson.Safe.from_file settings |> member "env" |> to_assoc |> List.map (fun (k, v) -> k ^ "=" ^ to_string v)
+
 let err_file () = file "stub-hook-err"
 
 (* runs the command in a group of its own, stdin from /dev/null, stdout dropped, stderr to a file *)
-let start command =
+let start ~env command =
+  append_file (file "stub-runs") "run\n";
   let err = Unix.openfile (err_file ()) [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
   match Unix.fork () with
   | 0 ->
@@ -35,7 +44,7 @@ let start command =
          Unix.dup2 null_in Unix.stdin;
          Unix.dup2 null_out Unix.stdout;
          Unix.dup2 err Unix.stderr;
-         Unix.execv "/bin/sh" [| "/bin/sh"; "-c"; command |]
+         Unix.execve "/bin/sh" [| "/bin/sh"; "-c"; command |] env
        with _ -> ());
       exit 127
   | pid ->
@@ -47,12 +56,13 @@ let kill_group pid = try Unix.kill (-pid) Sys.sigkill with Unix.Unix_error _ -> 
 let () =
   let args = List.tl (Array.to_list Sys.argv) in
   write_file (file "stub-args") (String.concat "" (List.map (fun a -> first_line a ^ "\n") args));
-  let command =
-    match settings_path args with
-    | None -> prerr_endline "stub_agent: no --settings"; exit 2
-    | Some p -> ( try hook_command p with e -> Printf.eprintf "stub_agent: %s: %s\n" p (Printexc.to_string e); exit 2)
+  let settings = match settings_path args with None -> prerr_endline "stub_agent: no --settings"; exit 2 | Some p -> p in
+  let command, vars =
+    try (hook_command settings, settings_env settings) with e -> Printf.eprintf "stub_agent: %s: %s\n" settings (Printexc.to_string e); exit 2
   in
-  let running = ref (Some (start command)) in
+  write_file (file "stub-env") (String.concat "" (List.map (fun v -> v ^ "\n") vars));
+  let env = Array.of_list (("HOME=" ^ Option.value (Sys.getenv_opt "HOME") ~default:"/") :: vars) in
+  let running = ref (Some (start ~env command)) in
   print_endline "stub agent up";
   let finish () =
     (match !running with Some pid -> kill_group pid; ignore (try Unix.waitpid [] pid with Unix.Unix_error _ -> (0, Unix.WEXITED 0)) | None -> ());
@@ -66,7 +76,7 @@ let () =
         | 0, _ -> ()
         | _, Unix.WEXITED 2 ->
             append_file (file "stub-notes") (In_channel.with_open_bin (err_file ()) In_channel.input_all ^ "\n");
-            running := Some (start command)
+            running := Some (start ~env command)
         | _ -> running := None
         | exception Unix.Unix_error _ -> running := None)
   in

@@ -26,6 +26,7 @@
 //           from its stdin, and ends (closing the window) at the first that ends it, or at the end
 //           of stdin:
 //             quiet  ticks the `quiet` box, waits for the board to say so, prints `quiet`
+//             loud   unticks it, waits for the board to say so, prints `loud`
 //             bye    types `bye` and Return into the terminal, then does what `shell` does
 //             shell  waits for a shell prompt (a row ending in `$`), types `moth status` and Return,
 //                    waits for `attached to` on the screen, prints `shell`, and ends
@@ -352,6 +353,14 @@ public:
     print("quiet");
   }
 
+  void untickQuiet() {
+    waitFor("the quiet box to be usable", 30, [this] { return quietBox_->isEnabled(); });
+    quietBox_->click();
+    waitFor("the board to say quiet is off", 30, [this] { return !board_.quiet() && !board_.working(); });
+    if (quietBox_->isChecked()) fail("the quiet box is still ticked");
+    print("loud");
+  }
+
   void shell() {
     waitFor("a shell prompt on the terminal. the screen: " + screenText(), 30, [this] { return promptShown(); });
     type("moth status\n");
@@ -364,6 +373,7 @@ public:
     for (;;) {
       const QString c = command();
       if (c == "quiet") tickQuiet();
+      else if (c == "loud") untickQuiet();
       else if (c == "bye") {
         type("bye\n");
         shell();
@@ -437,7 +447,9 @@ int main(int argc, char **argv) {
   if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
 
   QApplication app(argc, argv);
-  const QString mode = argv[1], bottle = argv[2], exe = argv[3], number = argv[4], address = argv[5], value = term ? QString() : argv[6];
+  const QString mode = argv[1], bottle = argv[2], exe = argv[3], number = argv[4], fifth = argv[5], value = term ? QString() : argv[6];
+  const QString address = term ? QString() : fifth;
+  const QString waitText = term ? fifth : QString();
   if (!term && addressOf(address) == 0) {
     std::fprintf(stderr, "%s is not an address like 0x7ffe1234\n", argv[5]);
     return 2;
@@ -450,7 +462,7 @@ int main(int argc, char **argv) {
   Drive drive(window, board);
   if (term) {
     drive.useTerminal(window);
-    drive.terminalShows(address, 60);  // the text to wait for is the fifth argument
+    drive.terminalShows(waitText, 60);
     print("terminal");
     drive.attach(bottle, exe);
     drive.search(number);
