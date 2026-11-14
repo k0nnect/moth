@@ -117,6 +117,35 @@ bool processes(const QString &pattern) {  // is there a process whose command li
   return p.exitCode() == 0;
 }
 
+bool stopped(const QString &text) {  // is there a stopped process whose command line has this
+  QProcess p;
+  p.start("/bin/ps", {"-axo", "stat=,args="});
+  p.waitForFinished();
+  for (const QString &line : QString::fromUtf8(p.readAllStandardOutput()).split('\n'))
+    if (line.trimmed().startsWith('T') && line.contains(text)) return true;
+  return false;
+}
+
+// a row of the screen that is `text` and nothing else
+bool showsRow(const TerminalView *v, const QString &text, int ms = 5000) {
+  return QTest::qWaitFor(
+      [&] {
+        for (int r = 0; r < v->screen()->rows(); ++r)
+          if (v->screen()->text(r).trimmed() == text) return true;
+        return false;
+      },
+      ms);
+}
+
+// zsh as the user's shell, reading none of the owner's start-up files: HOME and ZDOTDIR are the
+// test's own folder, whose .zshrc sets a prompt that ends in $
+void useZsh(Shell &shell) {
+  shell.env.set("SHELL", "/bin/zsh");
+  shell.env.set("ZDOTDIR", shell.home.path().toUtf8());
+  QFile rc(shell.home.path() + "/.zshrc");
+  if (rc.open(QIODevice::WriteOnly)) rc.write("PS1='$ '\n");
+}
+
 }  // namespace
 
 class TestMainWindow : public QObject {
@@ -131,6 +160,7 @@ private slots:
   void anEnvPutsBackWhatWasSetTwice();
   void theTerminalPathsAndEnvironment();
   void theCommandAfterItCannotEatTheShellThatFollows();
+  void aCommandThatStopsItselfIsResumedUnderShAndZsh();
   void hidingAndShowingTheWindowDoesNotStartTheTerminalAgain();
   void aTitleWithLineSeparatorsKeepsTheStripOneLine();
   void whenTheShellEndedCommandCCopiesTheLastScreen();
@@ -321,9 +351,11 @@ void TestMainWindow::theTerminalPathsAndEnvironment() {
   QVERIFY(terminalEnv("/tmp/h", "rel/moth").contains("MOTH_BIN=" + QDir::currentPath() + "/rel/moth"));
 }
 
-// R20: whatever the command ends with, a shell follows
+// R20: whatever the command ends with, a shell follows, and nothing is said of jobs when nothing
+// stopped (a command that ends above 128 makes fg look once, quietly)
 void TestMainWindow::theCommandAfterItCannotEatTheShellThatFollows() {
-  for (const QString &command : {QString("echo one &"), QString("echo two;"), QString("echo three # a comment")}) {
+  for (const QString &command : {QString("echo one &"), QString("echo two;"), QString("echo three # a comment"),
+                                 QString("/bin/sh -c 'exit 200'")}) {
     Shell shell(command);
     Rig rig;
     QVERIFY(rig.ready());
@@ -334,7 +366,55 @@ void TestMainWindow::theCommandAfterItCannotEatTheShellThatFollows() {
     QVERIFY(t);
     QVERIFY2(prompted(t), qPrintable(command + "\n" + screenText(*t)));
     QVERIFY2(!screenText(*t).contains("syntax error"), qPrintable(screenText(*t)));
+    QVERIFY2(!screenText(*t).contains("job") && !screenText(*t).contains("fg"), qPrintable(screenText(*t)));
     QVERIFY(t->running());
+  }
+}
+
+// I5: Control+Z in the agent bounces back. A command that stops itself is resumed by itself (nothing
+// typed), the shell follows once it ends, and nothing stopped is left; under sh and under zsh.
+// Under zsh, a command that ends above 128 without stopping says nothing of jobs either
+void TestMainWindow::aCommandThatStopsItselfIsResumedUnderShAndZsh() {
+  for (const bool zsh : {false, true}) {
+    const QString which = zsh ? "zsh" : "sh";
+    QTemporaryDir bin("/tmp/moth-bin-XXXXXX");
+    const QString standIn = bin.path() + "/stops";
+    QFile f(standIn);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write("#!/bin/sh\necho up\nkill -TSTP $$\necho back\nread x\necho \"got $x\"\n");
+    f.close();
+    f.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    {
+      Shell shell("'" + standIn + "'");
+      if (zsh) useZsh(shell);
+      Rig rig;
+      QVERIFY(rig.ready());
+      MainWindow w(&rig.board);
+      w.setPolling(false);
+      showOffscreen(w);
+      TerminalView *t = w.terminal();
+      QVERIFY(t);
+      QVERIFY2(showsRow(t, "up"), qPrintable(which + "\n" + screenText(*t)));
+      QVERIFY2(showsRow(t, "back"), qPrintable(which + "\n" + screenText(*t)));  // nothing typed
+      QVERIFY2(!stopped(standIn), qPrintable(which));
+      type(t, "done");
+      QVERIFY2(showsRow(t, "got done"), qPrintable(which + "\n" + screenText(*t)));
+      QVERIFY2(prompted(t), qPrintable(which + "\n" + screenText(*t)));
+      QVERIFY2(QTest::qWaitFor([&] { return !processes(standIn); }, 2000), qPrintable(which));  // not stopped, not there at all
+      QVERIFY(t->running());
+    }
+    if (zsh) {
+      Shell shell("/bin/sh -c 'exit 200'");
+      useZsh(shell);
+      Rig rig;
+      QVERIFY(rig.ready());
+      MainWindow w(&rig.board);
+      w.setPolling(false);
+      showOffscreen(w);
+      TerminalView *t = w.terminal();
+      QVERIFY2(prompted(t), qPrintable(screenText(*t)));
+      QVERIFY2(!screenText(*t).contains("job") && !screenText(*t).contains("fg"), qPrintable(screenText(*t)));
+    }
   }
 }
 

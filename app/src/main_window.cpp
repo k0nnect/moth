@@ -50,6 +50,16 @@ Qt::KeyboardModifier commandModifier() {
 #endif
 }
 
+// Between the command and the shell that follows: a command that stopped (Claude Code stops itself
+// on Control+Z and says to run fg) is resumed until it is really gone, so it bounces back instead
+// of being stranded by the exec. A status above 128 is a stop (or a death by signal); fg resumes
+// the job and answers its next status, so the calls go on while it stops again and end once it
+// ends or fg finds no job, which fg says to /dev/null. A function that calls itself, not a loop:
+// bash, as /bin/sh, leaves a loop as soon as a job it resumed there stops again. A command that
+// ended by itself (128 or less) runs none of it.
+const char *const resumeStopped =
+    "[ $? -gt 128 ] && { moth_resume() { fg >/dev/null 2>&1; [ $? -gt 128 ] && moth_resume; }; moth_resume; }";
+
 }  // namespace
 
 MainWindow::MainWindow(Board *board) : board_(board) {
@@ -147,7 +157,7 @@ void MainWindow::startTerminal() {
   if (!terminal_ || terminal_->running()) return;
   const QString shell = userShell(), command = terminalCommand(mothBin());
   QStringList args{"-l", "-i"};
-  if (!command.isEmpty()) args << "-c" << command + "\nexec \"$SHELL\" -l -i";
+  if (!command.isEmpty()) args << "-c" << command + "\n" + resumeStopped + "\nexec \"$SHELL\" -l -i";
   QString home = qEnvironmentVariable("HOME");
   if (home.isEmpty()) home = "/";
   started_ = true;
