@@ -10,6 +10,7 @@ let home () =
 
 let not_running = "moth isn't running"
 let core_log home = Filename.concat home "core.log"
+let lost_contact home = sprintf "lost contact with moth's background service. see %s" (core_log home)
 
 let connect path =
   let s = Unix.socket ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
@@ -68,7 +69,7 @@ let converse ~home fd request k =
       with
       | reply -> k ic (parse_reply reply)
       | exception (End_of_file | Sys_error _ | Unix.Unix_error _) ->
-          Error (sprintf "lost contact with moth's background service. see %s" (core_log home)))
+          Error (lost_contact home))
 
 let exchange ~home fd request = converse ~home fd request (fun _ reply -> reply)
 
@@ -88,7 +89,7 @@ let start_and_connect ~spawn_daemon ~home path =
   in
   match Daemon.make_home home with exception Failure m -> Error m | () -> retry false
 
-let call ?(autostart = true) ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~args ~opts () =
+let call ?(autostart = true) ?(record = true) ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~args ~opts () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let* path = Daemon.socket_path ~home in
   let* fd =
@@ -99,13 +100,15 @@ let call ?(autostart = true) ?(spawn_daemon = spawn_daemon) ~home ~actor ~cmd ~a
   in
   let request =
     `Assoc
-      [
+      ([
         ("id", `Int 1);
         ("actor", `String actor);
         ("cmd", `String cmd);
         ("args", `List (List.map (fun a -> `String a) args));
         ("opts", `Assoc (List.map (fun (k, v) -> (k, `String v)) opts));
       ]
+      @ if record then [] else [ ("record", `Bool false) ]
+    )
   in
   exchange ~home fd request
 
@@ -120,7 +123,7 @@ let watch ~home ?after ?started ?idle f =
       Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) @@ fun () ->
       let opts = match after with Some k -> [ ("after", `String (string_of_int k)) ] | None -> [] in
       let request = `Assoc [ ("id", `Int 1); ("cmd", `String "watch"); ("args", `List []); ("opts", `Assoc opts) ] in
-      let lost = Error (sprintf "lost contact with moth's background service. see %s" (core_log home)) in
+      let lost = Error (lost_contact home) in
       (* lines are read by hand, so that [idle] gets its say whenever half a second passes with
          nothing to read: [`Line l], [`Idle] or [`Eof] *)
       let pending = Buffer.create 4096 and chunk = Bytes.create 4096 in
@@ -186,7 +189,7 @@ let parse_args argv =
         Ok { cmd = "launch"; args = List.hd words :: game_args; opts; json }
     | "--json" :: rest -> go words opts true rest
     | "--all" :: rest -> go words (set "all" "true" opts) json rest
-    | (("--bottle" | "-n" | "--from" | "--near" | "--after" | "--at" | "--kind") as o) :: rest -> (
+    | (("--bottle" | "-n" | "--from" | "--near" | "--after" | "--at" | "--kind" | "--session") as o) :: rest -> (
         match rest with
         | v :: rest -> go words (set (if o = "-n" then "n" else String.sub o 2 (String.length o - 2)) v opts) json rest
         | [] -> Error (o ^ " needs a value"))

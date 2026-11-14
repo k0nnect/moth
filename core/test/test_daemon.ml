@@ -162,7 +162,7 @@ let before_attach () =
       check_err "before attach" not_attached (call d "find" [ "100" ]);
       List.iter (fun (cmd, args) -> check_err cmd not_attached (call d cmd args)) [ ("next", [ "85" ]); ("results", []); ("set", [ "1"; "5" ]); ("undo", []) ];
       check_str "status" "not attached" (text (call d "status" []));
-      check_json "status json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("proto", `Int 2) ]) (json (call d "status" []));
+      check_json "status json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("proto", `Int 2); ("quiet", `Bool false) ]) (json (call d "status" []));
       check_str "detach" "not attached" (text (call d "detach" [])))
 
 let attaching () =
@@ -173,7 +173,7 @@ let attaching () =
       check_strs "one helper, in the bottle" [ "uhmm" ] fk.started;
       check_str "status" attached (text (call d "status" []));
       check_json "status json"
-        (`Assoc [ ("attached", `Assoc [ ("pid", `Int 208); ("name", `String "disco.exe"); ("bits", `Int 64); ("bottle", `String "uhmm") ]); ("hunt", `Null); ("proto", `Int 2) ])
+        (`Assoc [ ("attached", `Assoc [ ("pid", `Int 208); ("name", `String "disco.exe"); ("bits", `Int 64); ("bottle", `String "uhmm") ]); ("hunt", `Null); ("proto", `Int 2); ("quiet", `Bool false) ])
         (json (call d "status" []));
       check_err "not running" "nope.exe isn't running in uhmm. start the game first." (attach d ~what:"nope.exe");
       check_err "no such pid" "pid 999 isn't running in uhmm." (attach d ~what:"999");
@@ -392,6 +392,7 @@ let events () =
       check_bool "ts" true (index 0 ev |> member "ts" |> to_number > 1e9);
       check_bool "error logged" false (index 1 ev |> member "ok" |> to_bool);
       check_str "error summary" "find needs a number" (index 1 ev |> member "summary" |> to_string);
+      check_bool "a failed acting command acted" true (index 1 ev |> member "act" |> to_bool);
       check_int "earlier one" 3 (index 1 ev |> member "seq" |> to_int);
       let all = json (call d "log" []) in
       check_int "the log call itself is logged" 5 (List.length (to_list all));
@@ -871,7 +872,7 @@ let closed_game () =
       fk.alive <- false;
       let r = call d "status" [] in
       check_str "closed" "not attached. disco.exe closed." (text r);
-      check_json "closed json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String "disco.exe"); ("proto", `Int 2) ]) (json r);
+      check_json "closed json" (`Assoc [ ("attached", `Null); ("hunt", `Null); ("closed", `String "disco.exe"); ("proto", `Int 2); ("quiet", `Bool false) ]) (json r);
       check_int "the helper let go of the game" 1 fk.detaches;
       check_err "kept" not_attached (call d "kept" []);
       check_err "results" not_attached (call d "results" []);
@@ -1329,7 +1330,7 @@ let events_say_whether_they_acted () =
         [ ("games", false); ("bottles", false); ("status", false); ("find", true); ("results", false); ("keep", true); ("kept", false);
           ("set", true); ("undo", true); ("log", false); ("forget", true); ("status", false); ("detach", true) ]
       in
-      check_bool "which acted" true (!acts = want);
+      Alcotest.(check (list (pair string bool))) "which acted" want !acts;
       let attach_ev = List.find (fun ev -> cmd_of ev = "attach") (stored d) in
       check_bool "attach acted" true (act_of attach_ev))
 
@@ -1426,6 +1427,7 @@ let a_read_that_loses_the_game ?(keeping = false) cmd lose answer () =
       check_str "as the read" cmd (member "cmd" ev |> to_string);
       check_int "with the next seq" (before + 1) (member "seq" ev |> to_int);
       check_str "saying why" answer (member "summary" ev |> to_string);
+      check_bool "and it acted" true (member "act" ev |> to_bool);
       check_json "the watcher hears it, with no busy line before it" (event ev) (next_line w);
       check_str "status, unrecorded" "not attached" (text (unrecorded d "status" []));
       check_int "which is not recorded" (before + 1) (List.length (stored d));
@@ -1787,6 +1789,188 @@ let home () =
   with_env "MOTH_HOME" "" (fun () ->
       with_env "HOME" "/Users/u" (fun () -> check_str "default" "/Users/u/Library/Application Support/moth" (Client.home ())))
 
+(* ---- quiet, and moth wait ---- *)
+
+let quiet_is_kept () =
+  let _, sh = fake () in
+  let quiet d = Yojson.Safe.Util.(json (call d "status" []) |> member "quiet") in
+  let d = start sh in
+  Fun.protect
+    ~finally:(fun () -> rm d.home)
+    (fun () ->
+      check_json "off to begin with" (`Bool false) (quiet d);
+      check_str "no argument" "quiet is off" (text (call d "quiet" []));
+      check_str "on" "quiet: the agent is not told what you do. it can still look: moth log" (text (call d "quiet" [ "on" ]));
+      check_str "no argument, on" "quiet is on" (text (call d "quiet" []));
+      check_json "status says so" (`Bool true) (quiet d);
+      check_err "neither" "quiet takes on or off" (call d "quiet" [ "maybe" ]);
+      check_err "two words" "quiet takes on or off" (call d "quiet" [ "on"; "off" ]);
+      check_json "still on" (`Bool true) (quiet d);
+      let refused = List.filter (fun ev -> cmd_of ev = "quiet" && not Yojson.Safe.Util.(member "ok" ev |> to_bool)) (stored d) in
+      check_int "both refusals are events" 2 (List.length refused);
+      check_bool "that acted" true (List.for_all act_of refused);
+      ignore (call d "stop" []);
+      Thread.join d.thread;
+      check_bool "the file says on" true (Sys.file_exists (Filename.concat d.home "quiet"));
+      let d = start ~home:d.home sh in
+      check_json "a new daemon on the same home is still quiet" (`Bool true) (quiet d);
+      check_str "off" "the agent is told what you do again" (text (call d "quiet" [ "off" ]));
+      check_bool "the file is gone" false (Sys.file_exists (Filename.concat d.home "quiet"));
+      check_json "off" (`Bool false) (quiet d);
+      ignore (call d "stop" []);
+      Thread.join d.thread)
+
+(* the real moth program, run as the agent's hook runs it: next to the test in _build *)
+let moth_exe = lazy (Filename.concat (Sys.getcwd ()) "../bin/main.exe")
+
+type waiter = { pid : int; err : string; mutable code : int option }
+
+let spawned = ref []
+let spawn_count = ref 0
+
+(* [moth wait --session dir] against [home], stdin and stdout on /dev/null, stderr in a file *)
+let spawn_wait ~home ~session =
+  incr spawn_count;
+  let err = Printf.sprintf "/tmp/moth-wait-%d-%d.err" (Unix.getpid ()) !spawn_count in
+  let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
+  let errfd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
+  let exe = Lazy.force moth_exe in
+  let env = Array.append [| "MOTH_HOME=" ^ home |] (Array.of_list (List.filter (fun e -> not (String.starts_with ~prefix:"MOTH_HOME=" e)) (Array.to_list (Unix.environment ())))) in
+  let pid = Unix.create_process_env exe [| exe; "wait"; "--session"; session |] env null null errfd in
+  Unix.close null;
+  Unix.close errfd;
+  let w = { pid; err; code = None } in
+  spawned := w :: !spawned;
+  w
+
+let reap w =
+  if w.code = None then
+    (match Unix.waitpid [ Unix.WNOHANG ] w.pid with 0, _ -> () | _, Unix.WEXITED n -> w.code <- Some n | _, _ -> w.code <- Some (-1));
+  w.code
+
+(* its exit code, waiting up to [within] seconds; None when it is still running *)
+let exit_within w within =
+  let deadline = Unix.gettimeofday () +. within in
+  let rec go () =
+    match reap w with
+    | Some n -> Some n
+    | None when Unix.gettimeofday () >= deadline -> None
+    | None ->
+        Thread.delay 0.05;
+        go ()
+  in
+  go ()
+
+let read_all path = try In_channel.with_open_bin path In_channel.input_all with Sys_error _ -> ""
+
+(* whatever a test started is gone when it ends, whatever happened *)
+let with_waiters f =
+  Fun.protect f ~finally:(fun () ->
+      List.iter
+        (fun w ->
+          (match reap w with
+          | None -> (
+              (try Unix.kill w.pid Sys.sigkill with Unix.Unix_error _ -> ());
+              try ignore (Unix.waitpid [] w.pid) with Unix.Unix_error _ -> ())
+          | Some _ -> ());
+          try Sys.remove w.err with Sys_error _ -> ())
+        !spawned;
+      spawned := [])
+
+let spaced_home () = fresh_home () ^ " with a space"
+
+(* [home]/agent/<this test's pid>: a session that is alive *)
+let session_dir ?(pid = Unix.getpid ()) home =
+  let mk d = try Unix.mkdir d 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> () in
+  mk home;
+  mk (Filename.concat home "agent");
+  let dir = Filename.concat (Filename.concat home "agent") (string_of_int pid) in
+  mk dir;
+  dir
+
+let newest_seq d = Yojson.Safe.Util.(member "seq" (List.nth (stored d) (List.length (stored d) - 1)) |> to_int)
+
+let wait_tells_the_agent () =
+  let fk, sh = fake () in
+  with_waiters (fun () ->
+      with_daemon ~home:(spaced_home ()) sh (fun d ->
+          ignore (text (attach d));
+          let dir = session_dir d.home in
+          let w = spawn_wait ~home:d.home ~session:dir in
+          Thread.delay 1.;
+          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+          ignore (text (call d "find" [ "3" ]));
+          check_bool "exits 2 within 4 seconds" true (exit_within w 4. = Some 2);
+          let err = read_all w.err in
+          check_bool "tells what the person did" true (String.starts_with ~prefix:"[moth] the person did this in moth:\n- find 3: " err);
+          check_str "the cursor is that event's seq" (string_of_int (newest_seq d)) (String.trim (read_all (Filename.concat dir "cursor")));
+          (* the next waiter starts after it, and has nothing to say *)
+          let again = spawn_wait ~home:d.home ~session:dir in
+          check_bool "still waiting after 3 seconds" true (exit_within again 3. = None)))
+
+let two_waiters () =
+  let fk, sh = fake () in
+  with_waiters (fun () ->
+      with_daemon ~home:(spaced_home ()) sh (fun d ->
+          ignore (text (attach d));
+          let dir = session_dir d.home in
+          let first = spawn_wait ~home:d.home ~session:dir in
+          Thread.delay 1.;
+          let second = spawn_wait ~home:d.home ~session:dir in
+          Thread.delay 1.5;
+          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+          ignore (text (call d "find" [ "3" ]));
+          let a = exit_within first 4. and b = exit_within second 4. in
+          check_bool "the newer one tells" true (b = Some 2);
+          check_bool "the older one leaves quietly" true (a = Some 0);
+          check_str "and says nothing" "" (read_all first.err)))
+
+let a_dead_session () =
+  let home = spaced_home () in
+  with_waiters (fun () ->
+      Fun.protect
+        ~finally:(fun () -> rm home)
+        (fun () ->
+          (* a pid that has been and gone *)
+          let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
+          let gone = Unix.create_process "true" [| "true" |] null null null in
+          ignore (Unix.waitpid [] gone);
+          Unix.close null;
+          let dir = session_dir ~pid:gone home in
+          let w = spawn_wait ~home ~session:dir in
+          check_bool "exits 0 within 2 seconds" true (exit_within w 2. = Some 0);
+          check_str "and says nothing" "" (read_all w.err);
+          check_bool "and wrote nothing there" false (Sys.file_exists (Filename.concat dir "waiter"))))
+
+let wait_with_no_daemon () =
+  let fk, sh = fake () in
+  let home = spaced_home () in
+  with_waiters (fun () ->
+      let dir = session_dir home in
+      let w = spawn_wait ~home ~session:dir in
+      check_bool "still waiting after 3 seconds" true (exit_within w 3. = None);
+      check_bool "and started no daemon" false (Sys.file_exists (Filename.concat home "core.sock"));
+      with_daemon ~home sh (fun d ->
+          ignore (text (attach d));
+          Thread.delay 2.;
+          Fake_helper.queue_scan fk.script [ gi "i32" 3 ];
+          ignore (text (call d "find" [ "3" ]));
+          check_bool "exits 2 once the person acts" true (exit_within w 4. = Some 2);
+          check_bool "with the note" true (String.starts_with ~prefix:"[moth] the person did this in moth:" (read_all w.err))))
+
+let wait_needs_a_session () =
+  with_waiters (fun () ->
+      let exe = Lazy.force moth_exe in
+      let err = Printf.sprintf "/tmp/moth-wait-%d-usage.err" (Unix.getpid ()) in
+      let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 and errfd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
+      let pid = Unix.create_process exe [| exe; "wait" |] null null errfd in
+      Unix.close null;
+      Unix.close errfd;
+      let w = { pid; err; code = None } in
+      spawned := w :: !spawned;
+      check_bool "exits 2" true (exit_within w 2. = Some 2);
+      check_str "saying how" "wait is run by the agent's hook: moth wait --session <dir>\n" (read_all err))
+
 let () =
   let t n f = Alcotest.test_case n `Quick f in
   Alcotest.run "daemon"
@@ -1868,6 +2052,7 @@ let () =
           t "a watcher that never reads" a_watcher_that_never_reads;
           t "Client.watch with no daemon" watch_with_no_daemon;
           t "watch until stop" watching_until_stop;
+          t "quiet is kept" quiet_is_kept;
         ] );
       ( "row writes",
         [
@@ -1875,6 +2060,14 @@ let () =
           t "--at finds its row afresh" a_row_found_afresh;
           t "--kind refuses a row of another kind" a_row_of_another_kind;
           t "--kind and --all go with --at" kind_and_all_go_with_at;
+        ] );
+      ( "wait",
+        [
+          t "moth wait tells the agent, in a home with a space" wait_tells_the_agent;
+          t "two waiters on one session: the newer tells" two_waiters;
+          t "a session that is gone" a_dead_session;
+          t "no daemon, then a daemon" wait_with_no_daemon;
+          t "no session" wait_needs_a_session;
         ] );
       ("client", [ t "parse args" parse_args; t "parse args: results options" parse_results_args; t "home" home ]);
     ]

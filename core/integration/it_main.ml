@@ -535,7 +535,9 @@ let pages () =
       let shared = List.filter (fun r -> List.exists (fun q -> q.addr = r.addr) first.rows) second.rows in
       check (shared = []) "results --from 6 -n 5 repeats addresses of the first page: %s" (show_rows shared);
       let said = to_string (member "message" (moth [ "set"; "#7"; "4" ])) in
-      check (String.starts_with ~prefix:"set #7 (0x" said && contains said " to 4 ") "set #7 4 said %S" said;
+      let row7 = List.find (fun r -> r.n = 7) second.rows in
+      let want = Printf.sprintf "set #7 (0x%Lx) to 4 (was " row7.addr in
+      check (String.starts_with ~prefix:want said) "set #7 4 said %S, not %S..." said want;
       (* row 7 is wherever the fewest-first order puts it, often a float of wine's own: put it back *)
       ignore (moth [ "undo" ]))
 

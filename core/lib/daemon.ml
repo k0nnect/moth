@@ -82,6 +82,7 @@ type state = {
   mutable wrote : Yojson.Safe.t option; (* the write this request made, for its event *)
   mutable held : Yojson.Safe.t option; (* whether this request's set held, for its event *)
   mutable closed : bool; (* this request's status found the game closed *)
+  mutable quiet : bool; (* the agent is not told what the person does; kept in [home]/quiet *)
   mutable owned : (Unix.file_descr * Unix.file_descr) option; (* listener and lock, while serving *)
   mutable watchers : watcher list; (* oldest first *)
 }
@@ -321,7 +322,7 @@ let protocol = 2
    hunt, kept values and writes with it; the helper stays, and lets go of the game's candidates
    now rather than at the next attach (if it can't, the answer is the same). *)
 let status st =
-  let with_proto = function Ok (`Assoc f, t) -> Ok (`Assoc (f @ [ ("proto", `Int protocol) ]), t) | r -> r in
+  let with_proto = function Ok (`Assoc f, t) -> Ok (`Assoc (f @ [ ("proto", `Int protocol); ("quiet", `Bool st.quiet) ]), t) | r -> r in
   with_proto @@
   match (st.target, st.conn) with
   | Some t, Some (_, h) -> (
@@ -527,6 +528,26 @@ let log st opts =
 
 (* ---- commands ---- *)
 
+(* quiet on|off, kept in [home]/quiet (present means on) so a restart keeps it; no argument says
+   which it is *)
+let quiet st args =
+  let file = in_home st.home "quiet" in
+  let set on =
+    try
+      if on then close_out (open_out_gen [ Open_wronly; Open_creat; Open_trunc ] 0o600 file) else if Sys.file_exists file then Sys.remove file;
+      st.quiet <- on;
+      Ok ()
+    with Sys_error m -> Error (sprintf "couldn't keep quiet in %s: %s" file m)
+  in
+  match args with
+  | [ "on" ] ->
+      let* () = set true in
+      Ok (said "quiet: the agent is not told what you do. it can still look: moth log")
+  | [ "off" ] ->
+      let* () = set false in
+      Ok (said "the agent is told what you do again")
+  | _ -> Ok (said (if st.quiet then "quiet is on" else "quiet is off"))
+
 (* a result's number, #n or n, from 1 *)
 let row_number s =
   let s = if String.starts_with ~prefix:"#" s then String.sub s 1 (String.length s - 1) else s in
@@ -597,6 +618,7 @@ let check_usage ~cmd ~args ~opts =
   | "watch" ->
       let* () = none in
       need (whole "after" (fun _ -> true)) "watch --after needs an event number"
+  | "quiet" -> need (match args with [] | [ ("on" | "off") ] -> true | _ -> false) "quiet takes on or off"
   | _ -> Error (sprintf "unknown command: %s. run: moth help" cmd)
 
 let relations = [ ("down", Session.Down); ("up", Session.Up); ("same", Session.Same); ("changed", Session.Changed) ]
@@ -659,6 +681,7 @@ let handle st ~record ~cmd ~args ~opts =
   | "games", _ -> Ok (games st)
   | "detach", _ -> Ok (said (detach st))
   | "log", _ -> Ok (log st opts)
+  | "quiet", _ -> quiet st args
   | "stop", _ ->
       shutdown st;
       Ok (said "stopped")
@@ -843,6 +866,7 @@ let run ~home ~start_helper ~launch =
       wrote = None;
       held = None;
       closed = false;
+      quiet = Sys.file_exists (in_home home "quiet");
       owned = Some (listener, lock);
       watchers = [];
     }

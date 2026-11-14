@@ -1,6 +1,7 @@
 (tests
- (names test_sanity test_value test_interp test_wire test_session test_render test_crossover test_anticheat test_daemon test_client)
+ (names test_sanity test_value test_interp test_wire test_session test_render test_crossover test_anticheat test_daemon test_client test_wait)
  (modules :standard \ test_helper_conn)
+ (deps ../bin/main.exe)
  (libraries moth_core yojson alcotest unix threads.posix))
 
 (test
