@@ -105,6 +105,62 @@ private slots:
     QCOMPARE(t.s.scrollback(), TermScreen::kScrollbackLimit);
     QCOMPARE(t.s.text(-1), QString("n19977"));  // 20000 lines + the empty one under the last: 24 rows
   }
+  void linesDroppedFromTheScrollbackAreCounted() {
+    Scr t;
+    QByteArray all;
+    for (int i = 1; i <= 20000; ++i) all += "n" + QByteArray::number(i) + "\r\n";
+    t.feed(all);
+    // 19977 lines went in (see scrollbackIsCapped); all but the last 10,000 went out again
+    QCOMPARE(t.s.linesDropped(), qint64(9977));
+    t.feed("\x1b[3J");  // cleared: every line goes
+    QCOMPARE(t.s.scrollback(), 0);
+    QCOMPARE(t.s.linesDropped(), qint64(19977));
+    t.s.resize(10, 80);  // lines pushed by a resize are not dropped
+    QCOMPARE(t.s.scrollback(), 14);
+    QCOMPARE(t.s.linesDropped(), qint64(19977));
+  }
+  void aRowThatWrappedIsKnown() {
+    Scr t(24, 40);
+    t.feed(QByteArray(100, 'x') + "\r\n" + QByteArray(40, 'y') + "\r\n" + QByteArray(39, 'a') +
+           QString::fromUtf8("日z").toUtf8());
+    QVERIFY(t.s.wrapped(0));
+    QVERIFY(t.s.wrapped(1));
+    QVERIFY(!t.s.wrapped(2));  // the last 20 x
+    QVERIFY(!t.s.wrapped(3));  // filled to the last column, and then a new line: not a wrap
+    QVERIFY(t.s.wrapped(4));   // 日 does not fit in the last column and goes on to the next row
+    QCOMPARE(t.s.cell(4, 39).text, QString());
+    QVERIFY(!t.s.wrapped(5));
+    QVERIFY(!t.s.wrapped(23));
+    QVERIFY(!t.s.wrapped(24));
+    QVERIFY(!t.s.wrapped(-1));
+  }
+  void aLineThatWrappedIsKnownInTheScrollback() {
+    Scr t(5, 10);
+    // as output scrolls, a line at a time
+    t.feed("aaaaaaaaaabbb\r\ncccccccccc\r\nd\r\n\r\n\r\n\r\n\r\n\r\n");
+    QCOMPARE(t.s.scrollback(), 5);
+    QCOMPARE(t.s.text(-5), QString("aaaaaaaaaa"));
+    QVERIFY(t.s.wrapped(-5));
+    QCOMPARE(t.s.text(-4), QString("bbb"));
+    QVERIFY(!t.s.wrapped(-4));
+    QCOMPARE(t.s.text(-3), QString("cccccccccc"));
+    QVERIFY(!t.s.wrapped(-3));
+    QVERIFY(!t.s.wrapped(-2));
+    QVERIFY(!t.s.wrapped(-6));
+  }
+  void linesPushedByAResizeKeepWhetherTheyWrapped() {
+    Scr t(6, 10);
+    t.feed("aaaaaaaaaabb\r\ncccccccccc\r\neeeeeeeeeeff\r\ng");
+    t.s.resize(2, 10);
+    QCOMPARE(t.s.scrollback(), 4);
+    QCOMPARE(t.s.text(-4), QString("aaaaaaaaaa"));
+    QVERIFY(t.s.wrapped(-4));
+    QVERIFY(!t.s.wrapped(-3));  // bb
+    QCOMPARE(t.s.text(-2), QString("cccccccccc"));
+    QVERIFY(!t.s.wrapped(-2));
+    QCOMPARE(t.s.text(-1), QString("eeeeeeeeee"));
+    QVERIFY(t.s.wrapped(-1));
+  }
   void alternateScreen() {
     Scr t;
     QByteArray all;
@@ -298,6 +354,27 @@ private slots:
     QCOMPARE(t.take(), QByteArray("\x1b[<65;2;2M"));
     t.feed("\x1b[?1000l");
     QVERIFY(!t.s.mouseWanted());
+  }
+  void mouseDrags() {
+    Scr t;
+    t.s.mouseMove(3, 7, Qt::NoModifier);
+    QCOMPARE(t.take(), QByteArray());  // nothing asked for
+    t.feed("\x1b[?1000h\x1b[?1006h");
+    t.s.mouse(2, 5, Qt::LeftButton, true, Qt::NoModifier);
+    t.take();
+    t.s.mouseMove(3, 7, Qt::NoModifier);
+    QCOMPARE(t.take(), QByteArray());  // presses and releases only
+    t.s.mouse(3, 7, Qt::LeftButton, false, Qt::NoModifier);
+    t.take();
+    t.feed("\x1b[?1002h");
+    t.s.mouseMove(4, 8, Qt::NoModifier);
+    QCOMPARE(t.take(), QByteArray());  // drags, and no button is held
+    t.s.mouse(4, 8, Qt::LeftButton, true, Qt::NoModifier);
+    t.take();
+    t.s.mouseMove(5, 9, Qt::ShiftModifier);
+    QCOMPARE(t.take(), QByteArray("\x1b[<36;10;6M"));  // 32, a drag, and 4 for Shift
+    t.s.mouseMove(5, 9, Qt::NoModifier);
+    QCOMPARE(t.take(), QByteArray());  // not moved to another cell
   }
   void deviceStatusReport() {
     Scr t;

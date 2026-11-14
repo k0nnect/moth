@@ -1,10 +1,15 @@
 #include <QApplication>
+#include <QClipboard>
 #include <QInputMethod>
 #include <QInputMethodEvent>
 #include <QLineEdit>
+#include <QMimeData>
+#include <QScrollBar>
 #include <QTemporaryDir>
 #include <QVBoxLayout>
 #include <QtTest>
+#include <cerrno>
+#include <csignal>
 
 #include "term_screen.hpp"
 #include "terminal_view.hpp"
@@ -54,9 +59,91 @@ bool startDump(TerminalView &v, int count) {
          QTest::qWaitFor([&] { return v.screen()->text(0).startsWith("ready"); });
 }
 
+// the same for more bytes, with no control character but ESC (mouse reports, arrow keys), after
+// the shell commands `first`: only echo and line editing are turned off, and the bytes are printed
+// eight to a line, each line on a row of its own
+bool startLongDump(TerminalView &v, int count, const QString &first) {
+  const QString script = first + "; stty -echo -icanon; printf ready; head -c " + QString::number(count) +
+                         " | hexdump -v -e '8/1 \" %02x\" \"\\n\"'";
+  return v.run("/bin/sh", {"-c", script}, plainEnv, "/") &&
+         QTest::qWaitFor([&] { return v.screen()->text(0).startsWith("ready"); });
+}
+
+// a dump of mouse reports, after asking for them (1000: presses and releases, 1002: drags too)
+bool startMouseDump(TerminalView &v, int count, const QString &mode) {
+  return startLongDump(v, count, "printf '\\033[?" + mode + "h\\033[?1006h'") && v.screen()->mouseWanted();
+}
+
 QString dumped(TerminalView &v) {
   if (!QTest::qWaitFor([&] { return !v.running(); })) return "(still running) " + screenText(v);
   return screenText(v).mid(5).simplified();
+}
+
+// numbered lines, "line 1" to "line <last>", each ended
+QByteArray numberedLines(int first, int last) {
+  QByteArray out;
+  for (int i = first; i <= last; ++i) out += "line " + QByteArray::number(i) + "\r\n";
+  return out;
+}
+
+int cellWidth(const TerminalView &v) { return v.fontMetrics().averageCharWidth(); }
+int cellHeight(const TerminalView &v) { return v.fontMetrics().lineSpacing(); }
+
+// the middle of a cell, in the viewport's coordinates (where mouse events are delivered)
+QPoint at(const TerminalView &v, int row, int col) {
+  return QPoint(col * cellWidth(v) + cellWidth(v) / 2, row * cellHeight(v) + cellHeight(v) / 2);
+}
+
+// the text of the row at the top of the view: the scroll bar's value counts lines from the oldest
+QString topRow(const TerminalView &v) {
+  const QScrollBar *bar = v.verticalScrollBar();
+  return v.screen()->text(bar->value() - bar->maximum());
+}
+
+// a mouse event of the left button, as Qt delivers it to the viewport
+void mouse(TerminalView &v, QEvent::Type type, QPoint p, Qt::KeyboardModifiers mods = Qt::NoModifier) {
+  const Qt::MouseButton button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
+  const Qt::MouseButtons held = type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton;
+  QMouseEvent e(type, QPointF(p), v.viewport()->mapToGlobal(QPointF(p)), button, held, mods);
+  QApplication::sendEvent(v.viewport(), &e);
+}
+
+void drag(TerminalView &v, QPoint from, QPoint to, Qt::KeyboardModifiers mods = Qt::NoModifier) {
+  mouse(v, QEvent::MouseButtonPress, from, mods);
+  mouse(v, QEvent::MouseMove, to, mods);
+  mouse(v, QEvent::MouseButtonRelease, to, mods);
+}
+
+// a double click as Qt delivers it: the second press comes as a double click
+void doubleClick(TerminalView &v, QPoint p) {
+  mouse(v, QEvent::MouseButtonPress, p);
+  mouse(v, QEvent::MouseButtonRelease, p);
+  mouse(v, QEvent::MouseButtonDblClick, p);
+  mouse(v, QEvent::MouseButtonRelease, p);
+}
+
+// a wheel's notches (120 each), or a trackpad's pixels; up is positive
+void wheel(TerminalView &v, QPoint p, int angle, int pixels = 0) {
+  QWheelEvent e(QPointF(p), v.viewport()->mapToGlobal(QPointF(p)), QPoint(0, pixels), QPoint(0, angle),
+                Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+  QApplication::sendEvent(v.viewport(), &e);
+}
+
+// the clipboard as it was, put back when the test ends
+struct KeptClipboard {
+  QMimeData *kept = new QMimeData;
+  KeptClipboard() {
+    if (const QMimeData *now = QGuiApplication::clipboard()->mimeData())
+      for (const QString &format : now->formats()) kept->setData(format, now->data(format));
+  }
+  ~KeptClipboard() { QGuiApplication::clipboard()->setMimeData(kept); }  // which takes it
+};
+
+constexpr Qt::KeyboardModifier command = Qt::ControlModifier;  // on macOS Qt's Control is Command
+
+// presses Command and a letter; true when the view took it
+bool commandKey(TerminalView &v, Qt::Key key) {
+  return press(&v, key, command, QString(QChar(static_cast<char16_t>(key))).toLower());
 }
 
 // a view with what its programs exit with gathered
@@ -122,6 +209,11 @@ struct Picture {
       for (int x = qFloor(r.left() * dpr); x < qFloor((r.right() + 1) * dpr); ++x)
         if (image.pixelColor(x, y) != c) ++n;
     return n;
+  }
+  QImage area(const QRect &r) const {
+    const qreal dpr = image.devicePixelRatio();
+    return image.copy(QRect(qFloor(r.left() * dpr), qFloor(r.top() * dpr), qCeil(r.width() * dpr),
+                            qCeil(r.height() * dpr)));
   }
 };
 
@@ -211,6 +303,39 @@ private slots:
     replace("à", 0, 0);                                      // c3 a0
     QCOMPARE(dumped(t.view), QString("65 c3 a9 61 7f c3 a0"));
   }
+  void theInputMethodNeverTakesBackHalfACharacter() {
+    Term t;
+    auto replace = [&](int start, int length) {
+      QInputMethodEvent e;
+      e.setCommitString("é", start, length);
+      QApplication::sendEvent(&t.view, &e);
+    };
+    const QString grin = QString::fromUcs4(U"\U0001F600");  // two UTF-16 units
+    QVERIFY(startDump(t.view, 6));
+    press(&t.view, Qt::Key_unknown, Qt::NoModifier, grin);  // f0 9f 98 80
+    replace(-1, 1);                                          // half of it: c3 a9 alone
+    QCOMPARE(dumped(t.view), QString("f0 9f 98 80 c3 a9"));
+    QVERIFY(startDump(t.view, 7));
+    press(&t.view, Qt::Key_unknown, Qt::NoModifier, grin);  // f0 9f 98 80
+    replace(-2, 2);                                          // all of it: 7f c3 a9
+    QCOMPARE(dumped(t.view), QString("f0 9f 98 80 7f c3 a9"));
+  }
+  void theInputMethodIsToldAtOnceWhenAResizeMovesTheCursor() {
+    QWidget window;
+    auto *view = new TerminalView(&window);  // a child: its resizes come at once
+    view->setGeometry(0, 0, 600, 400);
+    window.resize(600, 400);
+    window.show();
+    window.activateWindow();
+    QVERIFY(QTest::qWaitForWindowActive(&window));
+    view->setFocus();
+    QVERIFY(QTest::qWaitFor([&] { return view->hasFocus(); }));
+    view->screen()->feed("\x1b[20;5H");
+    QTest::qWait(50);
+    QSignalSpy told(QGuiApplication::inputMethod(), &QInputMethod::cursorRectangleChanged);
+    view->resize(600, 200);  // fewer rows: the cursor's row moves up
+    QCOMPARE(told.count(), 1);
+  }
   void theInputMethodIsToldWhereTheCursorGoes() {
     Term t;
     QVERIFY(t.shown());
@@ -289,15 +414,19 @@ private slots:
     Term t;
     QVERIFY(t.shown());
     QTest::qWait(100);
-    // damage is gathered for 16 ms: a burst of a few milliseconds, with the event loop turning
-    // between its pieces, is painted at most once while it lasts and once when the time is up
+    // damage is gathered for 16 ms: a burst, with the event loop turning between its pieces, is
+    // painted at most once for every 16 ms it lasts (and so once at most when it takes a few), and
+    // once when the time is up
     const int burst = t.view.paints();
+    QElapsedTimer clock;
+    clock.start();
     for (int i = 0; i < 100; ++i) {
       t.view.screen()->feed("x");
       QCoreApplication::processEvents();
     }
+    const qint64 lasted = clock.elapsed();  // on a busy machine the burst may outlast 16 ms
     const int during = t.view.paints() - burst;
-    QVERIFY2(during <= 1, qPrintable(QString::number(during)));
+    QVERIFY2(during <= lasted / 16 + 1, qPrintable(QString("%1 paints in %2 ms").arg(during).arg(lasted)));
     QTest::qWait(50);
     QCOMPARE(t.view.paints() - burst - during, 1);
     // and a real flood, from a program
@@ -427,6 +556,8 @@ private slots:
 #ifndef Q_OS_MACOS
     QSKIP("Command is a Mac key");
 #endif
+    KeptClipboard kept;
+    QGuiApplication::clipboard()->clear();  // so that the paste sends nothing
     Term t;
     QVERIFY(startDump(t.view, 1));
     // Command is Qt's Control on macOS. C, V and A are the view's (copy, paste, select all)
@@ -504,6 +635,229 @@ private slots:
     QCOMPARE(t.view.screen()->text(0), QString("goodbye"));
     QVERIFY(!t.view.running());
     QCOMPARE(t.view.pid(), qint64(0));
+  }
+
+  // --- looking back, selecting, copying, the mouse
+
+  void theScrollBarSpansTheScrollbackAndTheViewStaysWhereItIsPut() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    QCOMPARE(t.view.screen()->rows(), 24);
+    QScrollBar *bar = t.view.verticalScrollBar();
+    t.view.screen()->feed(numberedLines(1, 200));
+    QVERIFY2(bar->maximum() >= 176, qPrintable(QString::number(bar->maximum())));
+    QCOMPARE(bar->value(), bar->maximum());  // at the bottom
+    QCOMPARE(bar->pageStep(), 24);
+    QCOMPARE(topRow(t.view), QString("line 178"));
+    const QPoint middle = t.view.viewport()->rect().center();
+    wheel(t.view, middle, 120);  // a notch up: three lines back
+    QCOMPARE(topRow(t.view), QString("line 175"));
+    QCOMPARE(bar->value(), bar->maximum() - 3);
+    const Picture back(t.view);
+    // new output leaves the top row where it is, in the scroll bar and as drawn
+    t.view.screen()->feed(numberedLines(201, 210));
+    QCOMPARE(topRow(t.view), QString("line 175"));
+    QCOMPARE(bar->value(), bar->maximum() - 13);
+    const Picture after(t.view);
+    QCOMPARE(after.area(after.row(0)), back.area(back.row(0)));
+    QCOMPARE(after.area(after.row(23)), back.area(back.row(23)));
+    // the scroll bar moves the view
+    bar->setValue(0);
+    QCOMPARE(topRow(t.view), QString("line 1"));
+    bar->setValue(bar->maximum() - 3);
+    QCOMPARE(topRow(t.view), QString("line 185"));
+    // a trackpad: its pixels, a line for each cell's height, the rest kept for the next
+    wheel(t.view, middle, 0, cellHeight(t.view) / 2 + 1);
+    QCOMPARE(bar->value(), bar->maximum() - 3);
+    wheel(t.view, middle, 0, cellHeight(t.view) / 2 + 1);
+    QCOMPARE(bar->value(), bar->maximum() - 4);
+    // Command+C is the view's own: the view stays. A key for the program brings it to the bottom
+    QVERIFY(commandKey(t.view, Qt::Key_C));
+    QCOMPARE(bar->value(), bar->maximum() - 4);
+    QTest::keyClick(&t.view, Qt::Key_A);
+    QCOMPARE(bar->value(), bar->maximum());
+    QCOMPARE(topRow(t.view), t.view.screen()->text(0));
+  }
+  void aDragSelectsCellsAcrossRowsAndCommandCCopiesThem() {
+    KeptClipboard kept;
+    Term t;
+    QVERIFY(t.shown());
+    t.view.screen()->feed("first row\r\nsecond row\r\nthird row");
+    QGuiApplication::clipboard()->setText("before");
+    QVERIFY(commandKey(t.view, Qt::Key_C));  // nothing selected: nothing copied
+    QCOMPARE(QGuiApplication::clipboard()->text(), QString("before"));
+    drag(t.view, at(t.view, 1, 0), at(t.view, 2, 3));
+    QCOMPARE(t.view.selectedText(), QString("second row\nthir"));
+    QVERIFY(commandKey(t.view, Qt::Key_C));
+    QCOMPARE(QGuiApplication::clipboard()->text(), QString("second row\nthir"));
+    QCOMPARE(t.view.selectedText(), QString("second row\nthir"));  // still selected
+    // drawn reversed: the background of what is selected is the text's colour
+    const Picture pic(t.view);
+    QCOMPARE(pic.colour(pic.cells(1, 0).topLeft()), foreground);
+    QCOMPARE(pic.colour(pic.cells(1, 30).topLeft()), foreground);  // on to the end of the row
+    QCOMPARE(pic.colour(pic.cells(2, 3).topLeft()), foreground);
+    QCOMPARE(pic.colour(pic.cells(2, 4).topLeft()), background);
+    QCOMPARE(pic.colour(pic.cells(0, 5).topLeft()), background);
+    // a click drops it
+    mouse(t.view, QEvent::MouseButtonPress, at(t.view, 0, 0));
+    mouse(t.view, QEvent::MouseButtonRelease, at(t.view, 0, 0));
+    QCOMPARE(t.view.selectedText(), QString());
+  }
+  void aDoubleClickSelectsAWordAndATripleClickTheRow() {
+    Term t;
+    QVERIFY(t.shown());
+    t.view.screen()->feed("hello world\r\n");
+    doubleClick(t.view, at(t.view, 0, 8));
+    QCOMPARE(t.view.selectedText(), QString("world"));
+    mouse(t.view, QEvent::MouseButtonPress, at(t.view, 0, 8));  // a third press, soon after
+    mouse(t.view, QEvent::MouseButtonRelease, at(t.view, 0, 8));
+    QCOMPARE(t.view.selectedText(), QString("hello world"));
+  }
+  void aLineThatWrappedCopiesAsOneLine() {
+    Term t;
+    QVERIFY(t.shown());
+    t.view.resize(t.view.width() - t.view.viewport()->width() + 40 * cellWidth(t.view), t.view.height());
+    QVERIFY(QTest::qWaitFor([&] { return t.view.screen()->cols() == 40; }));
+    QString hundred;
+    for (int i = 0; i < 10; ++i) hundred += "0123456789";
+    // and a line where 日 did not fit in the last column and went on to the next row
+    t.view.screen()->feed((hundred + "\r\n" + QString(39, 'a') + "日 next\r\n").toUtf8());
+    drag(t.view, at(t.view, 0, 0), at(t.view, 2, 19));
+    QCOMPARE(t.view.selectedText(), hundred);
+    doubleClick(t.view, at(t.view, 1, 5));  // a word goes on across the rows too
+    QCOMPARE(t.view.selectedText(), hundred);
+    drag(t.view, at(t.view, 3, 0), at(t.view, 4, 1));
+    QCOMPARE(t.view.selectedText(), QString(39, 'a') + "日");
+  }
+  void commandVPastesTheClipboard() {
+    KeptClipboard kept;
+    Term t;
+    QVERIFY(t.run("/bin/cat", {}));
+    QGuiApplication::clipboard()->setText("abc");
+    QVERIFY(commandKey(t.view, Qt::Key_V));
+    QVERIFY(QTest::qWaitFor([&] { return t.view.screen()->text(0) == "abc"; }));
+  }
+  void commandASelectsEverythingTheScrollbackToo() {
+    Term t;
+    t.view.screen()->feed(numberedLines(1, 50));
+    QVERIFY(t.view.screen()->scrollback() > 0);
+    QVERIFY(commandKey(t.view, Qt::Key_A));
+    const QString all = t.view.selectedText();
+    QVERIFY(all.startsWith("line 1\nline 2\n"));
+    QVERIFY(all.contains("\nline 49\nline 50\n"));
+  }
+  void aProgramThatAsksForTheMouseGetsItAndOptionSelects() {
+    Term t;
+    QVERIFY(t.shown());
+    QVERIFY(startMouseDump(t.view, 28, "1000"));
+    drag(t.view, at(t.view, 0, 1), at(t.view, 0, 3));  // a press and a release
+    QCOMPARE(t.view.selectedText(), QString());
+    drag(t.view, at(t.view, 0, 1), at(t.view, 0, 3), Qt::AltModifier);  // the view's: nothing sent
+    QCOMPARE(t.view.selectedText(), QString("ead"));
+    wheel(t.view, at(t.view, 2, 4), 120);  // a notch up, at row 2 column 4
+    QCOMPARE(dumped(t.view), QString("1b 5b 3c 30 3b 32 3b 31 4d 1b 5b 3c 30 3b 34 3b 31 6d "
+                                     "1b 5b 3c 36 34 3b 35 3b 33 4d"));
+    // a program that asks for drags gets them too
+    QVERIFY(startMouseDump(t.view, 28, "1002"));
+    drag(t.view, at(t.view, 0, 1), at(t.view, 1, 3));
+    QCOMPARE(dumped(t.view), QString("1b 5b 3c 30 3b 32 3b 31 4d 1b 5b 3c 33 32 3b 34 3b 32 4d "
+                                     "1b 5b 3c 30 3b 34 3b 32 6d"));
+  }
+  void onTheAlternateScreenTheWheelSendsArrowKeysAndTheViewStays() {
+    Term t;
+    QVERIFY(t.shown());
+    QVERIFY(startLongDump(t.view, 18, "i=1; while [ $i -le 100 ]; do echo line $i; i=$((i+1)); done;"
+                                      " printf '\\033[?1049h\\033[H'"));
+    const TermScreen *s = t.view.screen();
+    QVERIFY(s->altScreen());
+    QVERIFY(s->scrollback() > 50);
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    QCOMPARE(bar->maximum(), 0);  // nothing to look back at on this screen
+    wheel(t.view, at(t.view, 3, 3), 120);   // three Up keys
+    wheel(t.view, at(t.view, 3, 3), -120);  // three Down keys
+    QCOMPARE(bar->maximum(), 0);
+    QCOMPARE(bar->value(), 0);
+    QVERIFY(commandKey(t.view, Qt::Key_A));  // everything there is to see: this screen
+    QVERIFY(t.view.selectedText().startsWith("ready"));
+    QCOMPARE(dumped(t.view), QString("1b 5b 41 1b 5b 41 1b 5b 41 1b 5b 42 1b 5b 42 1b 5b 42"));
+  }
+  void aFloodLeavesTheWindowAnswering() {
+    qint64 pid = 0;
+    {
+      Term t;
+      QVERIFY(t.shown());
+      QVERIFY(t.run("/usr/bin/yes", {}));
+      pid = t.view.pid();
+      // a timer every 10 ms that never waits more than 50 ms fires at least 20 times a second throughout
+      QElapsedTimer clock;
+      qint64 last = 0, longest = 0;
+      QTimer tick;
+      tick.setInterval(10);
+      QObject::connect(&tick, &QTimer::timeout, &tick, [&] {
+        longest = std::max(longest, clock.elapsed() - last);
+        last = clock.elapsed();
+      });
+      QEventLoop loop;
+      QTimer::singleShot(2000, &loop, &QEventLoop::quit);
+      clock.start();
+      tick.start();
+      loop.exec();
+      longest = std::max(longest, clock.elapsed() - last);
+      QVERIFY2(longest <= 50, qPrintable(QString("the event loop waited %1 ms").arg(longest)));
+      QCOMPARE(t.view.screen()->scrollback(), TermScreen::kScrollbackLimit);
+      QVERIFY(t.view.running());
+    }
+    const int sent = ::kill(static_cast<pid_t>(pid), 0), why = errno;
+    QCOMPARE(sent, -1);  // no such process: gone, and reaped
+    QCOMPARE(why, ESRCH);
+  }
+  void newOutputUnderASelectionDropsIt() {
+    Term t;
+    QVERIFY(t.shown());
+    t.view.screen()->feed("first\r\nsecond\r\nthird");
+    drag(t.view, at(t.view, 0, 0), at(t.view, 1, 5));
+    QCOMPARE(t.view.selectedText(), QString("first\nsecond"));
+    t.view.screen()->feed("\x1b[10;1Hother");  // elsewhere
+    QCOMPARE(t.view.selectedText(), QString("first\nsecond"));
+    t.view.screen()->feed("\x1b[1;1Hnew");  // over it
+    QCOMPARE(t.view.selectedText(), QString());
+    // and a new size drops it
+    drag(t.view, at(t.view, 2, 0), at(t.view, 2, 4));
+    QCOMPARE(t.view.selectedText(), QString("third"));
+    t.view.resize(t.view.width() + 5 * cellWidth(t.view), t.view.height());
+    QVERIFY(QTest::qWaitFor([&] { return t.view.selectedText().isEmpty(); }));
+  }
+  void aSelectionInTheScrollbackStaysWhileOutputComesAndTheViewScrolls() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    t.view.screen()->feed(numberedLines(1, 100));
+    QScrollBar *bar = t.view.verticalScrollBar();
+    bar->setValue(0);
+    drag(t.view, at(t.view, 0, 0), at(t.view, 1, 5));
+    QCOMPARE(t.view.selectedText(), QString("line 1\nline 2"));
+    t.view.screen()->feed(numberedLines(101, 110));
+    QCOMPARE(topRow(t.view), QString("line 1"));
+    QCOMPARE(t.view.selectedText(), QString("line 1\nline 2"));
+    wheel(t.view, t.view.viewport()->rect().center(), -120);
+    QCOMPARE(topRow(t.view), QString("line 4"));
+    QCOMPARE(t.view.selectedText(), QString("line 1\nline 2"));
+  }
+  void draggingPastTheTopScrollsBackAndSelectsOn() {
+    Term t;
+    QVERIFY(t.shown(800, 24 * cellHeight(t.view) + 8));
+    t.view.screen()->feed(numberedLines(1, 100));  // row 0 is line 78, row 5 line 83
+    const QScrollBar *bar = t.view.verticalScrollBar();
+    const QPoint above(at(t.view, 0, 0).x(), -5);
+    mouse(t.view, QEvent::MouseButtonPress, at(t.view, 5, 0));
+    mouse(t.view, QEvent::MouseMove, above);
+    QVERIFY(QTest::qWaitFor([&] { return bar->value() <= bar->maximum() - 5; }, 2000));
+    mouse(t.view, QEvent::MouseButtonRelease, above);
+    const int stopped = bar->value();
+    QTest::qWait(150);
+    QCOMPARE(bar->value(), stopped);  // the release stops it
+    const QString text = t.view.selectedText();
+    QVERIFY2(text.startsWith(topRow(t.view) + "\n"), qPrintable(text));
+    QVERIFY2(text.endsWith("\nline 82\nl"), qPrintable(text));
   }
 };
 

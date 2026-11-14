@@ -39,10 +39,17 @@ public:
   int cols() const;
   void resize(int rows, int cols);
   int scrollback() const;                        // lines scrolled off the top, 10,000 at most
+  // lines that have left the scrollback at its old end since the screen was made, pushed out past
+  // the limit or cleared. With scrollback() it says how far every line has moved.
+  qint64 linesDropped() const;
   // rows 0 .. rows()-1 are the live screen; row -1 is the newest scrolled-off line, -2 the one
   // before. Out of range gives an empty cell.
   TermCell cell(int row, int col) const;
   QString text(int row) const;                   // a row's text, trailing blanks dropped
+  // the row goes on in the next: text came to its end and went on, rather than a new line starting.
+  // Live rows have it from libvterm; a line in the scrollback has what could be read as it went
+  // (see pushedLineWrapped)
+  bool wrapped(int row) const;
   QPoint cursor() const;                         // x is the column, y the row
   bool cursorVisible() const;
   bool altScreen() const;
@@ -51,6 +58,9 @@ public:
   void key(int qtKey, Qt::KeyboardModifiers mods, const QString &text);
   void paste(const QString &text);               // bracketed when the program asked for it
   void mouse(int row, int col, Qt::MouseButton button, bool pressed, Qt::KeyboardModifiers mods);
+  // the pointer is over this cell: reported when the program asked for drags and a button is held
+  // (or for every move); nothing unless mouseWanted()
+  void mouseMove(int row, int col, Qt::KeyboardModifiers mods);
   void wheel(int row, int col, int steps);       // positive is up; sent only when mouseWanted()
 signals:
   void damaged(int firstRow, int lastRow);
@@ -60,7 +70,10 @@ signals:
   void bell();
 
 private:
-  using Line = std::vector<VTermScreenCell>;     // trailing blank cells are not stored
+  struct Line {
+    std::vector<VTermScreenCell> cells;          // trailing blank cells are not stored
+    bool wrapped = false;                        // it went on in the next line
+  };
 
   static int onDamage(VTermRect rect, void *self);
   static int onSetTermProp(VTermProp prop, VTermValue *val, void *self);
@@ -73,12 +86,16 @@ private:
   TermCell convert(const VTermScreenCell &c) const;
   QColor colour(const VTermColor &c) const;
   VTermScreenCell blank() const;
+  bool pushedLineWrapped();
 
   VTerm *vt_ = nullptr;
   VTermScreen *screen_ = nullptr;
   VTermState *state_ = nullptr;
   std::deque<Line> history_;                     // oldest first
+  qint64 dropped_ = 0;                           // lines gone from the front of the history
   bool pushed_ = false;                          // a line went to the history during this feed
+  int resizingFrom_ = 0;                         // during a resize the rows there were; 0 otherwise
+  int resizePushes_ = 0;                         // lines the resize has pushed so far
   bool cursorVisible_ = true, altScreen_ = false, mouse_ = false;
   QString title_, titleBuf_;
 };

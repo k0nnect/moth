@@ -105,13 +105,17 @@ int TermScreen::cols() const {
 
 void TermScreen::resize(int rows, int cols) {
   pushed_ = false;
+  resizingFrom_ = this->rows();
+  resizePushes_ = 0;
   vterm_set_size(vt_, std::max(rows, 1), std::max(cols, 1));
+  resizingFrom_ = 0;
   vterm_screen_flush_damage(screen_);
   if (pushed_) emit scrolled();
   emit damaged(0, this->rows() - 1);
 }
 
 int TermScreen::scrollback() const { return static_cast<int>(history_.size()); }
+qint64 TermScreen::linesDropped() const { return dropped_; }
 
 QColor TermScreen::colour(const VTermColor &in) const {
   if (VTERM_COLOR_IS_DEFAULT_FG(&in) || VTERM_COLOR_IS_DEFAULT_BG(&in)) return QColor();
@@ -152,8 +156,8 @@ TermCell TermScreen::cell(int row, int col) const {
     const int back = -row;  // 1 is the newest
     if (back > static_cast<int>(history_.size())) return TermCell();
     const Line &line = history_[history_.size() - static_cast<size_t>(back)];
-    if (static_cast<size_t>(col) >= line.size()) return TermCell();
-    return convert(line[static_cast<size_t>(col)]);
+    if (static_cast<size_t>(col) >= line.cells.size()) return TermCell();
+    return convert(line.cells[static_cast<size_t>(col)]);
   }
   if (row >= rows()) return TermCell();
   VTermScreenCell c;
@@ -173,6 +177,16 @@ QString TermScreen::text(int row) const {
   while (end > 0 && s[end - 1] == ' ') --end;
   s.truncate(end);
   return s;
+}
+
+bool TermScreen::wrapped(int row) const {
+  if (row < 0) {
+    const int back = -row;
+    if (back > static_cast<int>(history_.size())) return false;
+    return history_[history_.size() - static_cast<size_t>(back)].wrapped;
+  }
+  if (row >= rows() - 1) return false;  // the last row: nothing has gone on from it yet
+  return vterm_state_get_lineinfo(state_, row + 1)->continuation;  // the next row continues it
 }
 
 QPoint TermScreen::cursor() const {
@@ -267,6 +281,11 @@ void TermScreen::mouse(int row, int col, Qt::MouseButton button, bool pressed,
   vterm_mouse_button(vt_, b, pressed, m);
 }
 
+void TermScreen::mouseMove(int row, int col, Qt::KeyboardModifiers mods) {
+  if (!mouse_) return;
+  vterm_mouse_move(vt_, row, col, vtermMods(mods));  // reports it only when the program asked
+}
+
 void TermScreen::wheel(int row, int col, int steps) {
   if (!mouse_ || steps == 0) return;
   vterm_mouse_move(vt_, row, col, VTERM_MOD_NONE);
@@ -311,10 +330,25 @@ int TermScreen::onPushLine(int cols, const VTermScreenCell *cells, void *selfp) 
   auto *self = static_cast<TermScreen *>(selfp);
   int used = cols;
   while (used > 0 && blankCell(cells[used - 1])) --used;
-  self->history_.emplace_back(cells, cells + used);
-  if (static_cast<int>(self->history_.size()) > kScrollbackLimit) self->history_.pop_front();
+  self->history_.push_back(Line{{cells, cells + used}, self->pushedLineWrapped()});
+  if (static_cast<int>(self->history_.size()) > kScrollbackLimit) {
+    self->history_.pop_front();
+    ++self->dropped_;
+  }
   self->pushed_ = true;
   return 1;
+}
+
+// whether the line libvterm is pushing into the history went on in the next. libvterm 0.3.3 gives
+// the cells and not the line's flags (a row's flag says it continues the row above), so they are read
+// where they stand, on the screen shown (the one whose rows libvterm pushes). In a scroll they have
+// already moved up with the rows: the line after the one going is on row 0 (right when one line
+// scrolls at a time, as output does; when several scroll at once, only for the last). In a resize
+// they have not moved, and the lines go from the top in order.
+bool TermScreen::pushedLineWrapped() {
+  if (resizingFrom_ == 0) return vterm_state_get_lineinfo(state_, 0)->continuation;
+  const int next = ++resizePushes_;
+  return next < resizingFrom_ && vterm_state_get_lineinfo(state_, next)->continuation;
 }
 
 int TermScreen::onPopLine(int cols, VTermScreenCell *cells, void *selfp) {
@@ -323,12 +357,14 @@ int TermScreen::onPopLine(int cols, VTermScreenCell *cells, void *selfp) {
   const Line line = std::move(self->history_.back());
   self->history_.pop_back();
   const VTermScreenCell empty = self->blank();
-  for (int i = 0; i < cols; ++i) cells[i] = static_cast<size_t>(i) < line.size() ? line[static_cast<size_t>(i)] : empty;
+  for (int i = 0; i < cols; ++i)
+    cells[i] = static_cast<size_t>(i) < line.cells.size() ? line.cells[static_cast<size_t>(i)] : empty;
   return 1;
 }
 
 int TermScreen::onSbClear(void *selfp) {
   auto *self = static_cast<TermScreen *>(selfp);
+  self->dropped_ += static_cast<qint64>(self->history_.size());
   self->history_.clear();
   emit self->scrolled();
   return 1;
