@@ -271,6 +271,12 @@ Only after stage 6: the public face, the licence choice, and publishing.
 - The helper's macOS back end, the native stand-in program and the Sims 4 stretch were all stage 6 work and are not built.
 - Section 12's open question about the four games whose folders were not found no longer needs an answer.
 
+**Changed by Chris on 2026-11-15: work stops here and moth is published as it stands.** He asked for it to go to GitHub as-is, public, under the MIT licence, with stage 2b merged. What follows from that:
+
+- Goal 7 ("private until done") no longer holds. Stages 1, 1b, 1c, 2a and 2b are what exists. Stages 3 (structure discovery), 4 (trainers) and 5 (the overlay) are not built.
+- Stage 2b's proof on a real game with the person at the keyboard was not run. What was checked instead is in `docs/verification/disco-elysium.md` under stage 2b.
+- The public face is a short README that says so.
+
 ## 10. How it gets verified
 
 - **A stand-in target.** A small Windows test program with known values in every form moth claims to handle (each number size, decimals, scaled values, unaligned values, values behind chains of pointers, values that move between runs). It runs in a scratch bottle (`uhmm` was used for the probes) so the engine can be tested automatically without a real game.
