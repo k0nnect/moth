@@ -353,3 +353,41 @@ Date: 2026-11-13. Done with Chris at the keyboard, on Day 2 of the same playthro
 5. With no game attached `undo last change` stays enabled. The service refuses it, so nothing is written.
 6. Pressing Return again in the number box sends the same `next` again. Three were sent for 42.
 7. After a short no-number hunt the list opens on 200 of 105,361 rows that read 0, as in stage 1c's problem 4: nothing in the window sorts or hides rows by value.
+
+# stage 2b (not run on disco elysium)
+
+Date: 2026-11-15. **The proof on the game, with Chris at the keyboard, was not run.** Work on moth stopped before it. What follows was done by the assistant alone, with the real Claude Code against the stand-in game, and is recorded here so that nobody reads stage 2b as proven on a real game.
+
+## setup
+
+- moth: branch `stage-2b-terminal-agent`, builds `8c823ae` to `8e871ab`, a temporary `MOTH_HOME` under `/tmp`.
+- The game: `moth-target.exe` (the stand-in from `helper/`) in the scratch bottle, started through `moth launch`.
+- The agent: the real Claude Code, 2.1.323 and then 2.1.325 (it updated itself during the session), started by `moth agent` in a tmux pane. For the last check it was started by the real window, offscreen, under zsh.
+- "A step by the person" below is a `moth` command typed in a second terminal as actor `user`.
+
+## result
+
+| check | seen | verdict |
+| --- | --- | --- |
+| the agent speaks first, with nothing typed | a fitting first reply about 20 s after the folder-trust prompt the first time, under 10 s the second | met |
+| the agent runs `moth` commands without a permission prompt | `moth status`, later `moth set 1 9 --at 0x7f6074` and a `keep`, none prompted; each logged with actor `agent` | met |
+| the agent's `moth` is this build and this session | `type -a moth` in its shell gave one line, this build's `bin/moth`; `MOTH_ACTOR=agent`, `MOTH_HOME` the temporary one | met |
+| a step by the person reaches an idle agent | `Stop hook feedback` and an unprompted, fitting comment within about 10 s, four times | met |
+| the agent's write lands | the stand-in game reported 9 after the agent's `set` | met |
+| a step made while the agent is replying | one note, delivered right after the reply ended | met |
+| three quick steps | one note, not three | met |
+| Escape on a turn the person typed | the waiter armed before it was still running; the next step was told | met |
+| Escape on a turn a note started | **first build: no waiter left, the next step was not told until the person typed.** Fixed (the waiter is now armed when a turn starts as well as when it ends) and seen fixed in a second session | met after the fix |
+| `/exit` | no `moth wait` left two seconds later | met |
+| the real window, offscreen, with the real Claude Code | the terminal showed Claude Code, the agent's `moth status` was logged, one waiter was armed; closing the window left no shell, agent, waiter or window process | met |
+| the person's Claude Code settings are untouched | `~/.claude/settings.json` had the same checksum before and after every session | met |
+
+## not checked
+
+Everything that needed a person, a real game and a window on screen: the design's example hunt with only `which one is it?` typed; the `quiet` tick box over a minute; the terminal by hand (scrolling back, selecting and copying, pasting, resizing while it prints, accents, the emoji picker, the press-and-hold menu, Control+Z); thirty idle minutes and then a click; closing the window in the middle of a reply; the window's CPU use with the agent's spinner running.
+
+## seen along the way
+
+1. Claude Code asks once whether the agent's work folder is trusted, and its default answer is "No, exit". moth does not answer it for the person.
+2. `agent/<pid>` session folders under `MOTH_HOME` stay behind after the agent exits. They are four small files each.
+3. `claude --resume`, run by hand after an exit, starts a session with none of moth's settings.
